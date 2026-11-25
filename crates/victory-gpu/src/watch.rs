@@ -707,11 +707,43 @@ impl Unchanged {
     }
 }
 
-/// The copies watching `block` let go of its bytes.
+/// Blocks per bucket of [`Guards::watchers`] (64: 4 MiB): a copy is
+/// registered once per bucket its refreshes cover, not once per block (the
+/// 174 MB heap's 2,784 blocks, ten times a frame, under the guards' lock
+/// in run P5-0).
+const BUCKET_SHIFT: usize = 6;
+
+/// Whether any copy was ever registered ([`unchanged_gone`] has nothing to
+/// do before).
+static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The copies watching `block`'s bucket let go of its bytes. They stay
+/// registered: the other blocks of the bucket are still theirs.
 fn invalidate(g: &mut Guards, block: usize) {
-    if let Some(list) = g.watchers.remove(&block) {
+    take_out_range(g, block * BLOCK, (block + 1) * BLOCK);
+}
+
+/// The copies registered on the buckets of `[from, to)` (title
+/// addresses) let go of those bytes.
+fn take_out_range(g: &Guards, from: usize, to: usize) {
+    if from >= to || g.watchers.is_empty() {
+        return;
+    }
+    let (first, last) = ((from / BLOCK) >> BUCKET_SHIFT, (to.div_ceil(BLOCK) + (1 << BUCKET_SHIFT) - 1) >> BUCKET_SHIFT);
+    for (_, list) in g.watchers.range(first..last) {
         for w in list {
-            w.take_out(block * BLOCK, (block + 1) * BLOCK);
+            w.take_out(from, to);
+        }
+    }
+}
+
+/// Registers `w` on the buckets of blocks `[first, last)`, once each.
+fn watch_buckets(g: &mut Guards, first: usize, last: usize, w: &std::sync::Arc<Unchanged>) {
+    WATCHING.store(true, std::sync::atomic::Ordering::Relaxed);
+    for bucket in first >> BUCKET_SHIFT..(last + (1 << BUCKET_SHIFT) - 1) >> BUCKET_SHIFT {
+        let list = g.watchers.entry(bucket).or_default();
+        if !list.iter().any(|x| std::sync::Arc::ptr_eq(x, w)) {
+            list.push(w.clone());
         }
     }
 }
@@ -731,12 +763,7 @@ pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Uncha
     if g.protected.range(first..last).count() != last - first {
         return None;
     }
-    for block in first..last {
-        let list = g.watchers.entry(block).or_default();
-        if !list.iter().any(|x| std::sync::Arc::ptr_eq(x, w)) {
-            list.push(w.clone());
-        }
-    }
+    watch_buckets(&mut g, first, last, w);
     // Read under the guards' lock, which every taking-out holds.
     Some(w.lock().0)
 }
@@ -783,7 +810,8 @@ pub(crate) fn refresh_watching<R>(w: &std::sync::Arc<Unchanged>, from: usize, to
 }
 
 /// In [`guard`], holding the guards: registers the refreshing copy, if
-/// any, on blocks `[first, last)` if all of them are guarded now.
+/// any, on blocks `[first, last)` if all of them are guarded now (all
+/// clean: a clean block is a guarded one, one lookup with #979's runs).
 fn register_refreshing(g: &mut Guards, first: usize, last: usize) {
     REFRESHING.with(|r| {
         let mut r = r.borrow_mut();
@@ -793,16 +821,11 @@ fn register_refreshing(g: &mut Guards, first: usize, last: usize) {
         if *failed || first >= last {
             return;
         }
-        if g.protected.range(first..last).count() != last - first {
+        if !g.clean.uncovered(first, last).is_empty() {
             *failed = true;
             return;
         }
-        for block in first..last {
-            let list = g.watchers.entry(block).or_default();
-            if !list.iter().any(|x| std::sync::Arc::ptr_eq(x, w)) {
-                list.push(w.clone());
-            }
-        }
+        watch_buckets(g, first, last, w);
         if seen.is_none() {
             // Under the guards' lock, which every taking-out holds.
             *seen = Some(w.lock().0);
@@ -815,12 +838,13 @@ fn register_refreshing(g: &mut Guards, first: usize, last: usize) {
 pub(crate) fn unwatch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unchanged>) {
     let (first, last) = (start / BLOCK, start.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
-    let blocks: Vec<usize> = g.watchers.range(first..last).map(|(&b, _)| b).collect();
-    for block in blocks {
-        if let Some(list) = g.watchers.get_mut(&block) {
+    let buckets: Vec<usize> =
+        g.watchers.range(first >> BUCKET_SHIFT..(last + (1 << BUCKET_SHIFT) - 1) >> BUCKET_SHIFT).map(|(&b, _)| b).collect();
+    for bucket in buckets {
+        if let Some(list) = g.watchers.get_mut(&bucket) {
             list.retain(|x| !std::sync::Arc::ptr_eq(x, w));
             if list.is_empty() {
-                g.watchers.remove(&block);
+                g.watchers.remove(&bucket);
             }
         }
     }
@@ -830,17 +854,11 @@ pub(crate) fn unwatch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unc
 /// (our own views, the journal's own notes): out of every copy's current
 /// ranges.
 fn unchanged_gone(at: usize, len: usize) {
-    if len == 0 || !skip_unchanged() {
+    if len == 0 || !WATCHING.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let mut g = guards();
-    if g.watchers.is_empty() {
-        return;
-    }
-    let blocks: Vec<usize> = g.watchers.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
-    for block in blocks {
-        invalidate(&mut g, block);
-    }
+    let g = guards();
+    take_out_range(&g, at, at.saturating_add(len));
 }
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1190,6 +1208,11 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // Whatever the guards do with it below (by default nothing for a
+    // write that is not a page's, `VICTORY_PAGE_WRITES`), a copy holding
+    // these bytes as current does not any more: a ReadFile into guarded
+    // memory left the bytes from before it current in run P5-0.
+    unchanged_gone(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -1319,10 +1342,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(block);
     }
-    let watched: Vec<usize> = g.watchers.range(range).map(|(&b, _)| b).collect();
-    for block in watched {
-        invalidate(&mut g, block);
-    }
+    let _ = range;
+    take_out_range(&g, at, at.saturating_add(len));
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
@@ -2063,6 +2084,53 @@ mod unchanged_tests {
         }
         title_memory_remapped(one, bytes);
         title_memory_remapped(two, bytes);
+    }
+
+    /// A write the guards are not told of as a page's (a ReadFile into
+    /// title memory, `title_memory_written` with `pages` false, which by
+    /// default opens nothing) still takes the bytes out of every copy
+    /// holding them current (run P5-0's gap).
+    #[test]
+    fn a_read_file_into_guarded_memory_takes_its_bytes_out() {
+        let first = FAR + 256;
+        guard_fake(first, 3);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, 3 * BLOCK);
+        let seen = watch_unchanged(start, len, &w).unwrap();
+        w.note(start, start + len, seen);
+        assert!(w.covers(start, len));
+        title_memory_written(start + BLOCK + 100, 50, false);
+        assert!(!w.covers(start, len));
+        assert!(!w.covers(start + BLOCK + 100, 50));
+        assert!(w.covers(start, BLOCK), "the rest stays current");
+        assert!(w.covers(start + 2 * BLOCK, BLOCK));
+        unguard_fake(first, 3, &w);
+    }
+
+    /// A copy is registered once per 4 MiB bucket and stays registered:
+    /// two writes in the same bucket, one after the other, both take their
+    /// bytes out; the copy's registration does not grow with its blocks.
+    #[test]
+    fn watchers_are_kept_per_bucket() {
+        let first = (FAR + 512) & !((1 << BUCKET_SHIFT) - 1);
+        let blocks = 2 << BUCKET_SHIFT;
+        guard_fake(first, blocks);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, blocks * BLOCK);
+        let seen = watch_unchanged(start, len, &w).unwrap();
+        w.note(start, start + len, seen);
+        {
+            let g = guards();
+            let buckets: usize = g.watchers.range(first >> BUCKET_SHIFT..(first + blocks) >> BUCKET_SHIFT).count();
+            assert_eq!(buckets, 2, "one entry per bucket, not per block");
+        }
+        open_here(&mut guards(), start + 3 * BLOCK, start + 3 * BLOCK + 1);
+        assert!(!w.covers(start + 3 * BLOCK, 8));
+        open_here(&mut guards(), start + 5 * BLOCK, start + 5 * BLOCK + 1);
+        assert!(!w.covers(start + 5 * BLOCK, 8), "still registered after the first opening");
+        assert!(w.covers(start + 4 * BLOCK, BLOCK));
+        assert!(w.covers(start + 6 * BLOCK, len - 6 * BLOCK));
+        unguard_fake(first, blocks, &w);
     }
 
     /// Memory not all guarded (write-watched, or a block open) is never
