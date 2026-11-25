@@ -4,6 +4,76 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Optional code patches from `VICTORY_PATCH`: `rva=hexbytes[:expected],…`,
+/// e.g. `0x28d0d60=31c0c3:ffc9f7c1` (write `xor eax,eax; ret` only if the
+/// original bytes start with `ff c9 f7 c1`). Applied to the prepared copy,
+/// never to the game's files.
+fn apply_byte_patches(prepared: &mut victory_loader::PreparedImage) -> Result<()> {
+    let Ok(spec) = std::env::var("VICTORY_PATCH") else {
+        return Ok(());
+    };
+    let info = &prepared.info;
+    patch_bytes(&spec, &mut prepared.bytes, |rva| info.rva_to_file_offset(rva).map(u64::from))
+}
+
+/// [`apply_byte_patches`] of `spec` on `bytes`, file offsets by `offset_of`.
+fn patch_bytes(spec: &str, bytes: &mut [u8], offset_of: impl Fn(u32) -> Option<u64>) -> Result<()> {
+    let hex = |s: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(s.len() % 2 == 0, "odd hex length in VICTORY_PATCH: {s}");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("bad hex in VICTORY_PATCH"))
+            .collect()
+    };
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (at, rest) = item.split_once('=').context("VICTORY_PATCH item needs rva=bytes")?;
+        let rva = u32::from_str_radix(at.trim_start_matches("0x"), 16).context("bad rva")?;
+        let (new, expected) = match rest.split_once(':') {
+            Some((n, e)) => (hex(n)?, Some(hex(e)?)),
+            None => (hex(rest)?, None),
+        };
+        let off = offset_of(rva).with_context(|| format!("VICTORY_PATCH rva {rva:#x} is not file-backed"))? as usize;
+        let slot = bytes
+            .get_mut(off..off + new.len().max(expected.as_ref().map_or(0, Vec::len)))
+            .with_context(|| format!("VICTORY_PATCH rva {rva:#x} outside the image"))?;
+        if let Some(e) = &expected {
+            anyhow::ensure!(
+                slot.starts_with(e),
+                "VICTORY_PATCH rva {rva:#x}: found {:02x?}, expected {:02x?}; not patching",
+                &slot[..e.len()],
+                e
+            );
+        }
+        println!("patch          {rva:#x}: {:02x?} -> {:02x?}", &slot[..new.len()], new);
+        slot[..new.len()].copy_from_slice(&new);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::patch_bytes;
+
+    /// A patch whose expected bytes match is written; one whose bytes do
+    /// not is refused and leaves everything as it was; bad specs fail.
+    #[test]
+    fn patches_apply_only_over_the_expected_bytes() {
+        let original = [0u8, 1, 2, 0xff, 0xc9, 0xf7, 0xc1, 0xf7, 9, 9];
+        let at = |rva: u32| (rva >= 0x1000).then(|| u64::from(rva - 0x1000));
+        let mut bytes = original;
+        patch_bytes("0x1003=31c0c3:ffc9f7c1", &mut bytes, at).unwrap();
+        assert_eq!(bytes, [0, 1, 2, 0x31, 0xc0, 0xc3, 0xc1, 0xf7, 9, 9]);
+        let mut bytes = original;
+        assert!(patch_bytes("0x1003=31c0c3:ffc9f7c2", &mut bytes, at).is_err(), "mismatch refused");
+        assert_eq!(bytes, original);
+        assert!(patch_bytes("0x1003=31c", &mut bytes, at).is_err(), "odd hex");
+        assert!(patch_bytes("0x1009=3131", &mut bytes, at).is_err(), "past the image");
+        assert!(patch_bytes("0x10=31", &mut bytes, at).is_err(), "not file-backed");
+        assert!(patch_bytes("", &mut bytes, at).is_ok());
+        assert_eq!(bytes, original);
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -20,7 +90,8 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
+    apply_byte_patches(&mut prepared)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
