@@ -3354,30 +3354,6 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// flight, which is the order the wait asks for. If the flights may write
 /// the value in a way not known here (shaders, a timestamp, another
 /// width), they are settled and memory is asked again.
-/// [`late_met`] without its settle: whether a bottom-of-pipe write of a
-/// flight in the air, or of one being landed, is known to meet `wait`.
-/// False says nothing about what else the flights may write there (fork
-/// fxceless 39731795d, for its `VICTORY_JOIN_PARTS`).
-pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
-    let (address, bytes) = wait.place();
-    let line = line();
-    let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
-        Late::Write(at, what, n) => Some((at, what, n)),
-        _ => None,
-    }));
-    for (at, what, n) in writes {
-        if let crate::queue::Written::Value(v) = what
-            && *at == address
-            && *n >= bytes
-            && wait.holds_for(*v)
-        {
-            LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
     {
@@ -3411,6 +3387,125 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     }
     settle_now(WHY_VALUE);
     wait.met()
+}
+
+/// The last bottom-of-pipe write over a wait's place, of `writes` (in the
+/// order they are done): `None` if none touches `[address, address +
+/// bytes)`; `Some(Some(v))` if the last that does stores the value `v` over
+/// all of it; `Some(None)` if it stores something else there (a timestamp,
+/// another width or place).
+pub(crate) fn last_write_over<'a>(
+    writes: impl DoubleEndedIterator<Item = &'a (usize, crate::queue::Written, usize)>,
+    address: usize,
+    bytes: usize,
+) -> Option<Option<u64>> {
+    for (at, what, n) in writes.rev() {
+        if *at >= address + bytes || address >= *at + *n {
+            continue;
+        }
+        return Some(match what {
+            crate::queue::Written::Value(v) if *at == address && *n >= bytes => Some(*v),
+            _ => None,
+        });
+    }
+    None
+}
+
+/// Of the flights in the air and being landed ([`late`]): the last
+/// bottom-of-pipe write over `[address, address + bytes)`
+/// ([`last_write_over`]), and whether their shaders may write there.
+pub(crate) fn late_last_write(address: usize, bytes: usize) -> (Option<Option<u64>>, bool) {
+    if !late() {
+        return (None, false);
+    }
+    let line = line();
+    // Those being landed were sent before those in the air.
+    let writes: Vec<(usize, crate::queue::Written, usize)> = line
+        .in_hand
+        .iter()
+        .copied()
+        .chain(line.line.iter().filter_map(|item| match item {
+            Late::Write(at, what, n) => Some((*at, *what, *n)),
+            _ => None,
+        }))
+        .collect();
+    (last_write_over(writes.iter(), address, bytes), touches(&line.written, address, address + bytes))
+}
+
+/// Whether a queue may pass `wait` once what is ahead of it has run, the
+/// newest known write first (upstream #2611's class): `joined`, the last
+/// bottom-of-pipe write of parts taken and not sent ([`last_write_over`]);
+/// `flights`, of the flights; `unsure`, whether the flights' shaders may
+/// write the place; `memory`, whether memory meets it now. `None`: not
+/// known without the card (the flights are settled, or the wait stays).
+///
+/// Memory asked first, as before, passes a wait that memory meets now and
+/// a write ahead of it changes: 7 in memory, a flight that stores 8, a wait
+/// for 7 (the bench's case: the part behind the wait ran early).
+pub(crate) fn wait_holds_guarded(
+    wait: &crate::list::ValueWait,
+    joined: Option<Option<u64>>,
+    flights: Option<Option<u64>>,
+    unsure: bool,
+    memory: impl FnOnce() -> bool,
+) -> Option<bool> {
+    for last in [joined, flights] {
+        match last {
+            Some(Some(v)) => return Some(wait.holds_for(v)),
+            Some(None) => return None,
+            None => {}
+        }
+    }
+    if unsure {
+        return None;
+    }
+    Some(memory())
+}
+
+/// Settles the flights for a wait for a memory value ([`settle_now`]).
+pub(crate) fn settle_for_value() {
+    settle_now(WHY_VALUE);
+}
+
+/// Whether part `next` must not join parts `taken` in one submission
+/// (`crate::queue`'s `VICTORY_JOIN_PARTS`): preparing it reads on the CPU
+/// title memory their shaders write (as [`blocked_by`] asks), which is not there
+/// before they have run and been copied back. The bench's case d2: 16,308
+/// bytes of a buffer read stale. The parts taken go first, and `next`
+/// after them, where the flights' check settles them ([`late_blocked`]).
+pub(crate) fn join_blocked(taken: &[&HostList], next: &[&HostList]) -> bool {
+    let mut written: Vec<(usize, usize)> = Vec::new();
+    for list in taken {
+        written.extend(list.deferred().copies.iter().filter_map(|step| match step {
+            Step::GpuWrite(_, address, len) => Some((*address, *address + *len)),
+            _ => None,
+        }));
+    }
+    join_ranges(&mut written, []);
+    if written.is_empty() {
+        return false;
+    }
+    // As `blocked_by`, but no read goes ahead here (`fill_ahead`): what a
+    // read ahead of flights finds is checked when they land, and the parts
+    // taken are no flights yet, so nothing would check it.
+    for list in next {
+        for step in &list.deferred().copies {
+            let blocked = match step {
+                &Step::Copy(dst, src, len) => touches(&written, src, src + len) || touches(&written, dst, dst + len),
+                &Step::Fill(_, src, len) => touches(&written, src, src + len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    touches(&written, at, at + len)
+                }
+                Step::Run(_) => true,
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => false,
+            };
+            if blocked {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
@@ -3771,6 +3866,86 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64,
             if CARD_PATCHES.load(Ordering::Relaxed) { "" } else { ": off" }
         );
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use crate::queue::Written;
+
+    /// The last write over a wait's place: the last that touches it, its
+    /// value only if it covers the place exactly.
+    #[test]
+    fn the_last_write_over_a_place_is_the_newest() {
+        let w = |at, v: u64, n| (at, Written::Value(v), n);
+        let writes = [w(0x100, 7, 4), w(0x200, 9, 4), w(0x100, 8, 4)];
+        assert_eq!(super::last_write_over(writes.iter(), 0x100, 4), Some(Some(8)));
+        assert_eq!(super::last_write_over(writes.iter(), 0x300, 4), None);
+        // A timestamp, or a narrower write, over it: something else.
+        let other = [w(0x100, 7, 4), (0x100, Written::GpuTimestamp, 8)];
+        assert_eq!(super::last_write_over(other.iter(), 0x100, 4), Some(None));
+        let narrow = [w(0x102, 1, 2)];
+        assert_eq!(super::last_write_over(narrow.iter(), 0x100, 4), Some(None));
+    }
+
+    /// Upstream #2611's class (the bench's oracle, HAZARD_2B): memory holds
+    /// 7, a write ahead of the wait stores 8, the wait is for 7. Memory
+    /// asked first passes it (as `value_met` and the joined parts did); the
+    /// newest known write first does not.
+    #[test]
+    fn a_wait_memory_meets_is_held_when_a_write_ahead_changes_it() {
+        let memory = 7u32;
+        let wait = crate::list::ValueWait::for_test(std::ptr::from_ref(&memory) as u64, 3, 7, false);
+        assert!(wait.met(), "memory meets it now");
+        // As it was: memory first.
+        let as_was = wait.met() || false;
+        assert!(as_was, "memory asked first passes the wait");
+        // A flight stores 8: held.
+        assert_eq!(super::wait_holds_guarded(&wait, None, Some(Some(8)), false, || wait.met()), Some(false));
+        // A part taken stores 8 (joined): held, whatever the flights say.
+        assert_eq!(super::wait_holds_guarded(&wait, Some(Some(8)), Some(Some(7)), false, || wait.met()), Some(false));
+        // The newest is the part taken: 7 again after a flight's 8.
+        assert_eq!(super::wait_holds_guarded(&wait, Some(Some(7)), Some(Some(8)), false, || wait.met()), Some(true));
+        // A write of another kind, or shaders that may write there: not known.
+        assert_eq!(super::wait_holds_guarded(&wait, None, Some(None), false, || wait.met()), None);
+        assert_eq!(super::wait_holds_guarded(&wait, None, None, true, || wait.met()), None);
+        // Nothing ahead: memory.
+        assert_eq!(super::wait_holds_guarded(&wait, None, None, false, || wait.met()), Some(true));
+    }
+
+    /// The bench's case d2: a part whose preparing copies, on the CPU, title
+    /// memory a part taken before it writes with its shaders must not join
+    /// it; one that reads elsewhere may. (Joined as before, the copy read
+    /// the bytes from before those shaders: 16,308 bytes differed.)
+    #[test]
+    fn a_part_reading_what_a_part_taken_writes_does_not_join_it() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let title = vec![0u8; 0x4_0000];
+        let base = title.as_ptr() as usize;
+        crate::shadow::register(0x7a17_0000, base as u64, 0x2_0000);
+        let Some(shadow) = crate::shadow::find(base as u64, 0x2_0000) else {
+            crate::shadow::unregister(0x7a17_0000, base as u64);
+            return;
+        };
+        let (Ok(taken), Ok(reads), Ok(elsewhere)) = (host.new_list(), host.new_list(), host.new_list()) else {
+            crate::shadow::unregister(0x7a17_0000, base as u64);
+            return;
+        };
+        let mut dst = vec![0u8; 256];
+        // Shaders of the part taken write the first 4 KiB of the buffer.
+        taken.defer_gpu_write(&shadow, base, 0x1000);
+        // The next part copies 64 bytes of them on the CPU...
+        reads.defer_copy(dst.as_mut_ptr(), (base + 0x100) as *const u8, 64);
+        // ... or 64 bytes of the buffer's second half.
+        elsewhere.defer_copy(dst.as_mut_ptr(), (base + 0x1_8000) as *const u8, 64);
+        assert!(super::join_blocked(&[&taken], &[&reads]), "it reads what the part taken writes");
+        assert!(!super::join_blocked(&[&taken], &[&elsewhere]), "it reads elsewhere");
+        assert!(!super::join_blocked(&[&elsewhere], &[&reads]), "a part taken that writes nothing");
+        drop((taken, reads, elsewhere, dst));
+        crate::shadow::unregister(0x7a17_0000, base as u64);
+        drop(title);
     }
 }
 
@@ -7148,14 +7323,10 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// Whether the list, once it has run, stores at `address` a value of
-    /// `bytes` bytes or more for which `holds` says yes (one of its
-    /// bottom-of-pipe writes, as [`late_met`] reads them of a flight).
-    pub(crate) fn will_write(&self, address: usize, bytes: usize, holds: impl Fn(u64) -> bool) -> bool {
-        self.deferred()
-            .writes
-            .iter()
-            .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if holds(*v)))
+    /// The last of its bottom-of-pipe writes over `[address, address +
+    /// bytes)` ([`last_write_over`]).
+    pub(crate) fn last_write(&self, address: usize, bytes: usize) -> Option<Option<u64>> {
+        last_write_over(self.deferred().writes.iter(), address, bytes)
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

@@ -615,10 +615,22 @@ impl Joined {
         self.parts >= join_most() || self.order.len() >= join_lists()
     }
 
-    /// Whether a bottom-of-pipe write of a part taken meets `wait`.
-    fn meets(&self, wait: &crate::list::ValueWait) -> bool {
-        let (address, bytes) = wait.place();
-        self.order.iter().any(|&i| self.lists[i].host().will_write(address, bytes, |v| wait.holds_for(v)))
+    /// The last bottom-of-pipe write of the parts taken over `[address,
+    /// address + bytes)` (`crate::host::last_write_over`): the newest
+    /// part's first.
+    fn last_write(&self, address: usize, bytes: usize) -> Option<Option<u64>> {
+        self.order.iter().rev().find_map(|&i| self.lists[i].host().last_write(address, bytes))
+    }
+
+    /// Whether `next` (a part's lists, in `order`) must go after these have
+    /// been sent (`crate::host::join_blocked`).
+    fn blocks(&self, next: &[crate::list::Detached], order: &[usize]) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let taken: Vec<&crate::host::HostList> = self.order.iter().map(|&i| self.lists[i].host()).collect();
+        let next: Vec<&crate::host::HostList> = order.iter().map(|&i| next[i].host()).collect();
+        crate::host::join_blocked(&taken, &next)
     }
 }
 
@@ -635,7 +647,7 @@ fn join<T>(mut lists: Vec<T>, mut order: Vec<usize>, more: Vec<T>, more_order: V
 /// Parts joined, host submissions they went in, their lists, signals
 /// delivered behind them, and waits passed for a write of a part taken.
 #[cfg(windows)]
-static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static JOINED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Gives the host what [`Joined`] holds, as one submission, delivers the
 /// signals met behind it, and takes the marks off the lines. Called with
@@ -651,13 +663,14 @@ fn send_joined(joined: &mut Joined) {
         if sent % 2048 == 0 {
             let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
             tracing::info!(
-                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
+                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet, {} parts sent apart because they read on the CPU what a part taken writes",
                 n[0],
                 n[1],
                 n[0] as f64 / n[1].max(1) as f64,
                 n[2] as f64 / n[1].max(1) as f64,
                 n[3],
-                n[4]
+                n[4],
+                n[5]
             );
         }
         match crate::host::host() {
@@ -738,11 +751,20 @@ fn release_held_now(all: bool) {
                     // without a wait for the card. A wait that stays is
                     // looked at again when the parts have been sent.
                     Some(Held::Value(wait)) if !all && !joined.is_empty() => {
-                        if !wait.met() && !crate::host::late_met_known(wait) {
-                            if !joined.meets(wait) {
-                                break;
+                        // The newest known write first: a part taken, then
+                        // the flights, memory last (#2611: memory asked
+                        // first passed a wait for 7 that a part taken turns
+                        // into 8). What is not known without the card waits.
+                        let (address, bytes) = wait.place();
+                        let mine = joined.last_write(address, bytes);
+                        let (flights, unsure) = crate::host::late_last_write(address, bytes);
+                        match crate::host::wait_holds_guarded(wait, mine, flights, unsure, || wait.met()) {
+                            Some(true) => {
+                                if matches!(mine, Some(Some(_))) {
+                                    JOINED[4].fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                            JOINED[4].fetch_add(1, Ordering::Relaxed);
+                            _ => break,
                         }
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
@@ -790,6 +812,15 @@ fn release_held_now(all: bool) {
                             }
                         }
                         if joining {
+                            // A part whose preparing reads on the CPU what
+                            // a part taken writes goes after them (the
+                            // bench's case d2): they are sent first.
+                            if joined.blocks(&lists, &order) {
+                                JOINED[5].fetch_add(1, Ordering::Relaxed);
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
                             // Taken, to go with the parts that follow it.
                             // The line stays open behind our mark.
                             if !joined.marked.contains(&q) {
