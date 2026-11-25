@@ -136,6 +136,14 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Of the tail before the present: list calls of ours, their
+    /// nanoseconds, and the presenting thread's time after its last call.
+    TailCalls,
+    TailCallNs,
+    TailOwnUs,
+    /// Pages a guard found written in blocks that have other views
+    /// (`watch::guard`).
+    AliasPages,
     /// Refreshes not asked for: nothing wrote their range since it was last
     /// refreshed (`watch::skip_unchanged`).
     SkippedUnchanged,
@@ -989,6 +997,11 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
+    // For the tail before the present: list calls since the last
+    // submission, and this thread's last call of ours.
+    TAIL_CALLS[0].fetch_add(1, Relaxed);
+    TAIL_CALLS[1].fetch_add(ns, Relaxed);
+    LAST_OURS.with(|l| l.set(now_us()));
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
     crate::framelog::add(crate::framelog::T::RecordCalls, 1);
@@ -1046,6 +1059,9 @@ pub(crate) fn submission_begins() {
 pub(crate) fn submission_ends(lock: u64) {
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
+    TAIL_CALLS[0].store(0, Relaxed);
+    TAIL_CALLS[1].store(0, Relaxed);
+    LAST_OURS.with(|l| l.set(now));
     let (user, kernel) = thread_times();
     let (u, k) = ENTERED.with(|e| e.get());
     LEFT.with(|l| l.set(Some((now, user, kernel))));
@@ -1060,7 +1076,73 @@ pub(crate) fn submission_ends(lock: u64) {
 
 /// The title calls its present (before our own copy to the window runs).
 pub(crate) fn present_begins() {
-    add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
+    let now = now_us();
+    add(C::TailUs, now.saturating_sub(SUBMITTED_AT.load(Relaxed)));
+    // What the tail was made of: list calls of ours on any thread since the
+    // last submission, and on the presenting thread the time since its own
+    // last call of ours (the title's own work, or a wait of its, before
+    // its present).
+    add(C::TailCalls, TAIL_CALLS[0].swap(0, Relaxed));
+    add(C::TailCallNs, TAIL_CALLS[1].swap(0, Relaxed));
+    let last = LAST_OURS.with(std::cell::Cell::get);
+    if last != 0 {
+        add(C::TailOwnUs, now.saturating_sub(last));
+    }
+}
+
+/// List calls since the last submission, and their nanoseconds.
+static TAIL_CALLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// When this thread last returned from a call of ours (a list call or
+    /// a submission), in [`now_us`]'s microseconds.
+    static LAST_OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A list's reset took `ns` on this thread (`HostList::reset`).
+pub(crate) fn reset_by_thread(ns: u64) {
+    let mut all = RESETS.lock().unwrap_or_else(|e| e.into_inner());
+    let id = thread_id();
+    if let Some(r) = all.iter_mut().find(|r| r.0 == id) {
+        (r.1, r.2) = (r.1 + ns, r.2 + 1);
+    } else if all.len() < 64 {
+        all.push((id, ns, 1));
+    }
+}
+
+/// Per thread (its id): the nanoseconds of list resets, and how many.
+static RESETS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
+
+/// With the frame line: the resets by phase and by thread, per frame.
+fn reset_line(frames: f64) {
+    let phases: Vec<f64> = crate::host::RESET_PHASES.iter().map(|p| p.swap(0, Relaxed) as f64 / 1e6 / frames).collect();
+    let mut threads = std::mem::take(&mut *RESETS.lock().unwrap_or_else(|e| e.into_inner()));
+    threads.sort_unstable_by_key(|t| std::cmp::Reverse(t.1));
+    let submit = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|s| s.0).collect::<Vec<u32>>();
+    let by: Vec<String> = threads
+        .iter()
+        .take(6)
+        .map(|&(id, ns, n)| {
+            format!(
+                "thread {id}{} {:.1} ms in {:.0}",
+                if submit.contains(&id) { " (submits)" } else { "" },
+                ns as f64 / 1e6 / frames,
+                n as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "lists reset per frame by phase: {:.1} ms waiting for the list's deferred work, {:.1} ms letting go of what it kept \
+         (host objects, upload buffers), {:.1} ms emptying its notes, {:.1} ms its scratch memory, {:.1} ms the allocator's Reset, \
+         {:.1} ms the list's Reset; by thread: {}",
+        phases[0],
+        phases[1],
+        phases[2],
+        phases[3],
+        phases[4],
+        phases[5],
+        if by.is_empty() { "none".to_string() } else { by.join(", ") }
+    );
 }
 
 /// A frame was presented.
@@ -1203,6 +1285,21 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
+    reset_line(frames);
+    tracing::info!(
+        "from the last submission to the present call per frame: {:.1} ms; {:.0} list calls of ours on all threads in it \
+         ({:.1} ms); the presenting thread's own work after its last call of ours: {:.1} ms",
+        ms(c[C::TailUs as usize]),
+        c[C::TailCalls as usize],
+        c[C::TailCallNs as usize] / 1e6,
+        ms(c[C::TailOwnUs as usize]),
+    );
+    tracing::info!(
+        "view pages copied again because a block with other views was found written, per frame: {:.0} pages, {:.1} MB \
+         (VICTORY_VIEW_GUARD's views of one page; for fork #1015)",
+        c[C::AliasPages as usize],
+        mb(c[C::AliasPages as usize] * crate::watch::PAGE as f64),
+    );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
@@ -1296,6 +1393,7 @@ pub(crate) fn log(frames: f64) {
         c[C::WatchKnownView as usize],
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

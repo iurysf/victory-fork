@@ -914,6 +914,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             if open {
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                #[cfg(feature = "diagnostics")]
+                if g.aliased.contains(&block) {
+                    crate::copystat::add(crate::copystat::C::AliasPages, (BLOCK / PAGE) as u64);
+                }
                 if g.protected.contains(&block) {
                     // Written through the runtime, still read-only.
                     g.clean.insert(block, block + 1);
