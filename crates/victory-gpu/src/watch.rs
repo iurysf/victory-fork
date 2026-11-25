@@ -1385,6 +1385,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     remapped_viewed(&mut g, at, len, view_known());
 }
 
+/// Remappings that kept their blocks known as view memory, since the last
+/// frame line ([`remapped_viewed`]).
+pub(crate) static REMAPS_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What a remapping of `[at, at + len)` leaves of the blocks known as view
 /// memory ([`view_known`]). With it on (fork fxceless 39731795d, its
 /// "watch_remap"): the runtime remaps for two things only (`xmem`'s `map`
@@ -1399,6 +1403,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 fn remapped_viewed(g: &mut Guards, at: usize, len: usize, keep: bool) {
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     if keep {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!("remapped title memory stays known as view memory (watch_remap, VICTORY_VIEW_KNOWN=1): on"));
+        REMAPS_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.viewed.extend(range);
         return;
     }

@@ -1106,12 +1106,16 @@ pub(crate) fn reset_by_thread(ns: u64) {
     if let Some(r) = all.iter_mut().find(|r| r.0 == id) {
         (r.1, r.2) = (r.1 + ns, r.2 + 1);
     } else if all.len() < 64 {
-        all.push((id, ns, 1));
+        // Our threads have names (victory-submit, victory-late-wait,
+        // victory-relay ...); the title's do not.
+        let name = std::thread::current().name().unwrap_or("a title thread").to_owned();
+        all.push((id, ns, 1, name));
     }
 }
 
-/// Per thread (its id): the nanoseconds of list resets, and how many.
-static RESETS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
+/// Per thread (its id): the nanoseconds of list resets, how many, and the
+/// thread's name.
+static RESETS: Mutex<Vec<(u32, u64, u64, String)>> = Mutex::new(Vec::new());
 
 /// With the frame line: the resets by phase and by thread, per frame.
 fn reset_line(frames: f64) {
@@ -1122,26 +1126,32 @@ fn reset_line(frames: f64) {
     let by: Vec<String> = threads
         .iter()
         .take(6)
-        .map(|&(id, ns, n)| {
+        .map(|(id, ns, n, name)| {
             format!(
-                "thread {id}{} {:.1} ms in {:.0}",
-                if submit.contains(&id) { " (submits)" } else { "" },
-                ns as f64 / 1e6 / frames,
-                n as f64 / frames
+                "thread {id} {name}{} {:.1} ms in {:.0}",
+                if submit.contains(id) { " (submits)" } else { "" },
+                *ns as f64 / 1e6 / frames,
+                *n as f64 / frames
             )
         })
         .collect();
     tracing::info!(
         "lists reset per frame by phase: {:.1} ms waiting for the list's deferred work, {:.1} ms letting go of what it kept \
          (host objects, upload buffers), {:.1} ms emptying its notes, {:.1} ms its scratch memory, {:.1} ms the allocator's Reset, \
-         {:.1} ms the list's Reset; by thread: {}",
+         {:.1} ms the list's Reset; by thread: {}; lists whose held objects were let go here, the release queue full \
+         (VICTORY_RELEASE_LATER=1), since the start: {}",
         phases[0],
         phases[1],
         phases[2],
         phases[3],
         phases[4],
         phases[5],
-        if by.is_empty() { "none".to_string() } else { by.join(", ") }
+        if by.is_empty() { "none".to_string() } else { by.join(", ") },
+        crate::host::RELEASED_HERE.load(Relaxed)
+    );
+    tracing::info!(
+        "remappings per frame that kept their blocks known as view memory (watch_remap, VICTORY_VIEW_KNOWN=1): {:.1}",
+        crate::watch::REMAPS_KEPT.swap(0, Relaxed) as f64 / frames
     );
 }
 

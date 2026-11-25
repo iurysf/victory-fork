@@ -2091,6 +2091,19 @@ impl Deferred {
     fn clear_reuse(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // With `VICTORY_RELEASE_LATER=1` what the list held (steps with
+        // their host copies, upload buffers, host objects, read-back
+        // buffers) goes to a thread of its own to be let go: the list's
+        // submission has run, nothing in flight uses them. Run P8-0 spent
+        // 10.6-15.5 ms a frame letting them go here, on one thread.
+        if release_later_on() && !(self.copies.is_empty() && self.uploads.is_empty() && self.kept.is_empty() && self.backs.is_empty()) {
+            release_later(Box::new(HeldAfterRun(
+                self.copies.drain(..).collect(),
+                self.uploads.drain(..).collect(),
+                self.kept.drain(..).collect(),
+                self.backs.drain(..).collect(),
+            )));
+        }
         self.copies.clear();
         self.uploads.clear();
         self.upload_bytes = 0;
@@ -2117,6 +2130,59 @@ impl Deferred {
         }
     }
 }
+
+/// What a reset list held after its submission ran ([`release_later`]).
+struct HeldAfterRun(
+    #[allow(dead_code)] Vec<Step>,
+    #[allow(dead_code)] Vec<ID3D12Resource>,
+    #[allow(dead_code)] Vec<windows::core::IUnknown>,
+    #[allow(dead_code)] Vec<(ID3D12Resource, usize, [usize; 3])>,
+);
+
+// SAFETY: D3D12 objects and our host copies are free-threaded; the list's
+// submission has run, so nothing else uses what is in here.
+unsafe impl Send for HeldAfterRun {}
+
+/// Whether a reset list's held objects are let go on a thread of their own
+/// (`VICTORY_RELEASE_LATER=1`; off by default).
+fn release_later_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_LATER").is_some_and(|v| v == "1"))
+}
+
+/// Drops `what` on the `victory-release` thread (after upstream
+/// Marvisak/VIctory 3e10052, Marvis): releasing D3D12 objects and host
+/// copies is kernel work. Only for things no GPU work in flight uses. The
+/// queue holds 256 at most; past that, or without the thread, they are let
+/// go here, as before (counted).
+fn release_later(what: Box<dyn std::any::Any + Send>) {
+    type Release = std::sync::mpsc::SyncSender<Box<dyn std::any::Any + Send>>;
+    static RELEASE: OnceLock<Option<Release>> = OnceLock::new();
+    let release = RELEASE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn std::any::Any + Send>>(256);
+        std::thread::Builder::new()
+            .name("victory-release".into())
+            .spawn(move || rx.into_iter().for_each(drop))
+            .ok()
+            .map(|_| tx)
+    });
+    match release {
+        Some(tx) => {
+            if let Err(e) = tx.try_send(what) {
+                RELEASED_HERE.fetch_add(1, Ordering::Relaxed);
+                drop(e);
+            }
+        }
+        None => {
+            RELEASED_HERE.fetch_add(1, Ordering::Relaxed);
+            drop(what);
+        }
+    }
+}
+
+/// Since the start: lists whose held objects were let go on the resetting
+/// thread because the release queue was full or had no thread.
+pub(crate) static RELEASED_HERE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Drop for Deferred {
     fn drop(&mut self) {
@@ -3692,6 +3758,25 @@ fn late_line(frames: f64) {
 #[cfg(test)]
 mod deferred_tests {
     use super::Deferred;
+
+    /// What is sent to be let go later is dropped, and on another thread.
+    #[test]
+    fn what_is_let_go_later_is_dropped_on_its_own_thread() {
+        struct Noted(std::sync::Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some(std::thread::current().id());
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::release_later(Box::new(Noted(seen.clone())));
+        let since = std::time::Instant::now();
+        while seen.lock().unwrap().is_none() && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        let dropped_on = seen.lock().unwrap().expect("dropped");
+        assert_ne!(dropped_on, std::thread::current().id(), "not on the thread that let it go");
+    }
 
     /// A list's reset empties its deferred work as a new one would be, and
     /// keeps the room of its lists. Every field is named, so a new one
