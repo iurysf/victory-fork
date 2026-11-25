@@ -390,6 +390,15 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut written = Vec::new();
+    writes_into(start, end, guarded, &mut written).map(|now| (now, written))
+}
+
+/// [`writes`] into `written` (emptied first), a list the caller keeps
+/// between askings: a new list at each asking showed in the submitting
+/// thread's profile (fork #987, cybx: vectors built from tree iterators
+/// 3.9 % and 3.1 % of its samples, their growth 3.3 %).
+pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, written: &mut Vec<(usize, u64)>) -> Option<u64> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -397,13 +406,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        written.clear();
+        written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        return Some(j.ahead_asked);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -472,13 +477,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    written.clear();
+    written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    Some(now)
 }
 
 impl Tracked {
@@ -1092,11 +1093,24 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         note(g, from, to);
         return;
     }
-    for block in from..to {
+    // Block by block; a block that is not committed answers for the whole
+    // uncommitted run it begins: one question to Windows, no protection
+    // asked for the rest of it (fork #987, cybx: 77 runs a frame were
+    // refused whole in the world, with 10,264 questions and 1,120
+    // protections a frame). The blocks noted absent are the same.
+    let mut block = from;
+    while block < to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+            block += 1;
+            continue;
+        }
+        let end = uncommitted_end(block).min(to);
+        if end > block {
+            g.absent.extend(block..end);
+            block = end;
+        } else {
+            block += 1;
         }
     }
 }

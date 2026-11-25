@@ -1526,6 +1526,12 @@ impl Drop for Scratch {
     }
 }
 
+thread_local! {
+    /// Room for the journal's answers to this thread's refreshes
+    /// (`crate::watch::writes_into`), kept between them (fork #987).
+    static WRITTEN: std::cell::Cell<Vec<(usize, u64)>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 const NOT_WATCHED: u8 = 2;
 
 // Fixed-size equality compiles to two SIMD comparisons on Windows x64.
@@ -3337,13 +3343,17 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            // The written pages in a list kept on the thread (fork #987).
+            let mut written = WRITTEN.take();
+            let Some(now) = crate::watch::writes_into(a, e, true, &mut written) else {
+                WRITTEN.set(written);
                 return true;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            WRITTEN.set(written);
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -3484,9 +3494,12 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let mut written = WRITTEN.take();
+            let now = crate::watch::writes_into(from, to, true, &mut written);
+            let copied = now.map(|now| self.copy_stale(from, to, now, &written));
+            WRITTEN.set(written);
+            if let Some(copied) = copied {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
