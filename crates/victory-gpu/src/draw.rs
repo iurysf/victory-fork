@@ -1515,6 +1515,9 @@ impl State {
         // sliced by 64).
         static SLICED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sliced = *SLICED.get_or_init(|| std::env::var_os("VICTORY_HEAP_SWEEP_SLICE").is_some_and(|v| v == "1"));
+        // May turn within a run (`crate::ab`): either way every slot is
+        // looked at again within `every` passes.
+        let sliced = crate::ab::flag(crate::ab::Key::HeapSweepSlice, sliced);
         let sweep = !sliced && *passes % every == 0;
         let slots = if sweep {
             ranges.clear();
@@ -1647,6 +1650,7 @@ impl State {
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::HeapViewsUs, started.elapsed().as_micros() as u64);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);

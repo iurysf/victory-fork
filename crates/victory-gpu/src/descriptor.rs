@@ -252,6 +252,7 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
+    crate::framelog::add(crate::framelog::T::SyncHeapsUs, started.elapsed().as_micros() as u64);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }

@@ -360,6 +360,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
@@ -472,7 +473,11 @@ pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, written: &mut
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+    }
+    if !failed {
+        kernel_answered(first, last, &j.found[..count]);
     }
     j.asked += 1;
     let now = j.asked;
@@ -773,7 +778,11 @@ impl CleanBlocks {
 /// maps or unmaps it ([`title_memory_remapped`]).
 fn view_known() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"));
+    // May turn within a run (`crate::ab`): off, the blocks remembered are
+    // not read, and a remapping forgets its own (`remapped_viewed`), so
+    // none stays from before a turn back on; on, they are learnt again.
+    crate::ab::flag(crate::ab::Key::ViewKnown, run)
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -1271,7 +1280,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 /// block by block, as before.
 fn guard_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"));
+    // May turn within a run (`crate::ab`): both ways note the same blocks.
+    crate::ab::flag(crate::ab::Key::GuardRuns, run)
 }
 
 /// Whether an asking that does not take the guards' answer returns at once
@@ -1280,7 +1291,9 @@ fn guard_runs() -> bool {
 /// as before.
 fn watch_view_early() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEW_EARLY").is_none_or(|v| v != "0"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEW_EARLY").is_none_or(|v| v != "0"));
+    // May turn within a run (`crate::ab`): both ways answer None.
+    crate::ab::flag(crate::ab::Key::WatchViewEarly, run)
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

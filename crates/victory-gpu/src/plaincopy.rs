@@ -90,9 +90,11 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// takes, so it is never a crash, only its cost.
 fn least() -> usize {
     static LEAST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *LEAST.get_or_init(|| {
+    let run = *LEAST.get_or_init(|| {
         std::env::var("VICTORY_COPY_PLAIN_LEAST").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(256, |n| n.min(4096))
-    })
+    });
+    // May turn within a run (`crate::ab`): only which copies are tried in place.
+    (crate::ab::number(crate::ab::Key::CopyPlainLeast, run as u64) as usize).min(4096)
 }
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:

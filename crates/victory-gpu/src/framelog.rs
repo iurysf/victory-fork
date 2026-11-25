@@ -100,6 +100,12 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// The pass over the heap's buffer views (`draw.rs`), `sync_heaps`,
+    /// and the write watches' askings of the kernel and the guards
+    /// (diagnostics builds only): for `crate::ab`'s parts of a frame.
+    HeapViewsUs,
+    SyncHeapsUs,
+    WatchUs,
     Count,
 }
 
@@ -595,8 +601,34 @@ pub fn frame() {
         state.recent.push_back(f.us);
     }
     let usual = median(state.recent.iter().copied());
-    for line in lines(&frames, usual, elapsed.as_secs_f64()) {
-        tracing::info!("{line}");
+    // The A/B within the run (`crate::ab`): this reading's numbers, and
+    // its tag at the end of the frame times line.
+    let ab = {
+        let all: Vec<&Frame> = frames.iter().collect();
+        let m = mean(&all);
+        let ms = |t: T| m.t[t as usize] / 1e3;
+        crate::ab::reading(crate::ab::Reading {
+            frame: median(frames.iter().map(|f| f.us)) / 1e3,
+            parts: [
+                ms(T::PrepareUs),
+                ms(T::CopyUs),
+                ms(T::HeapViewsUs),
+                ms(T::SyncHeapsUs),
+                ms(T::WatchUs),
+                ms(T::CardWaitUs),
+                ms(T::CardListsUs),
+            ],
+            draws: m.s[S_DRAWS],
+            at: frames.last().map_or(0.0, |f| f.at),
+            making: crate::pipeline::making(),
+        })
+    };
+    for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
+        if i == 0 {
+            tracing::info!("{line}{ab}");
+        } else {
+            tracing::info!("{line}");
+        }
     }
 }
 

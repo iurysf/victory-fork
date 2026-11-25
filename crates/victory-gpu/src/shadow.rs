@@ -452,7 +452,11 @@ fn card_take(c: &Card, sent_as: u64, fetched: u64) -> Vec<(usize, usize)> {
 /// copy in the card's memory is asked at every submission, as before.
 fn card_queue_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_QUEUE").is_none_or(|v| v != "0"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_QUEUE").is_none_or(|v| v != "0"));
+    // May turn within a run (`crate::ab`): copies are queued either way;
+    // the walk takes every copy's ranges and clears their marks, and a copy
+    // queued meanwhile is taken from the queue after the turn.
+    crate::ab::flag(crate::ab::Key::CardQueue, run)
 }
 
 /// Since the start: card copies found with changed ranges and not queued

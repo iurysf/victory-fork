@@ -551,9 +551,11 @@ fn join_parts() -> bool {
         }
         mode
     });
+    // May turn within a run (`crate::ab`): it is read once each time the
+    // lines are run, and every joined submission is sent before they return.
     match mode {
-        0 => false,
-        1 => true,
+        0 => crate::ab::flag(crate::ab::Key::JoinParts, false),
+        1 => crate::ab::flag(crate::ab::Key::JoinParts, true),
         _ => {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;

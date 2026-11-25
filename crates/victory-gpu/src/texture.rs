@@ -1850,7 +1850,10 @@ mod title_memory_tests {
 /// is hashed (`VICTORY_TEXTURE_HASH_EVERY`, 1 to 256; 8 by default).
 fn hash_every() -> u64 {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
+    let run = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(8, |n| n.clamp(1, 256))
-    })
+    });
+    // May turn within a run (`crate::ab`): only how soon a texture's turn
+    // comes.
+    crate::ab::number(crate::ab::Key::TextureHashEvery, run).clamp(1, 256)
 }

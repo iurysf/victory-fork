@@ -466,7 +466,10 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 /// page current (`put_back_own` in `crate::shadow`).
 pub(crate) fn back_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_some_and(|v| v == "1"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_some_and(|v| v == "1"));
+    // May turn within a run (`crate::ab`): each merged stretch goes one way
+    // or the other whole, and the pages it notes current hold its bytes.
+    crate::ab::flag(crate::ab::Key::BackOwnView, run)
 }
 
 /// A view of our own on a whole section of the title's physical pages:
