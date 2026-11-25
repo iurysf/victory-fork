@@ -1747,6 +1747,7 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
+    #[cfg(test)]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
         self.note_buffer_into(index, view, seen, None)
     }
