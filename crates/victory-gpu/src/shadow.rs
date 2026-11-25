@@ -2229,6 +2229,21 @@ mod merge_tests {
         assert!(changed_runs(&[], &[]).is_empty());
     }
 
+    /// Queued snapshots are taken by `take_snapshots` (what a copy's drop
+    /// does with `VICTORY_WIDE_BACK=1` before its mapping goes; fork #936).
+    #[test]
+    fn take_snapshots_flushes_queued_snaps_before_release() {
+        use super::{SNAPS, give_back, pooled, take_snapshots};
+        let src = vec![0x5Au8; 64 << 10];
+        let mut dst = pooled(32 << 10);
+        dst.resize(32 << 10, 0);
+        SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push((src.as_ptr() as usize, dst.as_mut_ptr() as usize, 32 << 10));
+        take_snapshots();
+        assert!(dst.iter().all(|&b| b == 0x5A));
+        assert!(SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        give_back(dst);
+    }
+
     /// The block-wise skip finds the same runs as a byte-wise comparison:
     /// across block and line edges, at the ends, for lengths that are not
     /// whole blocks (after upstream Marvisak/VIctory#2280's test).
@@ -2271,6 +2286,12 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Snapshots queued from this copy's mapping (`VICTORY_WIDE_BACK`)
+        // are taken before it goes, not read from freed memory later
+        // (fork #936).
+        if wide_back() && !SNAPS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            take_snapshots();
+        }
         if crate::watch::skip_unchanged() {
             crate::watch::unwatch_unchanged(self.start as usize, self.len as usize, &self.unchanged);
         }
