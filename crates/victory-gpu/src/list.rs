@@ -269,7 +269,12 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            // Its allocator and list reset, if the pool left them
+            // (`VICTORY_RESET_LATER`): here, on the thread that takes it.
+            list.reset_pending();
+            Some(list)
+        }
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -291,8 +296,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // goes, its allocators stay (reset here, or with
+        // VICTORY_RESET_LATER by whoever takes the list out).
+        host.reset_for_pool();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {

@@ -1139,7 +1139,8 @@ fn reset_line(frames: f64) {
         "lists reset per frame by phase: {:.1} ms waiting for the list's deferred work, {:.1} ms letting go of what it kept \
          (host objects, upload buffers), {:.1} ms emptying its notes, {:.1} ms its scratch memory, {:.1} ms the allocator's Reset, \
          {:.1} ms the list's Reset; by thread: {}; lists whose held objects were let go here, the release queue full \
-         (VICTORY_RELEASE_LATER=1), since the start: {}",
+         (VICTORY_RELEASE_LATER=1), since the start: {}; resets left to the thread taking the list that had to wait for the card \
+         (VICTORY_RESET_LATER=1; 0 expected), since the start: {}",
         phases[0],
         phases[1],
         phases[2],
@@ -1147,7 +1148,8 @@ fn reset_line(frames: f64) {
         phases[4],
         phases[5],
         if by.is_empty() { "none".to_string() } else { by.join(", ") },
-        crate::host::RELEASED_HERE.load(Relaxed)
+        crate::host::RELEASED_HERE.load(Relaxed),
+        crate::host::RESET_LATER_WAITED.load(Relaxed)
     );
     tracing::info!(
         "remappings per frame that kept their blocks known as view memory (watch_remap, VICTORY_VIEW_KNOWN=1): {:.1}",

@@ -860,6 +860,10 @@ pub(crate) struct HostList {
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
+    /// With [`reset_later`]: the host fence's value at which the card had
+    /// finished this list's allocator when it went to the pool not reset
+    /// (0: nothing pending; `HostList::reset_pending`).
+    reset_due: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2130,6 +2134,21 @@ impl Deferred {
         }
     }
 }
+
+/// Whether the allocator and list `Reset` of a list going to the pool of
+/// idle lists is left to the thread that takes it out
+/// (`VICTORY_RESET_LATER=1`; off by default). Run P8-0 put them at about
+/// 8 + 2-3 ms a frame on the submitting thread (186 lists, 43 us each),
+/// which limits the frame, while the title's threads that take lists out
+/// stood idle in the present 79-129 ms.
+fn reset_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESET_LATER").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: pending resets that found the fence short of their
+/// value and waited (never expected: the list was settled before).
+pub(crate) static RESET_LATER_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a reset list held after its submission ran ([`release_later`]).
 struct HeldAfterRun(
@@ -3759,6 +3778,36 @@ fn late_line(frames: f64) {
 mod deferred_tests {
     use super::Deferred;
 
+    /// A list left for its taker's reset (VICTORY_RESET_LATER) is reset by
+    /// `reset_pending`: once (a second call does nothing), after the fence
+    /// is known to have reached the noted value, and it records and runs
+    /// again afterwards.
+    #[test]
+    fn a_reset_left_to_the_taker_is_done_once_and_the_list_runs_again() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        list.close();
+        host.execute(&[&list]);
+        // What `reset_for_pool` does with the switch: the parts here, the
+        // allocator and list left, the fence's value noted.
+        list.reset_parts(false);
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { host.fence.GetCompletedValue() };
+        list.reset_due.store(done.max(1), std::sync::atomic::Ordering::Release);
+        let waited = super::RESET_LATER_WAITED.load(std::sync::atomic::Ordering::Relaxed);
+        list.reset_pending();
+        assert_eq!(list.reset_due.load(std::sync::atomic::Ordering::Acquire), 0, "done");
+        assert_eq!(super::RESET_LATER_WAITED.load(std::sync::atomic::Ordering::Relaxed), waited, "the card had finished");
+        list.reset_pending();
+        // Reset: it records and runs again.
+        list.close();
+        host.execute(&[&list]);
+    }
+
     /// What is sent to be let go later is dropped, and on another thread.
     #[test]
     fn what_is_let_go_later_is_dropped_on_its_own_thread() {
@@ -4182,6 +4231,7 @@ impl Host {
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
+                reset_due: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6491,6 +6541,82 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.reset_parts(true);
+    }
+
+    /// [`HostList::reset`] of a list whose submission has run, for the
+    /// pool of idle lists: with [`reset_later`], what it held is let go
+    /// here but its allocator and list are reset by [`HostList::reset_pending`]
+    /// on the thread that takes it out of the pool; else all of it here.
+    pub(crate) fn reset_for_pool(&self) {
+        if !reset_later() {
+            self.reset_parts(true);
+            return;
+        }
+        self.reset_parts(false);
+        // The card has finished every list of this allocator: the list is
+        // here because its submission was settled (`land` after `settle`).
+        // The fence's value now says so, and the reset that takes it waits
+        // for it to be reached (it always is) before it resets them.
+        let host = host().expect("a list of ours has a host");
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { host.fence.GetCompletedValue() };
+        self.reset_due.store(done.max(1), Ordering::Release);
+    }
+
+    /// The allocator and list reset that [`HostList::reset_for_pool`] left
+    /// for the thread taking the list out of the pool, if any: first the
+    /// card is known to have finished the allocator's lists (the fence at
+    /// the value noted then), then they are reset.
+    pub(crate) fn reset_pending(&self) {
+        let due = self.reset_due.swap(0, Ordering::AcqRel);
+        if due == 0 {
+            return;
+        }
+        let host = host().expect("a list of ours has a host");
+        // SAFETY: a plain query of our fence.
+        if unsafe { host.fence.GetCompletedValue() } < due {
+            RESET_LATER_WAITED.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: our fence; a null event waits here until it is reached.
+            let _ = unsafe { host.fence.SetEventOnCompletion(due, windows::Win32::Foundation::HANDLE::default()) };
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.reset_lists();
+        #[cfg(feature = "diagnostics")]
+        {
+            let ns = started.elapsed().as_nanos() as u64;
+            crate::copystat::add(crate::copystat::C::ResetNs, ns);
+            crate::copystat::reset_by_thread(ns);
+        }
+    }
+
+    /// The allocator's and the list's own `Reset` (the list not executing),
+    /// timed as phases 4 and 5 of [`RESET_PHASES`], and the card meter's
+    /// span for the list opened.
+    fn reset_lists(&self) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the list is not executing.
+        let reset = unsafe { self.allocator.Reset() };
+        #[cfg(feature = "diagnostics")]
+        let allocated = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        RESET_PHASES[4].fetch_add((allocated - started).as_nanos() as u64, Ordering::Relaxed);
+        // SAFETY: as above.
+        let reset = reset.and_then(|()| unsafe { self.list.Reset(&self.allocator, None) });
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        #[cfg(feature = "diagnostics")]
+        RESET_PHASES[5].fetch_add(allocated.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.meter
+            .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
+    }
+
+    /// The parts of [`HostList::reset`]; the allocator and list too if
+    /// `lists`.
+    fn reset_parts(&self, lists: bool) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // Diagnostics: the phases of a reset, each to the time it ended
@@ -6531,17 +6657,9 @@ impl HostList {
             }
         }
         lap(3);
-        // SAFETY: the list is not executing.
-        let reset = unsafe { self.allocator.Reset() };
-        lap(4);
-        // SAFETY: as above.
-        let reset = reset.and_then(|()| unsafe { self.list.Reset(&self.allocator, None) });
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
+        if lists {
+            self.reset_lists();
         }
-        lap(5);
-        self.meter
-            .store(crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             let ns = started.elapsed().as_nanos() as u64;
