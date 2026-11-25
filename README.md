@@ -28,6 +28,139 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
+## The `fx-main` branch: frame-rate work on an RTX 4070 (2026-11-25)
+
+This branch is the fork's `main`
+([fxceless/victory-fork](https://github.com/fxceless/victory-fork)) at
+`0b0074e` with 29 commits on top, all for one goal: **10 frames a second or
+more in the world on one machine** (100 ms a frame). It is not there yet:
+4.8 frames a second in the yard after the prologue, 7.0 in the lighter scene
+measured now. Test machine: Windows 11, AMD Ryzen 7 5800X3D, NVIDIA RTX 4070
+12 GB, 32 GB RAM; Series X profile, 1440p, the argument clamp left on.
+
+How it is measured: one build per step, the same save and the same spot, the
+character not moved. The number is the median frame time over the last 30
+seconds of the settled scene, and two saved frames of every run are looked
+at. Two equal runs differ by 20 to 25 ms, so a difference under 40 ms between
+two single runs is not called a gain. A change is first replayed on a bench
+outside the game (not in this tree); only what wins there lands here, and the
+game is run again for a stack of them.
+
+| Run | Tree | Scene | Frame | Notes |
+|-----|------|-------|-------|-------|
+| P3-0 | `33f0ddc` | yard after the prologue, about 5,000 draws a frame | 245.6 ms (4.1 fps) | the base with #864 and #916 |
+| P4-0 | `7a36d8f` | same | 206.6 ms (4.8 fps) | card patches, the wide compare, block compares; the picture is right |
+| P5-0 | `4c73c5a` | same | 233.1 ms (4.3 fps) | slower, with a block of scrambled texture: see "Found and fixed" |
+| P6-0 | `c1005e5` | the room a save from the middle of the story opens in, about 1,265 draws a frame | 143.4 ms (7.0 fps) | the scene measured from now on; not comparable with the rows above |
+
+Each row is a single run: read it with the 20 to 25 ms above in mind.
+
+### What the commits change
+
+Waits for the card:
+- Title bytes that change under shader writes still in flight go up as
+  masked dword patches in one compute pass, not a copy per run (`39bddda`,
+  `2b6df7f`, after upstream #2257 by TaynanGT). The submit thread waited
+  56.6 ms a frame for "title memory changed under shader writes" in run
+  P3-0, 0.0 in P4-0. The patches are exact: no merging over gaps.
+- A submission's room for long runs is 2,048 copies, not 512 (`f86c728`):
+  the wait had come back in P5-0 (11 to 36 ms a frame); 0.0 in P6-0.
+
+The card's time:
+- The compare of card copies hashes a 64 KiB piece with a group of 256
+  threads, not one (`0c221cf`): 41.4 ms of the card a frame in P3-0, 11.5
+  in P5-0 (the same scene); 145.4 to 2.41 ms on the bench.
+- Indirect argument clamps of a list's first part are done once in the
+  list's prelude, behind `VICTORY_INDIRECT_HOIST=1`, off by default
+  (`1ccf04f`, a port of upstream #2472 by ESAT586 that leaves the title's
+  argument buffers untouched). Bench, 5,000 draws: 16.6 to 0.38 ms of the
+  card. **Not run in the game yet.**
+- A draw window's records are clamped in lane order (`1dd2f8d`, fork #864
+  by xiaotu030202).
+
+The submit thread:
+- No allocation per send or page in the card patches and merges, and a
+  snapshot pool that does not run out (`c9119ad`, `00f8eae`): about 15,000
+  page faults a frame in P4-0, 4,091 in P5-0 (1,407 in P6-0's scene).
+- The guards' clean blocks are kept as runs (`e3a97bd`, fork #979 by
+  gmankab) and a copy registers once per 4 MiB for `VICTORY_SKIP_UNCHANGED`
+  (`c1005e5`): 16.2 to 2.2 ms on the bench.
+- A submission refreshes a copy's ranges disjoint, not their span
+  (`4c73c5a`, upstream #2428 by borosf); copy-backs and merges compare a
+  block at a time (`fbc1ad8`, upstream #2280 by wbkepler and wrothgaril)
+  and the relay's merge goes eight bytes at a time (`3f4fd76`).
+- The heap pass is not handed intact slots again (`f2eeece`); a list's
+  reset keeps its room (`1839451`).
+- Switches, off by default: `VICTORY_SKIP_UNCHANGED=1` (after upstream
+  #2136 by r4tedx), `VICTORY_FILL_WAIT_PIECE=1`, `VICTORY_HEAP_SKIP_INTACT=1`
+  (`4939985`); `VICTORY_COPY_PLAIN_LEAST` (`77be016`);
+  `VICTORY_TEXTURE_HASH_EVERY` (`7c8a584`).
+
+Found and fixed (run P5-0's regression, reproduced on the bench first):
+- `VICTORY_REFRESH_ONCE=1` does not take a write out of the copies made
+  through the page's other addresses. It is the first suspect for the
+  scrambled block and is left off; the block has not been seen since (one
+  run, another scene).
+- A file read into title memory left copies holding the bytes from before
+  it as current (`c1005e5`).
+- After fork #807 by AscilCH (`4e07c45`, `9bfb636`), every slot made by a
+  draw or the API was mirrored again at the next sync, about 6,000 a frame;
+  such a slot now keeps its record's fingerprint (`34a256b`).
+
+Stability and memory:
+- Constant buffer views are 64 KiB at most: NVIDIA removed the device for a
+  larger one (`892c0ef`, by douline).
+- A copy dropped with snapshots still queued no longer leaves freed memory
+  to be read (`29dafa3`, fork #936 by faycalbaklouti).
+- Only a shader that can store by address declares its title-memory copies
+  written (`33f0ddc`, fork #916 by SpaghettiMaster545).
+- Leaks the bench's audit found: placed sizes and view shapes keyed without
+  the description's filler words (196,608 entries on a replay, 256 without),
+  closed sections retired, gone heaps let go (`06b930b`, `7244da4`).
+- `VICTORY_PATCH=rva=hexbytes[:expected]` writes bytes into the prepared
+  copy of the executable in memory, never into the game's files, and only
+  where the expected bytes are found (`d3b27f7`). The test runs use it to
+  start from a save in the middle of the story, after
+  [ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import)
+  by LilBigJP.
+
+### The switches of the measured runs
+
+```
+VICTORY_INPLACE=0 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1
+VICTORY_INDIRECT_WINDOW=1 VICTORY_COPY_PLAIN=1 VICTORY_COPY_PLAIN_LEAST=16
+VICTORY_CAPTURE_WORLD_EVERY=64 VICTORY_SKIP_UNCHANGED=1
+VICTORY_FILL_WAIT_PIECE=1 VICTORY_HEAP_SKIP_INTACT=1 VICTORY_WIDE_REFRESH=1
+VICTORY_VIEW_KNOWN=1 VICTORY_TEXTURE_HASH_EVERY=64
+```
+
+Not used: `VICTORY_REFRESH_ONCE` (see above), `VICTORY_CARD_FETCH_INFLIGHT`,
+`VICTORY_MERGE_GAP` (not exact), `VICTORY_TEXTURE_NO_WAIT`.
+
+### Where the frame goes now, and what is open
+
+Run P6-0, a usual frame of 135 ms: the title's render thread waits 82 ms in
+the present call for the submit thread, which works 94 ms (copies of title
+memory 33 ms for 65 MB; the heap 42 ms, 27 of them the pass over buffer
+views; the guards' watch 21.5 ms). The copy-back takes 53 ms on the relay
+thread. The card is busy about 89 of the 135 ms (from its idle time), 75.6
+ms of it in the title's own lists.
+
+- 43 ms a frame are still to be found in this scene.
+- Three costs did not fall with a scene of a quarter of the draws, cause not
+  known yet: the pass over buffer views (27 ms, almost no slot left as it
+  was), "lists reset" (23 to 30 ms, in spite of `1839451`), and 26 to 40 ms
+  between the last submission and the present call.
+- The picture of the test scene grows brighter from frame to frame until
+  much of it is white; cause not known.
+- About 24 GB of commit in use; the system's free commit fell to about 1 GB
+  in the last run.
+- The fork's `main` has moved on (`465b94f`); this branch has not merged it
+  yet.
+
+Everything below describes the fork's `main` on its author's machine, not
+this branch.
+
 ## Status of this fork (2026-11-25)
 
 **Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
