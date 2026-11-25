@@ -1352,8 +1352,28 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
+    remapped_viewed(&mut g, at, len, view_known());
+}
+
+/// What a remapping of `[at, at + len)` leaves of the blocks known as view
+/// memory ([`view_known`]). With it on (fork fxceless 39731795d, its
+/// "watch_remap"): the runtime remaps for two things only (`xmem`'s `map`
+/// and `unmap`): a range it has just mapped a section's pages into, and a
+/// view it is about to make a placeholder again; either way what stands
+/// there is view memory or a hole in it, so the blocks stay known as view
+/// memory. Forgotten, as before, the next asking about each range went to
+/// the kernel's write watch and failed (185-191 a frame in run P6-0), then
+/// to Windows' `VirtualQuery` walk (`is_view`). Only that knowledge is
+/// kept: the blocks' guards were taken out above, so their bytes are
+/// copied again at the next refresh whatever this says.
+fn remapped_viewed(g: &mut Guards, at: usize, len: usize, keep: bool) {
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if keep {
+        g.viewed.extend(range);
+        return;
+    }
     // What the range shows is new: no longer known to be a view.
-    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    let viewed: Vec<usize> = g.viewed.range(range).copied().collect();
     for block in viewed {
         g.viewed.remove(&block);
     }
@@ -2135,6 +2155,38 @@ mod unchanged_tests {
         assert!(w.covers(start + 4 * BLOCK, BLOCK));
         assert!(w.covers(start + 6 * BLOCK, len - 6 * BLOCK));
         unguard_fake(first, blocks, &w);
+    }
+
+    /// A remapping with VICTORY_VIEW_KNOWN keeps its blocks known as view
+    /// memory (no failed write-watch asking after it) and still takes
+    /// their guards and current bytes out; without the switch it forgets
+    /// them, as before.
+    #[test]
+    fn a_remapping_keeps_its_blocks_known_as_view_memory() {
+        let first = FAR + 1024;
+        guard_fake(first, 2);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, 2 * BLOCK);
+        let seen = watch_unchanged(start, len, &w).unwrap();
+        w.note(start, start + len, seen);
+        {
+            let mut g = guards();
+            g.protected.remove(&first);
+            g.protected.remove(&(first + 1));
+            g.clean.remove(first);
+            g.clean.remove(first + 1);
+            take_out_range(&g, start, start + len);
+            remapped_viewed(&mut g, start, len, true);
+            assert!(g.viewed.contains(&first) && g.viewed.contains(&(first + 1)), "kept as view memory");
+            assert!(!g.protected.contains(&first), "its guard is gone: the bytes are copied again");
+        }
+        assert!(!w.covers(start, len), "nothing of it is held current");
+        {
+            let mut g = guards();
+            remapped_viewed(&mut g, start, len, false);
+            assert!(!g.viewed.contains(&first) && !g.viewed.contains(&(first + 1)), "forgotten without the switch");
+        }
+        unwatch_unchanged(start, len, &w);
     }
 
     /// Memory not all guarded (write-watched, or a block open) is never
