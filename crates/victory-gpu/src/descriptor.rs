@@ -325,6 +325,12 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // The heap pass's note of the host heap (the host copies it holds,
+        // and a new heap at the same address must not find it).
+        if let Some(Some(host)) = self.host.get() {
+            crate::draw::heap_gone(std::ptr::from_ref(host) as usize);
+        }
     }
 }
 

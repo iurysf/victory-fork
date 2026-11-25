@@ -286,9 +286,55 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // A handle the system gave again: nothing of the section it named
+    // before may be used for this one.
+    forget_section(section);
     let mut v = views();
-    v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+}
+
+/// The runtime closes `section`'s handle (the views it mapped keep the
+/// pages alive on their own): our view of it, if any, is unmapped, and the
+/// handle is forgotten, so that a section made later under the same handle
+/// is never written through a view of this one ([`write_own`]).
+pub fn title_memory_section_gone(section: usize) {
+    forget_section(section);
+}
+
+fn forget_section(section: usize) {
+    {
+        let mut v = views();
+        let before = v.sections.len();
+        v.sections.retain(|s| s.0 != section);
+        let known = v.sections.len() != before;
+        // The title's views of it stay mapped and keep showing the same
+        // pages (and the guards keep opening them together), so they stay,
+        // under a name no live handle has: no write of ours goes through
+        // them ([`write_own`] finds no section by that name).
+        if known {
+            static RETIRED: AtomicU64 = AtomicU64::new(0);
+            let name = usize::MAX - RETIRED.fetch_add(1, Ordering::Relaxed) as usize;
+            let keys: Vec<(usize, u64)> = v.pages.range((section, 0)..=(section, u64::MAX)).map(|(&k, _)| k).collect();
+            for key in keys {
+                if let Some(shown) = v.pages.remove(&key) {
+                    v.pages.insert((name, key.1), shown);
+                }
+            }
+            for view in v.views.values_mut() {
+                if view.1 == section {
+                    view.1 = name;
+                }
+            }
+        }
+    }
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(view)) = own.as_mut().and_then(|own| own.remove(&section)) {
+        // SAFETY: a view we mapped ourselves (`write_own`), not used after
+        // this: the entry is gone under the same lock every write holds.
+        unsafe {
+            let _ = mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.base as *mut c_void });
+        }
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -1375,5 +1421,41 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    /// A closed section's handle is forgotten: no write of ours finds it,
+    /// its views keep their pages together under another name, and a new
+    /// section under the same handle starts clean.
+    #[test]
+    fn a_closed_section_is_retired() {
+        let section = 0x7a5e_0000usize;
+        let at = 1usize << 45;
+        title_memory_section(section, 4 * K64 as u64, false);
+        {
+            let mut v = views();
+            v.views.insert(at, (2 * K64, section, 0));
+            v.pages.entry((section, 0)).or_default().push(at);
+        }
+        title_memory_section_gone(section);
+        {
+            let v = views();
+            assert!(v.sections.iter().all(|s| s.0 != section));
+            let view = v.views.get(&at).expect("the title's view stays");
+            assert_ne!(view.1, section, "under another name");
+            assert!(v.pages.range((section, 0)..=(section, u64::MAX)).next().is_none());
+            assert!(v.pages.contains_key(&(view.1, 0)));
+        }
+        // A new section under the same handle shares nothing with it.
+        title_memory_section(section, 4 * K64 as u64, false);
+        assert!(views().pages.range((section, 0)..=(section, u64::MAX)).next().is_none());
+        title_memory_section_gone(section);
+        let mut v = views();
+        let name = v.views.remove(&at).map(|view| view.1).unwrap();
+        v.pages.remove(&(name, 0));
     }
 }

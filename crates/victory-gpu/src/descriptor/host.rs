@@ -211,11 +211,17 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
+        // Words 1 and 13 are the layout's filler (`crate::resource::texture_at`):
+        // whatever the title's stack held there made a new entry each time
+        // (196,608 of them in a bench replay of run P3-0, 256 without).
+        let mut key = *desc;
+        key[1] = 0;
+        key[13] = 0;
+        if let Some(&known) = self.sizes.get(&key) {
             return known;
         }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
+        let bytes = crate::resource::placed_bytes(&key);
+        self.sizes.insert(key, bytes);
         bytes
     }
 
@@ -966,10 +972,10 @@ impl HostHeap {
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
-                    PLACED_SPANS
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(std::sync::Arc::downgrade(&spans));
+                    let mut heaps = PLACED_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+                    // The spans of heaps gone since.
+                    heaps.retain(|w| w.strong_count() > 0);
+                    heaps.push(std::sync::Arc::downgrade(&spans));
                 }
                 spans
             },
@@ -3111,6 +3117,24 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The filler words of a description (1 and 13) make no new entry in
+    /// the size table.
+    #[test]
+    fn placed_sizes_ignore_the_filler() {
+        let mut spans = Spans::default();
+        let mut desc = [0u32; 14];
+        desc[0] = 3;
+        desc[2] = 256;
+        desc[3] = 256;
+        let first = spans.bytes(&desc);
+        for junk in 1..100u32 {
+            desc[1] = junk.wrapping_mul(0x9e37_79b9);
+            desc[13] = junk;
+            assert_eq!(spans.bytes(&desc), first);
+        }
+        assert_eq!(spans.sizes.len(), 1);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

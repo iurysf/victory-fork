@@ -376,6 +376,19 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// were ([`heap_skip_intact`]); since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Per host heap (by address): the heap pass's count and, per slot, the
+/// host copy and range its buffer view reads and the view it named.
+type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64)>;
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> = std::sync::Mutex::new(None);
+
+/// A host view heap goes: the heap pass lets go of the copies it kept
+/// for it.
+pub(crate) fn heap_gone(host: usize) {
+    if let Some(map) = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&host);
+    }
+}
+
 /// Whether the heap pass leaves a slot written since the last pass alone
 /// when its record names the same view as when the pass last took it
 /// (`VICTORY_HEAP_SKIP_INTACT=1`; off by default): no view made or looked
@@ -1432,10 +1445,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
@@ -1523,6 +1533,11 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        // Copies not refreshed for a while are mostly gone (their numbers
+        // are never used again): out, now and then.
+        if frame % 256 == 0 {
+            whole.retain(|_, last| *last + 256 > frame);
+        }
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
