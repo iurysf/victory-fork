@@ -585,15 +585,49 @@ fn kept_view_check(block: usize) {
 struct BlockSet {
     set: BTreeSet<usize>,
     runs: CleanBlocks,
+    /// Which of the two holds the blocks now (runs: [`guard_intervals`]).
+    runs_mode: bool,
 }
 
 impl BlockSet {
     const fn new() -> Self {
-        Self { set: BTreeSet::new(), runs: CleanBlocks(BTreeMap::new()) }
+        Self { set: BTreeSet::new(), runs: CleanBlocks(BTreeMap::new()), runs_mode: false }
+    }
+
+    /// The blocks moved into the other store if `runs` says another (under
+    /// the guards' lock, [`guards`]): the switch turned within the run.
+    fn store_as(&mut self, runs: bool) {
+        if self.runs_mode == runs {
+            return;
+        }
+        if runs {
+            let mut at: Option<(usize, usize)> = None;
+            for &block in &self.set {
+                match at {
+                    Some((from, to)) if to == block => at = Some((from, to + 1)),
+                    _ => {
+                        if let Some((from, to)) = at {
+                            self.runs.insert(from, to);
+                        }
+                        at = Some((block, block + 1));
+                    }
+                }
+            }
+            if let Some((from, to)) = at {
+                self.runs.insert(from, to);
+            }
+            self.set.clear();
+        } else {
+            for (&from, &to) in &self.runs.0 {
+                self.set.extend(from..to);
+            }
+            self.runs.0.clear();
+        }
+        self.runs_mode = runs;
     }
 
     fn contains(&self, block: &usize) -> bool {
-        if guard_intervals() {
+        if self.runs_mode {
             self.runs.uncovered(*block, *block + 1).is_empty()
         } else {
             self.set.contains(block)
@@ -601,7 +635,7 @@ impl BlockSet {
     }
 
     fn insert(&mut self, block: usize) {
-        if guard_intervals() {
+        if self.runs_mode {
             self.runs.insert(block, block + 1);
         } else {
             self.set.insert(block);
@@ -609,7 +643,7 @@ impl BlockSet {
     }
 
     fn remove(&mut self, block: &usize) {
-        if guard_intervals() {
+        if self.runs_mode {
             self.runs.remove(*block);
         } else {
             self.set.remove(block);
@@ -617,7 +651,7 @@ impl BlockSet {
     }
 
     fn extend(&mut self, range: std::ops::Range<usize>) {
-        if guard_intervals() {
+        if self.runs_mode {
             self.runs.insert(range.start, range.end);
         } else {
             self.set.extend(range);
@@ -626,7 +660,7 @@ impl BlockSet {
 
     /// The blocks of `range` in the set, in order.
     fn blocks_in(&self, range: std::ops::Range<usize>) -> Vec<usize> {
-        if !guard_intervals() {
+        if !self.runs_mode {
             return self.set.range(range).copied().collect();
         }
         runs_blocks_in(&self.runs, range)
@@ -634,7 +668,7 @@ impl BlockSet {
 
     /// How many blocks of `range` are in the set.
     fn count_in(&self, range: std::ops::Range<usize>) -> usize {
-        if !guard_intervals() {
+        if !self.runs_mode {
             return self.set.range(range).count();
         }
         runs_count_in(&self.runs, range)
@@ -673,11 +707,14 @@ fn runs_count_in(runs: &CleanBlocks, range: std::ops::Range<usize>) -> usize {
 /// takes the guards' lock once for a range all clean. After fork #1067
 /// (UwUCammie), adapted: the clean blocks were runs here already (#979),
 /// and what `guard` registers for the refresh stays (`register_refreshing`).
-/// The bench measured 1.73 -> 0.74 ms in the yard (block 3, B3-1). Not
-/// turned within a run (`crate::ab`): the two are two stores of one state.
+/// The bench measured 1.73 -> 0.74 ms in the yard (block 3, B3-1). May
+/// turn within a run (`crate::ab`): the guards' lock taken next moves the
+/// blocks into the other store ([`guards`]; some 150,000 blocks, once a
+/// turn, in a reading the A/B leaves out).
 fn guard_intervals() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_INTERVALS").is_some_and(|v| v == "1"))
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_INTERVALS").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::GuardRunsStore, run)
 }
 
 struct Guards {
@@ -1122,7 +1159,13 @@ fn unchanged_gone(at: usize, len: usize) {
 
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let runs = guard_intervals();
+    if g.protected.runs_mode != runs {
+        g.protected.store_as(runs);
+        g.viewed.store_as(runs);
+    }
+    g
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1909,6 +1952,30 @@ mod tests {
             }
             check(&runs, &blocks);
         }
+    }
+
+    /// `VICTORY_GUARD_INTERVALS` turned within a run: the blocks move from
+    /// one store into the other and back with nothing lost or added, and
+    /// answer the same in either.
+    #[test]
+    fn guard_blocks_move_between_stores_whole() {
+        let mut set = BlockSet::new();
+        for block in [3, 4, 5, 9, 20, 21] {
+            set.insert(block);
+        }
+        set.extend(30..40);
+        let want: Vec<usize> = set.blocks_in(0..64);
+        set.store_as(true);
+        assert!(set.runs_mode && set.set.is_empty());
+        assert_eq!(set.blocks_in(0..64), want);
+        assert_eq!(set.count_in(0..64), want.len());
+        assert!(set.contains(&4) && !set.contains(&6));
+        set.remove(&35);
+        set.store_as(false);
+        assert!(!set.runs_mode && set.runs.0.is_empty());
+        let mut less = want.clone();
+        less.retain(|&b| b != 35);
+        assert_eq!(set.blocks_in(0..64), less);
     }
 
     /// The guards' blocks as runs answer as one by one

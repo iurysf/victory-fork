@@ -80,12 +80,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 19] = [
     (Key::HeapLockfree, "HEAP_LOCKFREE", None),
     (Key::ShadowShared, "SHADOW_SHARED", None),
     (Key::GuardCoalesce, "GUARD_COALESCE", None),
-    (
-        Key::GuardRunsStore,
-        "GUARD_INTERVALS",
-        Some(
-            "the guards kept as runs of blocks or as single blocks are two stores of the same state; a turn would have              to carry one into the other under the guards' lock",
-        ),
+    (Key::GuardRunsStore, "GUARD_INTERVALS", None),
     (Key::CopyReadOnly, "COPY_READ_ONLY", None),
     (Key::WaitGuarded, "WAIT_GUARDED", None),
     (
