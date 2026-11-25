@@ -625,6 +625,28 @@ pub fn frame() {
         if let Some(line) = mark(&f) {
             tracing::info!("{line}");
         }
+        // The A/B by frames (`VICTORY_AB_FRAMES`): this frame's numbers.
+        if crate::ab::by_frames() {
+            let usual = median(state.recent.iter().copied());
+            let ms = |t: T| f.t[t as usize] / 1e3;
+            crate::ab::frame(crate::ab::Reading {
+                frame: f.us / 1e3,
+                parts: [
+                    ms(T::PrepareUs),
+                    ms(T::CopyUs),
+                    ms(T::HeapViewsUs),
+                    ms(T::SyncHeapsUs),
+                    ms(T::WatchUs),
+                    ms(T::CardWaitUs),
+                    ms(T::CardListsUs),
+                ],
+                draws: f.s[S_DRAWS],
+                at: f.at,
+                making: crate::pipeline::making(),
+                long: usual > 0.0 && f.us > usual * 1.5,
+                remap: ms(T::RemapUs),
+            });
+        }
         state.frames.push(f);
     }
     let elapsed = state.since.elapsed();
@@ -662,6 +684,8 @@ pub fn frame() {
             draws: m.s[S_DRAWS],
             at: frames.last().map_or(0.0, |f| f.at),
             making: crate::pipeline::making(),
+            long: false,
+            remap: ms(T::RemapUs),
         })
     };
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {

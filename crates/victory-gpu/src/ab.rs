@@ -124,6 +124,9 @@ pub(crate) struct Plan {
     start_s: Option<f64>,
     /// `VICTORY_AB_MIN_DRAWS`: the draws a frame of a steady reading (3,000).
     min_draws: f64,
+    /// `VICTORY_AB_FRAMES=N` (4 or more): blocks of N frames, turned and
+    /// measured frame by frame ([`frame`]), not readings of 5 s.
+    frames: Option<u32>,
 }
 
 /// `VICTORY_AB`'s plan, or why it is refused.
@@ -179,7 +182,7 @@ pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
                 .ok_or_else(|| format!("blocks {n:?}: a multiple of 4 (quartets A B B A)"))?,
         ),
     };
-    Ok(Plan { keys, name, readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0 })
+    Ok(Plan { keys, name, readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0, frames: None })
 }
 
 /// A number of seconds or draws from the environment: `None` if unset, not
@@ -203,6 +206,7 @@ fn plan() -> Option<&'static Plan> {
                 plan.after_s = after_s(env("VICTORY_AB_AFTER_S").as_deref());
                 plan.start_s = amount(env("VICTORY_AB_START_S").as_deref());
                 plan.min_draws = amount(env("VICTORY_AB_MIN_DRAWS").as_deref()).unwrap_or(3000.0);
+                plan.frames = amount(env("VICTORY_AB_FRAMES").as_deref()).map(|n| n as u32).filter(|&n| n >= 4);
                 MASK.store(plan.keys.iter().fold(0, |m, k| m | 1 << k.0 as u32), Relaxed);
                 let from = match plan.start_s {
                     Some(at) => format!("from the reading ending {at} s after the first frame (VICTORY_AB_START_S)"),
@@ -213,9 +217,12 @@ fn plan() -> Option<&'static Plan> {
                     ),
                 };
                 tracing::info!(
-                    "A/B within the run (VICTORY_AB={spec}): {} turned in quartets of blocks A B B A, {} readings a block{}, {from}",
+                    "A/B within the run (VICTORY_AB={spec}): {} turned in quartets of blocks A B B A, {} a block{}, {from}",
                     plan.name,
-                    plan.readings,
+                    match plan.frames {
+                        Some(n) => format!("{n} frames (VICTORY_AB_FRAMES; the first 2 left out)"),
+                        None => format!("{} readings", plan.readings),
+                    },
                     plan.blocks.map_or(String::new(), |n| format!(", {n} blocks"))
                 );
                 Some(plan)
@@ -289,6 +296,10 @@ pub(crate) struct Reading {
     pub draws: f64,
     pub at: f64,
     pub making: u64,
+    /// By frames: a frame over half as long again as the usual one.
+    pub long: bool,
+    /// By frames: the runtime's remapping in it, ms.
+    pub remap: f64,
 }
 
 /// The names of [`Reading::parts`].
@@ -300,11 +311,19 @@ const ORDER: [bool; 4] = [false, true, true, false];
 
 /// What [`State::step`] goes by.
 pub(crate) struct Settings {
+    /// Readings (or frames, [`by_frames`]) a block.
     pub readings: u32,
     pub blocks: Option<u32>,
     pub after_s: f64,
     pub start_s: Option<f64>,
     pub min_draws: f64,
+    /// Readings left out at the start of a block, as the switch turned in
+    /// them: 1 reading, 2 frames.
+    pub skip: u32,
+    /// Steady readings in a row before the blocks start: 3 readings, 48 frames.
+    pub steady_need: u32,
+    /// What a reading is: "readings" or "frames".
+    pub unit: &'static str,
 }
 
 /// Where the A/B is.
@@ -326,7 +345,7 @@ pub(crate) struct State {
     /// Readings of the blocks: kept; left out as the switch turned in them,
     /// with host pipelines being made, under the draws' floor. Quartets
     /// left out (a block of them kept no reading).
-    counts: [u64; 4],
+    counts: [u64; 6],
     left_out: u64,
     /// Every reading kept: when, and its frame (for the slope).
     kept: Vec<(f64, f64)>,
@@ -357,6 +376,8 @@ fn medians(readings: &[Reading]) -> Reading {
         draws: median(readings.iter().map(|r| r.draws).collect()),
         at: median(readings.iter().map(|r| r.at).collect()),
         making: 0,
+        long: false,
+        remap: median(readings.iter().map(|r| r.remap).collect()),
     }
 }
 
@@ -396,14 +417,14 @@ impl State {
             } else {
                 (self.steady, self.ready_at) = (0, None);
             }
-            if self.steady >= 3 && self.ready_at.is_none() {
+            if self.steady >= s.steady_need && self.ready_at.is_none() {
                 self.ready_at = Some(r.at);
             }
             self.started = self.ready_at.is_some_and(|at| r.at - at >= s.after_s);
             return Step { tag: "wait", b_next: false, line: None };
         }
         let b = ORDER[self.blocks as usize % 4];
-        let first = self.into == 0;
+        let first = self.into < s.skip;
         self.into += 1;
         if first {
             self.counts[1] += 1;
@@ -413,6 +434,12 @@ impl State {
         } else if r.draws < s.min_draws {
             // Another scene (a loading screen, a cut).
             self.counts[3] += 1;
+        } else if r.long {
+            // A frame half as long again as the usual one: a hitch.
+            self.counts[4] += 1;
+        } else if r.remap > 2.0 {
+            // The runtime remapping title memory for 2 ms or more.
+            self.counts[5] += 1;
         } else {
             self.counts[0] += 1;
             self.block.push(r);
@@ -440,7 +467,7 @@ impl State {
                 _ => self.left_out += 1,
             }
             self.quartet.clear();
-            line = Some(self.line(name, last, s.min_draws));
+            line = Some(self.line(name, last, s.min_draws, s.unit));
         }
         if last {
             self.done = true;
@@ -450,12 +477,13 @@ impl State {
     }
 
     /// The line of the quartets so far.
-    fn line(&self, name: &str, end: bool, floor: f64) -> String {
+    fn line(&self, name: &str, end: bool, floor: f64, unit: &str) -> String {
         let k = self.quartets.len();
         let readings = format!(
-            "readings: {} kept, {} left out as the switch turned in them, {} with host pipelines being made, {} under {floor} \
-             draws a frame; {} quartets left out (a block kept no reading)",
-            self.counts[0], self.counts[1], self.counts[2], self.counts[3], self.left_out
+            "{unit}: {} kept, {} left out as the switch turned in them, {} with host pipelines being made, {} under {floor} \
+             draws a frame, {} long (half as long again as the usual frame), {} with 2 ms or more of remapping; {} quartets \
+             left out (a block kept no reading)",
+            self.counts[0], self.counts[1], self.counts[2], self.counts[3], self.counts[4], self.counts[5], self.left_out
         );
         if k == 0 {
             return format!("A/B {name}{}: no quartet kept yet; {readings}", if end { " (the end: A from here on)" } else { "" });
@@ -475,24 +503,83 @@ impl State {
         let (qa, qb) = self.quartets.last().map_or((0.0, 0.0), |q| (a(q), b(q)));
         let within: Vec<f64> = self.quartets.iter().map(|q| q[3].frame - q[0].frame).collect();
         let parts: Vec<String> = PARTS.iter().enumerate().map(|(i, p)| format!("{p} {}", summary(&diffs(&|r| r.parts[i])))).collect();
+        // The spread of each part's B - A between quartets (its standard
+        // deviation): what a part varies by with nothing turned.
+        let spread = |d: &[f64]| -> f64 {
+            let n = d.len() as f64;
+            if n < 2.0 {
+                return 0.0;
+            }
+            let m = d.iter().sum::<f64>() / n;
+            (d.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (n - 1.0)).sqrt()
+        };
+        let spreads: Vec<String> =
+            PARTS.iter().enumerate().map(|(i, p)| format!("{p} {:.1}", spread(&diffs(&|r| r.parts[i])))).collect();
+        let preparing = diffs(&|r| r.parts[0]);
+        let per_k = diffs(&|r| if r.draws > 0.0 { r.frame * 1000.0 / r.draws } else { 0.0 });
         format!(
-            "A/B {name}{}: quartet {k} (blocks A B B A): frame A {qa:.1} B {qb:.1} ms, B - A {:+.1}; all {k} quartets: frame median \
-             A {:.1} B {:.1} ms, B - A by quartet {}, median {}; the frame's slope over the run {:+.2} ms a minute, within the \
-             quartets (the second A block less the first) {}; B - A of where a frame goes (median, range, sign): {}; {readings}",
+            "A/B {name}{}: quartet {k} (blocks A B B A): frame A {qa:.1} B {qb:.1} ms, B - A {:+.1}; all {k} quartets: preparing \
+             B - A {} (spread {:.1}), ms per 1,000 draws B - A {}; frame median A {:.1} B {:.1} ms, B - A by quartet {}, median {}; \
+             the frame's slope over the run {:+.2} ms a minute, within the quartets (the second A block less the first) {}; B - A \
+             of where a frame goes (median, range, sign): {}; spread between quartets by part: {}; {readings}",
             if end { " (the end: A from here on)" } else { "" },
             qb - qa,
+            summary(&preparing),
+            spread(&preparing),
+            summary(&per_k),
             median(self.quartets.iter().map(a).collect()),
             median(self.quartets.iter().map(b).collect()),
             each.join(" "),
             summary(&frames),
             slope(&self.kept),
             summary(&within),
-            parts.join("; ")
+            parts.join("; "),
+            spreads.join(", ")
         )
     }
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+/// What [`State::step`] goes by for `plan`.
+fn settings(plan: &Plan) -> Settings {
+    let (readings, skip, steady_need, unit) = match plan.frames {
+        Some(n) => (n, 2, 48, "frames"),
+        None => (plan.readings, 1, 3, "readings"),
+    };
+    Settings {
+        readings,
+        blocks: plan.blocks,
+        after_s: plan.after_s,
+        start_s: plan.start_s,
+        min_draws: plan.min_draws,
+        skip,
+        steady_need,
+        unit,
+    }
+}
+
+/// Whether the A/B goes by frames (`VICTORY_AB_FRAMES`).
+pub(crate) fn by_frames() -> bool {
+    plan().is_some_and(|p| p.frames.is_some())
+}
+
+/// At each frame, with [`by_frames`]: moves the A/B along.
+pub(crate) fn frame(r: Reading) {
+    let Some(plan) = plan() else {
+        return;
+    };
+    if plan.frames.is_none() {
+        return;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.get_or_insert_with(State::default);
+    let step = state.step(&settings(plan), r, &plan.name);
+    if let Some(line) = &step.line {
+        tracing::info!("{line}");
+    }
+    B.store(step.b_next, Relaxed);
+}
 
 /// At each frame-log reading: moves the A/B along; the reading's tag for
 /// its line (empty with no A/B).
@@ -502,14 +589,12 @@ pub(crate) fn reading(r: Reading) -> String {
     };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let state = state.get_or_insert_with(State::default);
-    let settings = Settings {
-        readings: plan.readings,
-        blocks: plan.blocks,
-        after_s: plan.after_s,
-        start_s: plan.start_s,
-        min_draws: plan.min_draws,
-    };
-    let step = state.step(&settings, r, &plan.name);
+    if plan.frames.is_some() {
+        // By frames ([`frame`]): the reading only says where the A/B is.
+        let tag = if state.done { "done" } else if !state.started { "wait" } else if B.load(Relaxed) { "B" } else { "A" };
+        return format!("; A/B {} {tag} (by frames)", plan.name);
+    }
+    let step = state.step(&settings(plan), r, &plan.name);
     if let Some(line) = &step.line {
         tracing::info!("{line}");
     }
@@ -576,11 +661,11 @@ mod tests {
             }
             lines.extend(state.step(&s, r, "TEST").line);
         }
-        assert_eq!(state.counts, [14, 8, 1, 1]);
+        assert_eq!(state.counts, [14, 8, 1, 1, 0, 0]);
         assert_eq!((state.quartets.len(), state.left_out), (1, 1));
         let last = lines.last().unwrap();
         assert!(
-            last.ends_with("readings: 14 kept, 8 left out as the switch turned in them, 1 with host pipelines being made, 1 under 3000 draws a frame; 1 quartets left out (a block kept no reading)"),
+            last.ends_with("readings: 14 kept, 8 left out as the switch turned in them, 1 with host pipelines being made, 1 under 3000 draws a frame, 0 long (half as long again as the usual frame), 0 with 2 ms or more of remapping; 1 quartets left out (a block kept no reading)"),
             "{last}"
         );
     }
@@ -603,7 +688,31 @@ mod tests {
             draws: if steady { 5000.0 } else { 100.0 },
             at: 5.0 * i as f64,
             making: 0,
+            long: false,
+            remap: 0.0,
         }
+    }
+
+    /// By frames: blocks of N frames with the first 2 left out; long
+    /// frames and frames with 2 ms of remapping left out too, counted.
+    #[test]
+    fn by_frames_two_frames_turn_and_hitches_are_left_out() {
+        let s = Settings { readings: 4, blocks: Some(4), after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 2, steady_need: 3, unit: "frames" };
+        let mut state = State::default();
+        let mut lines = Vec::new();
+        for i in 0..5 + 16 {
+            let mut r = reading(i, if i == 12 { 900.0 } else { 100.0 });
+            r.long = i == 12;
+            if i == 15 {
+                r.remap = 3.0;
+            }
+            lines.extend(state.step(&s, r, "TEST").line);
+        }
+        // 4 blocks of 4: 8 frames as the switch turned, 1 long, 1 remapping.
+        assert_eq!(state.counts, [6, 8, 0, 0, 1, 1]);
+        let last = lines.last().unwrap();
+        assert!(last.contains("frames: 6 kept, 8 left out as the switch turned in them"), "{last}");
+        assert!(last.contains("preparing B - A +0.0") && last.contains("ms per 1,000 draws B - A +0.0"), "{last}");
     }
 
     /// Runs the A/B over readings made by `ms(b, index)` (b: the arm the
@@ -622,13 +731,13 @@ mod tests {
     }
 
     fn settings(readings: u32, blocks: Option<u32>) -> Settings {
-        Settings { readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0 }
+        Settings { readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" }
     }
 
     #[test]
     fn the_blocks_may_start_at_a_time_or_at_fewer_draws() {
         // At a time: readings end every 5 s; from 20 s on, steady or not.
-        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: Some(20.0), min_draws: 3000.0 };
+        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: Some(20.0), min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" };
         let mut state = State::default();
         let tags: Vec<&str> = (0..7)
             .map(|i| {
@@ -640,7 +749,7 @@ mod tests {
         // Reading 4 ends at 20 s: the next one opens the first block.
         assert_eq!(tags, ["wait", "wait", "wait", "wait", "wait", "A-", "A"]);
         // At fewer draws: 1,000 a frame count as steady with a floor of 900.
-        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: None, min_draws: 900.0 };
+        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: None, min_draws: 900.0, skip: 1, steady_need: 3, unit: "readings" };
         let mut state = State::default();
         let tags: Vec<&str> = (0..5)
             .map(|i| {
@@ -671,7 +780,7 @@ mod tests {
         // Readings of 400 ms (still loading) do not count, nor ones with
         // pipelines being made; then three steady ones, then 10 s more.
         let mut state = State::default();
-        let s = Settings { readings: 2, blocks: None, after_s: 10.0, start_s: None, min_draws: 3000.0 };
+        let s = Settings { readings: 2, blocks: None, after_s: 10.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" };
         let mut tags = Vec::new();
         for i in 0..10 {
             let mut r = reading(i, if i < 3 { 400.0 } else { 150.0 });
