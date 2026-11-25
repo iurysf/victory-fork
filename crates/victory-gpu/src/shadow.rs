@@ -919,15 +919,38 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    // Eight bytes at a time (the relay merged 89 MB a frame a byte at a
+    // time in run P4-0; 2.5 times faster on the bench with threads): a
+    // byte the card changed (`now` against `held`) goes into `title`, and
+    // `held` becomes `now` (where they are equal it is already).
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let n = now.len().min(held.len()).min(title.len());
+    let words = n / 8;
+    let mut differs = 0u64;
+    for k in 0..words {
+        let r = k * 8..k * 8 + 8;
+        let w = u64::from_ne_bytes(now[r.clone()].try_into().unwrap());
+        let h = u64::from_ne_bytes(held[r.clone()].try_into().unwrap());
+        let t = u64::from_ne_bytes(title[r.clone()].try_into().unwrap());
+        // The high bit of each byte that differs, then the whole byte.
+        let x = w ^ h;
+        let wrote = ((((x & LOW) + LOW) | x) & HIGH) >> 7;
+        let wrote = wrote * 0xff;
+        let merged = (t & !wrote) | (w & wrote);
+        differs |= merged ^ t;
+        title[r.clone()].copy_from_slice(&merged.to_ne_bytes());
+        held[r].copy_from_slice(&w.to_ne_bytes());
     }
-    differs != 0
+    let mut tail = 0u8;
+    for i in words * 8..n {
+        let wrote = if now[i] != held[i] { 0xffu8 } else { 0 };
+        let merged = (title[i] & !wrote) | (now[i] & wrote);
+        tail |= merged ^ title[i];
+        title[i] = merged;
+        held[i] = now[i];
+    }
+    differs != 0 || tail != 0
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1316,6 +1339,52 @@ mod relay_tests {
         let mut wrong_cpu = cpu.clone();
         merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
         assert_eq!(wrong_title[30], base[30]);
+    }
+
+    /// The eight-bytes-at-a-time merge does what a byte-wise one does, for
+    /// every length (tails not a multiple of 8), every byte value, and
+    /// whether anything changed.
+    #[test]
+    fn merge_piece_matches_a_byte_wise_merge() {
+        let naive = |now: &[u8], held: &mut [u8], title: &mut [u8]| {
+            let mut changed = false;
+            for i in 0..now.len() {
+                if now[i] != held[i] {
+                    changed |= title[i] != now[i];
+                    title[i] = now[i];
+                    held[i] = now[i];
+                }
+            }
+            changed
+        };
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 1000, 4099] {
+            for round in 0..20 {
+                let held0: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                // Some bytes changed by the card, of every value (0x80 and
+                // 0x00 among them), some changed back to what was held.
+                let now: Vec<u8> = held0
+                    .iter()
+                    .map(|&h| match next() % 4 {
+                        0 => next() as u8,
+                        1 => h ^ 0x80,
+                        _ => h,
+                    })
+                    .collect();
+                let title0: Vec<u8> = (0..len).map(|i| if round % 3 == 0 { now[i] } else { next() as u8 }).collect();
+                let (mut h1, mut t1) = (held0.clone(), title0.clone());
+                let (mut h2, mut t2) = (held0.clone(), title0.clone());
+                let c1 = merge_piece(&now, &mut h1, &mut t1);
+                let c2 = naive(&now, &mut h2, &mut t2);
+                assert_eq!((t1, h1, c1), (t2, h2, c2), "length {len}, round {round}");
+            }
+        }
     }
 }
 
