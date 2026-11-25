@@ -46,7 +46,13 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// In pieces of [`KEPT_PIECE`] slots, each behind a lock of its own
+    /// (fork #1146, beamdotdev: the recording threads make their tables'
+    /// slots at the same time, and stood in line for one lock); with
+    /// `VICTORY_HEAP_LESS=0` [`HostHeap::kept_all`] is taken too, so they
+    /// are one lock's as before.
+    kept: Vec<Mutex<Vec<Option<ID3D12Resource>>>>,
+    kept_all: Mutex<()>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -103,6 +109,9 @@ pub(crate) struct HostHeap {
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
 }
+
+/// The slots of one piece of [`HostHeap::kept`].
+const KEPT_PIECE: u32 = 1024;
 
 /// [`HostHeap::slot_flags`]: the title slot may be in the queue of textures
 /// picked by index (set before it goes in; cleared when it is taken out).
@@ -1070,7 +1079,8 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             copied: Mutex::new(Vec::new()),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: (0..(count + extra).div_ceil(KEPT_PIECE)).map(|_| Mutex::new(vec![None; KEPT_PIECE as usize])).collect(),
+            kept_all: Mutex::new(()),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1421,13 +1431,7 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+        made.get(index as usize).is_some_and(|&made| made != 0 && made == key) && self.kept_some(index)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1907,14 +1911,34 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+        let Some(piece) = self.kept.get((index / KEPT_PIECE) as usize) else {
+            return;
+        };
+        let all = self.kept_lock();
+        let old = {
+            let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut kept[(index % KEPT_PIECE) as usize], resource)
+        };
+        // A running submission may still read the old resource through
+        // this slot. (With `VICTORY_HEAP_LESS=1` outside the slots' locks:
+        // letting go takes another, or frees a host resource.)
+        drop(all);
+        if let Some(old) = old {
+            crate::host::retire(old);
         }
+    }
+
+    /// [`HostHeap::kept_all`], with `VICTORY_HEAP_LESS=0` ([`heap_less`]).
+    fn kept_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        (!heap_less()).then(|| self.kept_all.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Whether slot `index` holds a host resource.
+    fn kept_some(&self, index: u32) -> bool {
+        let _all = self.kept_lock();
+        self.kept.get((index / KEPT_PIECE) as usize).is_some_and(|piece| {
+            piece.lock().unwrap_or_else(|e| e.into_inner()).get((index % KEPT_PIECE) as usize).is_some_and(Option::is_some)
+        })
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -2493,8 +2517,9 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
+        let _all = self.kept_lock();
+        let kept = self.kept.get((index / KEPT_PIECE) as usize)?.lock().unwrap_or_else(|e| e.into_inner());
+        let shown = kept.get((index % KEPT_PIECE) as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 

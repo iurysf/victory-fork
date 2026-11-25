@@ -276,11 +276,38 @@ struct Views {
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: std::sync::RwLock<Views> =
+    std::sync::RwLock::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`VIEWS`] to read: shared with other readers with `VICTORY_HEAP_LESS=1`
+/// (fork #1117, RealAzemed: the recording threads' lookups of views of
+/// title memory stood in line behind one another), taken alone as before
+/// otherwise.
+enum ViewsRead {
+    Shared(std::sync::RwLockReadGuard<'static, Views>),
+    Alone(std::sync::RwLockWriteGuard<'static, Views>),
+}
+
+impl std::ops::Deref for ViewsRead {
+    type Target = Views;
+    fn deref(&self) -> &Views {
+        match self {
+            ViewsRead::Shared(v) => v,
+            ViewsRead::Alone(v) => v,
+        }
+    }
+}
+
+fn views_read() -> ViewsRead {
+    if crate::descriptor::host::heap_less() {
+        ViewsRead::Shared(VIEWS.read().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        ViewsRead::Alone(views())
+    }
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -386,7 +413,7 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
         return Vec::new();
     }
-    let v = views();
+    let v = views_read();
     let mut out = Vec::new();
     if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
         && base + bytes > start
@@ -402,7 +429,7 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
+    let v = views_read();
     let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
         return Vec::new();
     };
@@ -420,7 +447,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
+    let v = views_read();
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
@@ -499,7 +526,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     // shows these pages for as long as this is held.
     let _still = crate::watch::title_memory_reading_now()?;
     let (section, offset, shown, section_bytes) = {
-        let v = views();
+        let v = views_read();
         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
         if at + bytes.len() > base + len {
             return None;
@@ -598,7 +625,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&views_read().views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1144,7 +1171,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
             }
         }
     }
-    let v = views();
+    let v = views_read();
     let (count, bytes) = (v.views.len(), v.views.values().map(|view| view.0 as u64).sum::<u64>());
     let pages = v.views.values().filter(|view| view.0 == K64).count();
     let big = v.views.values().map(|view| view.0).max().unwrap_or(0);
@@ -1448,7 +1475,7 @@ mod section_tests {
         }
         title_memory_section_gone(section);
         {
-            let v = views();
+            let v = views_read();
             assert!(v.sections.iter().all(|s| s.0 != section));
             let view = v.views.get(&at).expect("the title's view stays");
             assert_ne!(view.1, section, "under another name");

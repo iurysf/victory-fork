@@ -1110,7 +1110,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack when they fit (fork #1117, RealAzemed: one
+                // allocation a draw a stage), with VICTORY_HEAP_LESS=1.
+                let mut on_stack = [0u32; 64];
+                let mut on_heap = Vec::new();
+                let values: &mut [u32] = if crate::descriptor::host::heap_less() && dwords as usize <= on_stack.len() {
+                    &mut on_stack[..dwords as usize]
+                } else {
+                    on_heap.resize(dwords as usize, 0);
+                    &mut on_heap
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
