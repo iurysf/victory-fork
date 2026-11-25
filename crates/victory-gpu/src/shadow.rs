@@ -4639,6 +4639,7 @@ mod card_merge_tests {
     /// title's byte is put back to the card's older one.
     #[test]
     fn a_title_byte_sent_after_a_flight_survives_its_slot() {
+        let _turn = crate::warp_turn();
         let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
             return;
         };

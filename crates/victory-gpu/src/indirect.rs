@@ -1177,10 +1177,14 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// One WARP device at work at a time (`crate::warp_turn`); last,
+        /// so it is let go after the device.
+        _turn: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let turn = crate::warp_turn();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -1219,6 +1223,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _turn: turn,
                 })
             }
         }

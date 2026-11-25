@@ -83,3 +83,18 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Tests: one software (WARP) device at work at a time. WARP's shader
+/// compiler fails now and then when devices of one process compile at the
+/// same time: the parallel test runs stopped with an access violation in
+/// `d3d10warp!JITBaseVariable::OptimizeCopy` and `FeCleanup::Pass2` (3 of 3
+/// stacks taken under cdb, each in another WARP test; 2 of 12 runs failed
+/// without any test of ours that frees objects on another thread).
+#[cfg(test)]
+static WARP_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`WARP_TURN`] for as long as the returned guard lives.
+#[cfg(test)]
+pub(crate) fn warp_turn() -> std::sync::MutexGuard<'static, ()> {
+    WARP_TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
