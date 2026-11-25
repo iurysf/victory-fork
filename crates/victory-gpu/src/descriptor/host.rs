@@ -1560,6 +1560,13 @@ impl HostHeap {
         buffers.iter().copied().collect()
     }
 
+    /// The slots holding a buffer view whose index is in `range` (a slice
+    /// of the heap for [`crate::draw`]'s sliced sweep).
+    pub(crate) fn buffer_slots_in(&self, range: std::ops::Range<u32>) -> Vec<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.range(range).copied().collect()
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {

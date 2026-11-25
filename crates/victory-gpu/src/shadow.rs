@@ -546,6 +546,36 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 }
 
 #[cfg(test)]
+mod find_memo_tests {
+    use super::FindMemo;
+
+    /// The memo answers the same question again with the same answer and
+    /// asks again for any other: what the heap pass gets from it is what
+    /// it got from asking twice.
+    #[test]
+    fn the_memo_answers_only_the_same_question() {
+        let mut memo = FindMemo::default();
+        let mut looked = 0;
+        let mut ask = |memo: &mut FindMemo, key: (u64, u64)| {
+            memo.get_or(key, || {
+                looked += 1;
+                None
+            })
+        };
+        assert!(ask(&mut memo, (0x1000, 64)).is_none());
+        assert!(ask(&mut memo, (0x1000, 64)).is_none());
+        assert_eq!(memo.hits, 1);
+        // Another length, another address: asked.
+        ask(&mut memo, (0x1000, 128));
+        ask(&mut memo, (0x2000, 128));
+        ask(&mut memo, (0x1000, 128));
+        assert_eq!(memo.hits, 1);
+        drop(ask);
+        assert_eq!(looked, 4);
+    }
+}
+
+#[cfg(test)]
 mod card_tests {
     use super::{CARD_PATCH_RUN, CardSpan, PIECE, PATCH_ROOM, Room, card_piece_of, card_span_of, dword_patches, joined, joined_piece_runs};
 
@@ -3927,7 +3957,59 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    FIND_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.as_mut() {
+            Some(memo) => memo.get_or((address, len), || lookup(address, len, false)),
+            None => lookup(address, len, false),
+        }
+    })
+}
+
+/// The last [`find`] of this thread and its answer, while
+/// [`with_find_memo`] runs: the same question asked again in it is answered
+/// without the buffers' lock. The heap pass asked twice per slot (making the
+/// slot's view, then which copy it shows: 9,576 asks for 4,788 slots in the
+/// bench of run P6-0).
+#[derive(Default)]
+pub(crate) struct FindMemo {
+    last: Option<((u64, u64), Option<Arc<Shadow>>)>,
+    /// Asks answered without looking (tests).
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl FindMemo {
+    /// The answer for `key`: the last one if it was for `key`, else
+    /// `look`'s, kept.
+    pub(crate) fn get_or(&mut self, key: (u64, u64), look: impl FnOnce() -> Option<Arc<Shadow>>) -> Option<Arc<Shadow>> {
+        if let Some((k, v)) = &self.last
+            && *k == key
+        {
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return v.clone();
+        }
+        let v = look();
+        self.last = Some((key, v.clone()));
+        v
+    }
+}
+
+thread_local! {
+    static FIND_MEMO: std::cell::RefCell<Option<FindMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with this thread's [`find`]s remembering their last answer
+/// (one slot of the heap pass: nothing in it makes or lets go of a copy
+/// between its two asks). Not nested.
+pub(crate) fn with_find_memo<R>(f: impl FnOnce() -> R) -> R {
+    FIND_MEMO.with(|m| *m.borrow_mut() = Some(FindMemo::default()));
+    let out = f();
+    FIND_MEMO.with(|m| *m.borrow_mut() = None);
+    out
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

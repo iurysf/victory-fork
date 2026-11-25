@@ -1507,10 +1507,27 @@ impl State {
         let every = *SWEEP.get_or_init(|| {
             std::env::var("VICTORY_HEAP_SWEEP").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(16, |n| n.clamp(1, 256))
         });
-        let sweep = *passes % every == 0;
+        // `VICTORY_HEAP_SWEEP_SLICE=1` (off by default): no pass over all
+        // slots; each pass looks again at a slice of them as well, the
+        // next 1/`VICTORY_HEAP_SWEEP` of the heap's indices, so that every
+        // slot is looked at again once in as many passes (run P6-0: 29,000
+        // slots every sixteenth pass, 3.6 ms on the bench; 0.01 a pass
+        // sliced by 64).
+        static SLICED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sliced = *SLICED.get_or_init(|| std::env::var_os("VICTORY_HEAP_SWEEP_SLICE").is_some_and(|v| v == "1"));
+        let sweep = !sliced && *passes % every == 0;
         let slots = if sweep {
             ranges.clear();
             host.buffer_slots()
+        } else if sliced {
+            let n = u64::from(host.count());
+            let k = *passes % every;
+            let (from, to) = ((n * k / every) as u32, (n * (k + 1) / every) as u32);
+            let mut slots = changed;
+            slots.extend(host.buffer_slots_in(from..to));
+            slots.sort_unstable();
+            slots.dedup();
+            slots
         } else {
             changed
         };
@@ -1537,7 +1554,13 @@ impl State {
                 continue;
             };
             let key = slot_key(handle);
-            let Some(view) = host.mirror(index, handle, true) else {
+            // One look for the slot's copy: making its view and finding the
+            // copy it shows ask the same (`crate::shadow::with_find_memo`).
+            let Some((_view, copy)) = crate::shadow::with_find_memo(|| {
+                let view = host.mirror(index, handle, true)?;
+                let copy = crate::descriptor::host::buffer_copy(&view);
+                Some((view, copy))
+            }) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1557,7 +1580,7 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             // (Asked on sweeps only: a lock per slot on every pass.)
