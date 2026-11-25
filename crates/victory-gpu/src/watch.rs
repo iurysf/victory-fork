@@ -413,7 +413,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    //
+    // Also for a caller that does not take the guards' answer (`guarded`
+    // false: the texture refresh asks the write watch first, then the
+    // guards): it gets None at once, without the failing call. The
+    // watch_remap's 185-191 failed askings a frame were mostly those.
+    let known_view = known_view(first * PAGE);
+    if known_view && !guarded {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        return None;
+    }
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
