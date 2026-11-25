@@ -1796,14 +1796,26 @@ fn merge_gap() -> usize {
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
+    // Equal stretches (most of a page) are skipped a 1 KiB block at a
+    // time, then 32-byte lines, then words, then bytes: one comparison per
+    // 8 bytes cost ~30 us per 64 KiB page (upstream Marvisak/VIctory#2280,
+    // wrothgaril). The runs found are the same.
+    const BLOCK: usize = 1 << 10;
+    const LINE: usize = 32;
     let mut i = 0;
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
-        }
-        while i < n && now[i] == was[i] {
-            i += 1;
+        loop {
+            if i.is_multiple_of(BLOCK) && i + BLOCK <= n && now[i..i + BLOCK] == was[i..i + BLOCK] {
+                i += BLOCK;
+            } else if i.is_multiple_of(LINE) && i + LINE <= n && now[i..i + LINE] == was[i..i + LINE] {
+                i += LINE;
+            } else if i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+                i += 8;
+            } else if i < n && now[i] == was[i] {
+                i += 1;
+            } else {
+                break;
+            }
         }
         if i >= n {
             break;
@@ -1931,6 +1943,41 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The block-wise skip finds the same runs as a byte-wise comparison:
+    /// across block and line edges, at the ends, for lengths that are not
+    /// whole blocks (after upstream Marvisak/VIctory#2280's test).
+    #[test]
+    fn changed_runs_match_a_byte_wise_comparison() {
+        let naive = |now: &[u8], was: &[u8]| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for i in 0..now.len() {
+                if now[i] != was[i] {
+                    match runs.last_mut() {
+                        Some((at, n)) if *at + *n == i => *n += 1,
+                        _ => runs.push((i, 1)),
+                    }
+                }
+            }
+            runs
+        };
+        for len in [0usize, 1, 7, 31, 33, 1023, 1024, 1025, 3000, PIECE - 7, PIECE] {
+            let was = vec![0x5au8; len];
+            let mut now = was.clone();
+            let mut at = 3;
+            while at < len {
+                now[at] ^= 0xff;
+                at += 997;
+            }
+            for i in (1020..1060).filter(|&i| i < len) {
+                now[i] = 0;
+            }
+            if let Some(last) = now.last_mut() {
+                *last = 1;
+            }
+            assert_eq!(changed_runs(&now, &was), naive(&now, &was), "length {len}");
+        }
     }
 }
 
