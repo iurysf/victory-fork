@@ -74,7 +74,7 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line.
+/// under [`least`] bytes, since the last line.
 static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
@@ -83,7 +83,17 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
 /// a frame, nearly all of them such askings, took back most of what the
 /// copies in place had won).
-const LEAST: usize = 256;
+/// `VICTORY_COPY_PLAIN_LEAST=n` sets it (0 to 4096; 256 by default): with
+/// the two seconds a faulting source is left alone ([`RECENT`]) a smaller
+/// floor may pay (the bench put 7,500 short copies at 24 ms through the
+/// kernel and 0.07 ms in place); a fault here is a read, which the handler
+/// takes, so it is never a crash, only its cost.
+fn least() -> usize {
+    static LEAST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_COPY_PLAIN_LEAST").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(256, |n| n.min(4096))
+    })
+}
 
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
@@ -188,7 +198,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least() {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
@@ -216,8 +226,9 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
-        bytes / 1e6
+         faulted in the last two seconds, {small:.0} of under {} bytes (VICTORY_COPY_PLAIN_LEAST)",
+        bytes / 1e6,
+        least()
     );
 }
 
