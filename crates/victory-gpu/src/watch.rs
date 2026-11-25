@@ -662,6 +662,7 @@ fn invalidate(g: &mut Guards, block: usize) {
 /// opening from here on takes their bytes out of it) and the count to
 /// hand to [`Unchanged::note`] after the refresh; `None` otherwise
 /// (write-watched memory is never held current).
+#[cfg(test)]
 pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unchanged>) -> Option<u64> {
     let (first, last) = (start / BLOCK, start.saturating_add(len).div_ceil(BLOCK));
     if first >= last {
@@ -679,6 +680,76 @@ pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Uncha
     }
     // Read under the guards' lock, which every taking-out holds.
     Some(w.lock().0)
+}
+
+thread_local! {
+    /// While a host copy's refresh runs on this thread
+    /// ([`refresh_watching`]): the copy's [`Unchanged`], the count it had
+    /// when [`guard`] first registered it (`None`: not yet, or a guard
+    /// found a block of its range open), and the block ranges registered.
+    static REFRESHING: std::cell::RefCell<Option<(std::sync::Arc<Unchanged>, Option<u64>, bool, Vec<(usize, usize)>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs a refresh of `[from, to)` (title addresses) of the copy that `w`
+/// is of; with [`skip_unchanged`], every [`guard`] the refresh makes
+/// registers `w` on the blocks it has just guarded, under the same lock,
+/// so that a write after the guard (before or during the copy) takes the
+/// bytes out again. Afterwards the range is noted current if every block
+/// of it was registered so and nothing was taken out since. Registered
+/// before the refresh, as it was, a copy whose blocks had been written was
+/// never noted until a refresh after a quiet one (14 % of asks skipped in
+/// run P4-0).
+pub(crate) fn refresh_watching<R>(w: &std::sync::Arc<Unchanged>, from: usize, to: usize, refresh: impl FnOnce() -> R) -> R {
+    REFRESHING.with(|r| *r.borrow_mut() = Some((w.clone(), None, false, Vec::new())));
+    let out = refresh();
+    let taken = REFRESHING.with(|r| r.borrow_mut().take());
+    if let Some((_, Some(seen), false, mut registered)) = taken
+        && from < to
+    {
+        registered.sort_unstable();
+        let (first, last) = (from / BLOCK, to.div_ceil(BLOCK));
+        let mut next = first;
+        for (a, b) in registered {
+            if a > next {
+                break;
+            }
+            next = next.max(b);
+        }
+        if next >= last {
+            w.note(from, to, seen);
+        }
+    }
+    out
+}
+
+/// In [`guard`], holding the guards: registers the refreshing copy, if
+/// any, on blocks `[first, last)` if all of them are guarded now.
+fn register_refreshing(g: &mut Guards, first: usize, last: usize) {
+    REFRESHING.with(|r| {
+        let mut r = r.borrow_mut();
+        let Some((w, seen, failed, registered)) = r.as_mut() else {
+            return;
+        };
+        if *failed || first >= last {
+            return;
+        }
+        if g.protected.range(first..last).count() != last - first {
+            *failed = true;
+            return;
+        }
+        for block in first..last {
+            let list = g.watchers.entry(block).or_default();
+            if !list.iter().any(|x| std::sync::Arc::ptr_eq(x, w)) {
+                list.push(w.clone());
+            }
+        }
+        if seen.is_none() {
+            // Under the guards' lock, which every taking-out holds.
+            *seen = Some(w.lock().0);
+        }
+        registered.push((first, last));
+    });
 }
 
 /// A copy watching `[start, start + len)` goes.
@@ -750,6 +821,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
+        register_refreshing(&mut g, first, last);
         return Some(written);
     }
     let mut next_clean = 0;
@@ -785,6 +857,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block);
         }
     }
+    register_refreshing(&mut g, first, last);
     Some(written)
 }
 
@@ -1597,6 +1670,10 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
+    pub(super) fn two_views_for_others(bytes: usize) -> (usize, usize, usize) {
+        two_views(bytes)
+    }
+
     fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
@@ -1860,6 +1937,48 @@ mod unchanged_tests {
         assert!(!w.covers(start, len));
         assert!(!w.covers(start + BLOCK, 8));
         unguard_fake(first, 2, &w);
+    }
+
+    /// A refresh registers its copy in the guard it makes, under the
+    /// guards' lock: the range is current right after the first refresh,
+    /// a write after it takes it out, and a write during the refresh (after
+    /// its guard) leaves nothing noted.
+    #[test]
+    fn a_refresh_registers_in_its_guard() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        let bytes = 2 * BLOCK;
+        let (section, one, two) = super::tests::two_views_for_others(bytes);
+        let w = Arc::new(Unchanged::default());
+        // Written before: the first refresh guards it and holds it current.
+        // SAFETY: inside our view.
+        unsafe { (one as *mut u8).write_volatile(5) };
+        refresh_watching(&w, one, one + bytes, || guard(one, one + bytes));
+        assert!(w.covers(one, bytes), "current after one refresh");
+        // A write through the view faults, opens its block, takes it out.
+        // SAFETY: inside our view (the guard's handler opens it).
+        unsafe { ((one + BLOCK + 8) as *mut u8).write_volatile(7) };
+        assert!(!w.covers(one, bytes));
+        assert!(w.covers(one, BLOCK), "the other block stays current");
+        // A write during the refresh, after its guard: nothing noted.
+        let w2 = Arc::new(Unchanged::default());
+        refresh_watching(&w2, one, one + bytes, || {
+            let written = guard(one, one + bytes);
+            // SAFETY: as above.
+            unsafe { ((one + 16) as *mut u8).write_volatile(9) };
+            written
+        });
+        assert!(!w2.covers(one, bytes));
+        assert!(!w2.covers(one, 8));
+        unwatch_unchanged(one, bytes, &w);
+        unwatch_unchanged(one, bytes, &w2);
+        // SAFETY: our views; the section's handle.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+        }
+        title_memory_remapped(one, bytes);
+        title_memory_remapped(two, bytes);
     }
 
     /// Memory not all guarded (write-watched, or a block open) is never

@@ -188,8 +188,11 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    // Kept from pass to pass, under the lock above (a fresh one each pass
+    // faulted its pages in again).
+    static PAGE_BYTES: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    let mut page_bytes = PAGE_BYTES.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).

@@ -453,9 +453,16 @@ impl Room {
 /// bytes from `data` where the ranges hold them (zero elsewhere), and the
 /// mask of those bytes. A dword two ranges share is one patch, so that no
 /// two threads of the patch write the same dword.
+#[cfg(test)]
 pub(crate) fn dword_patches(ranges: &[(usize, usize)], data: &[u8], out: &mut Vec<[u32; 3]>) {
+    dword_patches_of(ranges.iter().copied(), data, out);
+}
+
+/// [`dword_patches`] of the ranges an iterator gives (in order, apart):
+/// no list of them is made.
+pub(crate) fn dword_patches_of(ranges: impl Iterator<Item = (usize, usize)>, data: &[u8], out: &mut Vec<[u32; 3]>) {
     let first = out.len();
-    for &(a, b) in ranges {
+    for (a, b) in ranges {
         for (at, &byte) in data[a..b].iter().enumerate().map(|(i, v)| (a + i, v)) {
             let (dword, shift) = ((at / 4) as u32, (at % 4) * 8);
             let (byte, mask) = (u32::from(byte) << shift, 0xFFu32 << shift);
@@ -1336,20 +1343,57 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
+/// Returns a snapshot buffer to the pool: at most 16 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
+    // 8 ran out in run P4-0 ("snapshot buffers kept: 0"): every snapshot
+    // was a fresh allocation, its pages faulted in (3,084 a frame on the
+    // bench, none with 16).
+    pool.truncate(16);
     let (mut seen, mut total) = (0, 0usize);
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
         seen == 1 || total <= KEPT
     });
+}
+
+/// A byte buffer kept on its thread between uses (the merges' page): taken
+/// empty-or-not, given back when dropped.
+struct Scratch(Vec<u8>);
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Scratch {
+    fn take() -> Scratch {
+        Scratch(SCRATCH.with(std::cell::Cell::take))
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let v = std::mem::take(&mut self.0);
+        SCRATCH.with(|s| s.set(v));
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3131,7 +3175,10 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
+        // The page buffer, kept on the thread between merges (a fresh
+        // 64 KiB each time faulted its pages in, 376 times a frame).
+        let mut title = Scratch::take();
+        title.resize(PAGE, 0);
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -3178,12 +3225,16 @@ impl Shadow {
                     if !room.take(&runs, patchable) {
                         return true;
                     }
-                    for (r, m) in runs {
+                    let mut bytes = 0u64;
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        bytes += m as u64;
                     }
+                    // The page's runs noted under one lock (one per run was
+                    // 496,156 lockings a frame in run P4-0).
+                    self.card_changed_runs(at, &runs);
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(bytes, Ordering::Relaxed);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         return true;
@@ -3230,16 +3281,16 @@ impl Shadow {
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), address.saturating_add(len).min(end));
-        let seen = if from < to && !self.writes_pending() {
-            crate::watch::watch_unchanged(from, to - from, &self.unchanged)
-        } else {
-            None
-        };
-        let copied = self.update_inner(address, len);
-        if let Some(seen) = seen
-            && !self.writes_pending()
-        {
-            self.unchanged.note(from, to, seen);
+        if from >= to || self.writes_pending() {
+            return self.update_inner(address, len);
+        }
+        // Registered by the guards the refresh makes, under their lock
+        // (`crate::watch::refresh_watching`); a range shaders may write is
+        // not held current.
+        let unchanged = self.unchanged.clone();
+        let copied = crate::watch::refresh_watching(&unchanged, from, to, || self.update_inner(address, len));
+        if self.writes_pending() {
+            self.unchanged.clear();
         }
         copied
     }
@@ -3421,6 +3472,28 @@ impl Shadow {
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
+    /// [`Shadow::card_changed`] of `runs` (offset in the page, bytes; in
+    /// order) of the page at offset `at`, under one lock.
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        for &(r, m) in runs {
+            let (from, to) = (at + r, at + r + m);
+            if from >= to {
+                continue;
+            }
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+        }
+    }
+
     fn card_changed(&self, from: usize, to: usize) {
         let Some(card) = &self.card else {
             return;
@@ -3442,7 +3515,10 @@ impl Shadow {
     /// [`Shadow::card_merge_relay`]): the bytes are taken now, where a copy
     /// takes them when the card runs it; both are the title's bytes noted
     /// in `dirty` by then.
-    pub(crate) fn card_patches(&self, ranges: &[(usize, usize)], out: &mut Vec<[u32; 3]>) {
+    /// Patches of dwords ([`dword_patches_of`]) of those of `ranges` shorter than
+    /// `shorter` bytes, taken and cut as they come (no list is made: a
+    /// frame sent some 500,000 runs).
+    pub(crate) fn card_patches_shorter(&self, ranges: &[(usize, usize)], shorter: usize, out: &mut Vec<[u32; 3]>) {
         if ranges.is_empty() || self.card.is_none() {
             return;
         }
@@ -3451,8 +3527,12 @@ impl Shadow {
         // SAFETY: the CPU side's mapping holds the copy's bytes; the ranges
         // are offsets in it (`card_dirty`), cut to it here.
         let data = unsafe { std::slice::from_raw_parts(self.data, len) };
-        let cut: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (a.min(len), b.min(len))).filter(|r| r.0 < r.1).collect();
-        dword_patches(&cut, data, out);
+        let cut = ranges
+            .iter()
+            .filter(|&&(a, b)| b - a < shorter)
+            .map(|&(a, b)| (a.min(len), b.min(len)))
+            .filter(|r| r.0 < r.1);
+        dword_patches_of(cut, data, out);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the

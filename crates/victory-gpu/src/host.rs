@@ -1556,6 +1556,9 @@ struct CardWork {
     /// bytes), not in use: a plan takes one and gives it back with its
     /// lists.
     patch_buffers: Vec<(ID3D12Resource, usize, u64)>,
+    /// The patches being made, kept from send to send (a frame's sends made
+    /// 592,064 of them: a fresh list each time faulted its pages in).
+    patch_scratch: Vec<[u32; 3]>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -4099,6 +4102,7 @@ impl Host {
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
                 patch: self.make_card_patch(),
                 patch_buffers: Vec::new(),
+                patch_scratch: Vec::new(),
             })
         }
     }
@@ -4373,15 +4377,14 @@ impl Host {
         // copy per range, as before.
         let mut split: Vec<std::ops::Range<usize>> = vec![0..0; dirty.len()];
         if !dirty.is_empty() && landed.is_none() && work.patch.is_some() {
-            let mut patches: Vec<[u32; 3]> = Vec::new();
+            let mut patches = std::mem::take(&mut work.patch_scratch);
+            patches.clear();
             for ((shadow, ranges), at) in dirty.iter().zip(split.iter_mut()) {
                 if !shadow.card_sides().is_some_and(|(_, _, size)| card_patchable(size)) {
                     continue;
                 }
-                let short: Vec<(usize, usize)> =
-                    ranges.iter().copied().filter(|&(a, b)| b - a < crate::shadow::CARD_PATCH_RUN).collect();
                 let first = patches.len();
-                shadow.card_patches(&short, &mut patches);
+                shadow.card_patches_shorter(ranges, crate::shadow::CARD_PATCH_RUN, &mut patches);
                 *at = first..patches.len();
             }
             if !patches.is_empty() {
@@ -4417,6 +4420,11 @@ impl Host {
                 }
             } else {
                 split = vec![0..0; dirty.len()];
+            }
+            // Kept for the next send (cleared there); a list grown past
+            // 16 MiB of patches is let go.
+            if patches.capacity() <= (16 << 20) / 12 {
+                work.patch_scratch = patches;
             }
         }
         if !dirty.is_empty() {
