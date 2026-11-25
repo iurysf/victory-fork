@@ -8378,6 +8378,20 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             tracing::info!(
+                "heap slots, since the start: {} made slots taken without the records' lock (VICTORY_HEAP_LOCKFREE=1: {}), {} buffer \
+                 views left for their draw that kept the null buffer view they held (VICTORY_HEAP_LESS=1: {})",
+                crate::descriptor::host::LOCKFREE_HITS.load(Ordering::Relaxed),
+                if crate::descriptor::host::heap_lockfree() { "on" } else { "off" },
+                crate::descriptor::host::NULL_KEPT.load(Ordering::Relaxed),
+                if crate::descriptor::host::heap_less() { "on" } else { "off" }
+            );
+            tracing::info!(
+                "copies of title buffers and windows made outside their map's lock (VICTORY_SHADOW_SHARED=1: {}), since the start:                  {} made by a second asker and let go, {} asks done under the lock after the map changed",
+                if crate::shadow::shadow_shared() { "on" } else { "off" },
+                crate::shadow::SHARED_TWICE[0].load(Ordering::Relaxed),
+                crate::shadow::SHARED_TWICE[1].load(Ordering::Relaxed)
+            );
+            tracing::info!(
                 "copies left out since the start because both sides were one host texture: {}",
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
             );
