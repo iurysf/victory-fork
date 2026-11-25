@@ -1282,6 +1282,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    let coalesced = guard_coalesce();
+    let mut aliases: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -1299,11 +1301,78 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block {
-                    protect_alias(g, alias);
+                    if coalesced {
+                        if !g.protected.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    } else {
+                        protect_alias(g, alias);
+                    }
                 }
             }
         }
     }
+    // The other views' blocks that follow one another are made read-only
+    // in one call ([`guard_coalesce`]); a run the kernel refuses whole (it
+    // spans regions it takes one at a time) block by block, as before.
+    aliases.sort_unstable();
+    aliases.dedup();
+    for (first, last) in block_runs(&aliases) {
+        if first + 1 == last || !protect_run(first, last) {
+            for block in first..last {
+                protect_alias(g, block);
+            }
+            continue;
+        }
+        g.protected.extend(first..last);
+        if view_known() {
+            g.viewed.extend(first..last);
+        }
+    }
+}
+
+/// Whether the guards' protections are asked of Windows over runs of
+/// blocks that follow one another rather than block by block, where they
+/// are given back (`open_here`) and where the other views of guarded pages
+/// are guarded (`protect`) (`VICTORY_GUARD_COALESCE=1`; off by default). A
+/// run Windows refuses is done block by block, as before; the blocks noted
+/// and the copies told are the same. After fork #1059 piece 1 (UwUCammie);
+/// the bench measured 4.06 -> 1.68 ms in the yard (block 2, B2-2). May turn
+/// within a run (`crate::ab`): it is how one call is made.
+fn guard_coalesce() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_COALESCE").is_some_and(|v| v == "1"));
+    #[cfg(test)]
+    match COALESCE_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    crate::ab::flag(crate::ab::Key::GuardCoalesce, run)
+}
+
+/// Tests that open the same blocks with [`guard_coalesce`] off (1) and on (2).
+#[cfg(test)]
+static COALESCE_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The runs `[first, last)` of `blocks` (in order, no two the same).
+fn block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &block in blocks {
+        match runs.last_mut() {
+            Some(run) if run.1 == block => run.1 += 1,
+            _ => runs.push((block, block + 1)),
+        }
+    }
+    runs
+}
+
+/// Makes blocks `[first, last)` read-only in one call; false if Windows refused.
+fn protect_run(first: usize, last: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READONLY, &mut old) != 0 }
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -1468,11 +1537,31 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> = g.protected.blocks_in(start / BLOCK..end.div_ceil(BLOCK));
+    if guard_coalesce() {
+        // Each run of them given back in one call ([`guard_coalesce`]): a
+        // long write (`fread`) opens hundreds of blocks, and every call
+        // walks the page tables. Noted and told block by block, as below.
+        for (first, last) in block_runs(&blocks) {
+            for block in first..last {
+                g.protected.remove(&block);
+                g.clean.remove(block);
+                invalidate(g, block);
+            }
+            let mut old = 0;
+            // SAFETY: blocks we made read-only.
+            let set = unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) };
+            if set == 0 && last - first > 1 {
+                // A run over regions Windows takes one at a time.
+                for block in first..last {
+                    let mut old = 0;
+                    // SAFETY: a block we made read-only.
+                    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+                }
+            }
+        }
+        return !blocks.is_empty();
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(block);
@@ -1820,6 +1909,104 @@ mod tests {
             }
             check(&runs, &blocks);
         }
+    }
+
+    /// The guards' blocks as runs answer as one by one
+    /// (`VICTORY_GUARD_INTERVALS`): after every step of a mixed sequence of
+    /// single blocks, ranges and removals, membership, the blocks of every
+    /// range and their count are the same.
+    #[test]
+    fn guard_blocks_as_runs_answer_as_one_by_one() {
+        let mut runs = CleanBlocks(BTreeMap::new());
+        let mut set = BTreeSet::new();
+        let check = |runs: &CleanBlocks, set: &BTreeSet<usize>| {
+            for from in 0..40 {
+                for to in from..40 {
+                    let want: Vec<usize> = set.range(from..to).copied().collect();
+                    assert_eq!(runs_blocks_in(runs, from..to), want, "{from}..{to}");
+                    assert_eq!(runs_count_in(runs, from..to), want.len(), "{from}..{to}");
+                }
+                assert_eq!(runs.uncovered(from, from + 1).is_empty(), set.contains(&from), "{from}");
+            }
+        };
+        let steps: [(u8, usize, usize); 12] = [
+            (0, 3, 9), (1, 12, 0), (0, 10, 12), (2, 5, 0), (0, 20, 30), (2, 20, 0),
+            (0, 0, 1), (2, 29, 0), (1, 31, 0), (0, 8, 25), (2, 15, 0), (2, 3, 0),
+        ];
+        for (op, a, b) in steps {
+            match op {
+                0 => {
+                    runs.insert(a, b);
+                    set.extend(a..b);
+                }
+                1 => {
+                    runs.insert(a, a + 1);
+                    set.insert(a);
+                }
+                _ => {
+                    runs.remove(a);
+                    set.remove(&a);
+                }
+            }
+            check(&runs, &set);
+        }
+        assert_eq!(runs_blocks_in(&runs, 5..3), [] as [usize; 0]);
+    }
+
+    /// Opening guarded blocks over runs (`VICTORY_GUARD_COALESCE`) leaves
+    /// the same blocks guarded and the same pages read-only as block by
+    /// block: eight blocks of memory of the test's, all guarded, then three
+    /// ranges opened.
+    #[test]
+    fn opening_over_runs_leaves_what_block_by_block_leaves() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualQuery,
+        };
+        let run = |mode: u8| -> (Vec<bool>, Vec<u32>) {
+            // SAFETY: a fresh allocation of the test's, freed at the end.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), 8 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_ne!(p, 0);
+            let first = p / BLOCK;
+            COALESCE_TEST.store(mode, std::sync::atomic::Ordering::SeqCst);
+            let held = {
+                let mut g = guards();
+                protect_here(&mut g, first, first + 8);
+                for (a, b) in [(1, 3), (4, 5), (6, 8)] {
+                    let _ = open_here(&mut g, (first + a) * BLOCK, (first + b) * BLOCK);
+                }
+                let held: Vec<bool> = (first..first + 8).map(|b| g.protected.contains(&b)).collect();
+                let protect: Vec<u32> = (0..8)
+                    .map(|b| {
+                        // SAFETY: plain data filled in by the query.
+                        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        // SAFETY: a valid out pointer of the right size.
+                        unsafe { VirtualQuery((p + b * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+                        info.Protect
+                    })
+                    .collect();
+                let _ = open_here(&mut g, first * BLOCK, (first + 8) * BLOCK);
+                (held, protect)
+            };
+            COALESCE_TEST.store(0, std::sync::atomic::Ordering::SeqCst);
+            let (held, protect) = held;
+            // SAFETY: the test's allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            (held, protect)
+        };
+        let off = run(1);
+        let on = run(2);
+        assert_eq!(off, on);
+        assert_eq!(off.0, [true, false, false, true, false, true, false, false]);
+    }
+
+    /// The runs of blocks one `VirtualProtect` call covers
+    /// (`VICTORY_GUARD_COALESCE`).
+    #[test]
+    fn blocks_are_cut_into_runs_that_follow_one_another() {
+        assert_eq!(block_runs(&[]), []);
+        assert_eq!(block_runs(&[4]), [(4, 5)]);
+        assert_eq!(block_runs(&[1, 2, 3, 7, 8, 10]), [(1, 4), (7, 9), (10, 11)]);
     }
 
     #[test]
