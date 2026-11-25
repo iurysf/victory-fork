@@ -984,6 +984,12 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Compute work, or shaders that store to buffers, may write records
+        // a hoisted clamp read before the list ran: the list's first part
+        // ends (`crate::indirect::hoist_on`).
+        if compute || p.stages.iter().any(|stage| stage.translated().stores) {
+            list.end_hoisted_indirect();
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -3042,6 +3048,51 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // In the list's first part, a draw of records nothing in the list
+        // can have written has its clamp hoisted into the list's prelude
+        // (`crate::indirect::hoist_on`): it reads them from the list's
+        // buffer, with no clamp, barrier or pipeline of ours here. A count
+        // buffer, a dispatch, a shader that stores, or no room end the part.
+        if crate::indirect::hoist_on() {
+            let stores = p.stages.iter().any(|stage| stage.translated().stores);
+            let closed = list.hoisted().closed();
+            let hoistable = crate::indirect::hoistable(kind, count.is_some(), max, stores, closed);
+            let hoisted = if hoistable {
+                args.refresh(list, arguments, len);
+                crate::indirect::hoist(list, (&args.buffer, offset), (kind, stride, max))
+            } else {
+                None
+            };
+            match hoisted {
+                Some((records, at)) => {
+                    self.window = None;
+                    let ran = match kind {
+                        DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                        MESH => self.prepare_for(list, false, true),
+                        _ => false,
+                    };
+                    if !ran {
+                        why("prepare failed");
+                        return false;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} (hoisted)"), false));
+                    if kind == MESH {
+                        self.mesh_scissor(list, true);
+                    }
+                    // SAFETY: an open list with everything set; the list keeps
+                    // its buffer of clamped records, readable as arguments
+                    // from the prelude on.
+                    unsafe { list.list.ExecuteIndirect(&signature, max, &records, at, None, 0) };
+                    if kind == MESH {
+                        self.mesh_scissor(list, false);
+                    }
+                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                None => list.end_hoisted_indirect(),
+            }
+        }
         let windowed = windows()
             && kind != DISPATCH
             && max == 1

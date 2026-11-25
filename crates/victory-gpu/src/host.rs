@@ -839,6 +839,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Indirect clamps hoisted into the prelude (`crate::indirect::hoist_on`).
+    hoisted: Mutex<crate::indirect::Hoisted>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -4054,6 +4056,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                hoisted: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
@@ -6315,6 +6318,18 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        // The prelude left the hoisted records readable as arguments; the
+        // list ends with them common, as it found them.
+        if let Some(dst) = self.hoisted().used_dst().cloned() {
+            // SAFETY: an open list; the list's own buffer.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6345,6 +6360,7 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         self.deferred().clear_reuse();
+        self.hoisted().reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6658,7 +6674,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
+        if barriers.is_empty() && syncs.is_empty() && hoisted.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6681,6 +6698,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if !hoisted.is_empty() && !hoisted.record_prelude(list) {
+                    fail(format_args!("a host list's hoisted indirect clamps did not record"));
                 }
                 list.Close()
             })
@@ -6932,6 +6952,54 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+    }
+
+    /// The list's hoisted indirect clamps (`crate::indirect::hoist`).
+    pub(crate) fn hoisted(&self) -> std::sync::MutexGuard<'_, crate::indirect::Hoisted> {
+        self.hoisted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The list's first part ends: no more indirect clamps are hoisted
+    /// into its prelude (`crate::indirect::hoist_on`).
+    pub(crate) fn end_hoisted_indirect(&self) {
+        self.hoisted().end();
+    }
+
+    /// [`HostList::budget`] for clamps hoisted into the prelude: the
+    /// budget's address and the card's copy, which the prelude zeroes
+    /// itself (the list records no zeroing). `None` if the list already
+    /// charged its budget this recording (the prelude would run first and
+    /// its zeroing would come after the hoisted charges), or has none.
+    pub(crate) fn budget_for_prelude(&self) -> Option<(u64, Option<ID3D12Resource>)> {
+        let (buffer, data) = self
+            .budget
+            .get_or_init(|| {
+                let (b, d) = host()?.shared_buffer(256)?;
+                Some((b, d as usize))
+            })
+            .as_ref()?;
+        let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
+        let mut deferred = self.deferred();
+        if deferred.budget_zeroed {
+            return None;
+        }
+        deferred.budget_zeroed = true;
+        let at = *data;
+        // SAFETY: as in `budget`: the list's own mapped words, written
+        // before it runs; the notes of its last run taken, then zeroed.
+        deferred.copies.push(Step::Host(Box::new(move || unsafe {
+            let words = at as *mut u32;
+            let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+            MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+            MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+            for k in 0..3 {
+                words.add(k).write_volatile(0);
+            }
+        })));
+        drop(deferred);
+        // SAFETY: live buffers.
+        let gpu = unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() };
+        Some((gpu, card.cloned()))
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if

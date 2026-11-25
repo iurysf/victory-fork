@@ -501,6 +501,423 @@ fn record_clamp_as(
     true
 }
 
+// ---------------------------------------------------------------------------
+// Clamps hoisted into the list's prelude (upstream Marvisak/VIctory#2472,
+// ESAT; adapted to this tree's scratch clamp).
+// ---------------------------------------------------------------------------
+
+/// Whether the indirect executions of a list's first part (before its first
+/// compute work, buffer-writing draw, copy or execution that cannot be
+/// hoisted) have their arguments clamped in one pass in the list's prelude
+/// (`VICTORY_INDIRECT_HOIST=1`; off by default). The executions then read
+/// their clamped records from a buffer of the list's own, with no clamp,
+/// barrier or pipeline change of ours between them; after the first part
+/// they are clamped as before (windows, or one at a time).
+///
+/// After upstream #2472 (ESAT), which clamps the title's copy in place. Here
+/// the title's records stay untouched: the pass reads them and writes the
+/// clamped ones into the list's buffer, as the clamp at each execution
+/// does, charging the list's budget in the same order with the same
+/// arithmetic, so each record comes out as that clamp would have left it.
+/// Executions with a count buffer, and dispatches, end the first part. The
+/// budget is zeroed by the prelude before the pass, and the mesh notes go
+/// to its words 4 and 8 as the clamp's do. Bench (RTX 4070, 5,000 draws,
+/// 52 % not windowed): 16.6 -> 0.38 ms of the card and 6.1 -> 0.69 ms of
+/// recording.
+pub(crate) fn hoist_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_HOIST").is_some_and(|v| v == "1"))
+}
+
+/// The pass over a list's hoisted executions: `jobs` (uint4 each: the
+/// record's byte offset in `src_args`, its offset in `dst_args`, kind and
+/// stride as `kind | stride << 8`, records) from `first_job`, all reading
+/// one buffer. One group: runs of single records are clamped 64 at a time
+/// and charged by lane 0 in order; a job of several records is clamped 64
+/// records at a time, likewise. The arithmetic is [`SOURCE`]'s for a record
+/// not clamped ahead, and so is the charge: a record that does not fit runs
+/// empty and leaves the budget full. The budget word is read once and
+/// written back at the end (the passes of one prelude run one after the
+/// other, with a barrier between them).
+const HOIST_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Batch : register(b0) {
+    uint first_job;
+    uint job_count;
+    uint unused0;
+    uint unused1;
+};
+ByteAddressBuffer jobs : register(t0);
+ByteAddressBuffer src_args : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+groupshared uint single_run;
+
+void clamp_and_cost(uint kind, uint src_at, out uint cost, out uint2 draw_counts, out uint3 groups) {
+    cost = 0u;
+    draw_counts = uint2(0u, 0u);
+    groups = uint3(0u, 0u, 0u);
+    if (kind <= 1u) {
+        uint2 want = src_args.Load2(src_at);
+        uint count = min(want.x, 1u << 24);
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        if (count >= MOST_DRAW) {
+            count = 0u;
+            instances = 0u;
+            cost = 0u;
+        }
+        draw_counts = uint2(count, instances);
+    } else if (kind == 2u) {
+        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        if (g.z != 0u && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0u, 0u, 0u);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        groups = g;
+    } else {
+        uint3 g = src_args.Load3(src_at);
+        // The clamp's notes on mesh records (budget words 4 and 8).
+        uint was;
+        budget.InterlockedMax(4, g.x, was);
+        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        groups = g;
+    }
+}
+
+void write_record(uint kind, uint stride, uint src_at, uint dst_at, bool over, uint2 draw_counts, uint3 groups) {
+    if (kind <= 1u) {
+        if (over) {
+            draw_counts = uint2(0u, 0u);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8u; off < stride; off += 4u) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0u, 0u, 0u);
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12u; off < stride; off += 4u) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+
+// The charge of `costs[0..n)` in order against `left`, as the clamp's
+// compare-and-swap does: a record that does not fit is marked and leaves
+// nothing.
+void charge(uint n, inout uint left) {
+    for (uint i = 0u; i < n; i++) {
+        if (costs[i] == 0u) {
+            continue;
+        }
+        if (costs[i] > left) {
+            costs[i] = PAST;
+            left = 0u;
+        } else {
+            left -= costs[i];
+        }
+    }
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0u;
+    if (lane == 0u) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    uint j = first_job;
+    uint end = first_job + job_count;
+    while (j < end) {
+        uint4 lane_job = (j + lane < end) ? jobs.Load4((j + lane) * 16u) : uint4(0u, 0u, 0u, 0u);
+        costs[lane] = lane_job.w;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0u) {
+            uint run = 0u;
+            while (run < 64u && j + run < end && costs[run] == 1u) {
+                run++;
+            }
+            single_run = run;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint run = single_run;
+        if (run > 0u) {
+            uint kind = lane_job.z & 0xffu;
+            uint stride = lane_job.z >> 8;
+            uint cost = 0u;
+            uint2 draw_counts = uint2(0u, 0u);
+            uint3 groups = uint3(0u, 0u, 0u);
+            if (lane < run) {
+                clamp_and_cost(kind, lane_job.x, cost, draw_counts, groups);
+            }
+            costs[lane] = cost;
+            GroupMemoryBarrierWithGroupSync();
+            if (lane == 0u) {
+                charge(run, left);
+            }
+            GroupMemoryBarrierWithGroupSync();
+            if (lane < run) {
+                write_record(kind, stride, lane_job.x, lane_job.y, costs[lane] == PAST, draw_counts, groups);
+            }
+            GroupMemoryBarrierWithGroupSync();
+            j += run;
+        } else {
+            uint4 job = jobs.Load4(j * 16u);
+            uint kind = job.z & 0xffu;
+            uint stride = job.z >> 8;
+            uint tiles = (job.w + 63u) / 64u;
+            for (uint tile = 0u; tile < tiles; tile++) {
+                uint record = tile * 64u + lane;
+                uint src_at = job.x + record * stride;
+                uint dst_at = job.y + record * stride;
+                uint cost = 0u;
+                uint2 draw_counts = uint2(0u, 0u);
+                uint3 groups = uint3(0u, 0u, 0u);
+                if (record < job.w) {
+                    clamp_and_cost(kind, src_at, cost, draw_counts, groups);
+                }
+                costs[lane] = cost;
+                GroupMemoryBarrierWithGroupSync();
+                if (lane == 0u) {
+                    charge(min(64u, job.w - tile * 64u), left);
+                }
+                GroupMemoryBarrierWithGroupSync();
+                if (record < job.w) {
+                    write_record(kind, stride, src_at, dst_at, costs[lane] == PAST, draw_counts, groups);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+            j += 1u;
+        }
+    }
+    if (lane == 0u) {
+        budget.Store(0, BUDGET - left);
+    }
+}
+"#;
+
+fn hoist_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match make_from(device, HOIST_SOURCE) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no hoisted argument clamp: indirect executions clamped one at a time");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Bytes of a list's buffer of hoisted clamped records, and of its jobs.
+const HOIST_BYTES: u64 = 1 << 20;
+const HOIST_JOBS: usize = 8192;
+
+/// A list's hoisted clamps ([`hoist_on`]): the jobs of its first part and
+/// the buffers they use, kept across resets.
+#[derive(Default)]
+pub(crate) struct Hoisted {
+    /// Whether the first part is still open (from the list's reset).
+    closed: bool,
+    /// Per job: the buffer its records are read from, and the job.
+    jobs: Vec<(ID3D12Resource, [u32; 4])>,
+    /// Bytes of `dst` taken.
+    used: u64,
+    /// The budget's address, and the card's copy of it to zero in the
+    /// prelude if it has one; set at the first job.
+    budget: Option<(u64, Option<ID3D12Resource>)>,
+    /// Where the clamped records go (the card's memory) and the jobs
+    /// (mapped PC memory).
+    dst: Option<ID3D12Resource>,
+    jobs_up: Option<(ID3D12Resource, usize)>,
+}
+
+// SAFETY: D3D12 objects (free-threaded) and a persistent mapping, used under
+// the list's lock.
+unsafe impl Send for Hoisted {}
+
+impl Hoisted {
+    /// At the list's reset: a new first part.
+    pub(crate) fn reset(&mut self) {
+        self.closed = false;
+        self.jobs.clear();
+        self.used = 0;
+        self.budget = None;
+    }
+
+    /// The first part ends: what follows is clamped as before.
+    pub(crate) fn end(&mut self) {
+        self.closed = true;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// Whether the first part has ended.
+    pub(crate) fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// The buffer of clamped records, if a job used it (the list moves it
+    /// back to common before it closes).
+    pub(crate) fn used_dst(&self) -> Option<&ID3D12Resource> {
+        (!self.jobs.is_empty()).then_some(self.dst.as_ref()).flatten()
+    }
+
+    /// Records the pass in `l`, the list's prelude: the card's budget
+    /// zeroed (if the budget is there), the jobs by runs of one source
+    /// buffer, the clamped records left readable as indirect arguments.
+    /// False if nothing could be recorded (the caller fails the run: the
+    /// executions read records no pass wrote).
+    pub(crate) fn record_prelude(&self, l: &ID3D12GraphicsCommandList) -> bool {
+        let (Some(c), Some(dst), Some((jobs_up, mapped)), Some((budget, card))) =
+            (hoist_clamp(), &self.dst, &self.jobs_up, &self.budget)
+        else {
+            return false;
+        };
+        // SAFETY: the mapping holds HOIST_JOBS jobs; the list has closed and
+        // its last submission has run, so the card reads none of them now.
+        unsafe {
+            let words: Vec<[u32; 4]> = self.jobs.iter().map(|j| j.1).collect();
+            std::ptr::copy_nonoverlapping(words.as_ptr(), *mapped as *mut [u32; 4], words.len());
+        }
+        // SAFETY: an open list; live buffers of the list's own; our root
+        // signature. The budget's card copy and `dst` are common at the
+        // start of every submission.
+        unsafe {
+            if let Some(card) = card {
+                let Ok(l2) = windows::core::Interface::cast::<ID3D12GraphicsCommandList2>(l) else {
+                    return false;
+                };
+                let at = card.GetGPUVirtualAddress();
+                let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + offset, Value: 0 });
+                l.ResourceBarrier(&[transition(card, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+                l.ResourceBarrier(&[transition(card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            }
+            // Runs of jobs reading one buffer.
+            let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+            let mut first = 0usize;
+            while first < self.jobs.len() {
+                let src = &self.jobs[first].0;
+                let mut n = 1;
+                while first + n < self.jobs.len() && self.jobs[first + n].0 == *src {
+                    n += 1;
+                }
+                runs.push((src.GetGPUVirtualAddress(), first as u32, n as u32));
+                first += n;
+            }
+            record_hoisted(c, l, jobs_up.GetGPUVirtualAddress(), dst, *budget, &runs);
+        }
+        true
+    }
+}
+
+/// Records the hoisted pass ([`HOIST_SOURCE`]) in `l`: `dst` from common
+/// to unordered access, one dispatch per run of jobs (the source buffer's
+/// address, the first job, the jobs) with a barrier between them for the
+/// budget word, `dst` left readable as indirect arguments.
+///
+/// # Safety
+/// An open list; live buffers; the jobs at `jobs` in mapped memory.
+unsafe fn record_hoisted(c: &Clamp, l: &ID3D12GraphicsCommandList, jobs: u64, dst: &ID3D12Resource, budget: u64, runs: &[(u64, u32, u32)]) {
+    // SAFETY: as the caller says.
+    unsafe {
+        l.ResourceBarrier(&[uav_barrier(), transition(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootShaderResourceView(1, jobs);
+        l.SetComputeRootUnorderedAccessView(3, dst.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        for (k, &(src, first, n)) in runs.iter().enumerate() {
+            if k > 0 {
+                // The budget word the last pass wrote back.
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+            let constants = [first, n, 0, 0];
+            l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(2, src);
+            l.Dispatch(1, 1, 1);
+        }
+        l.ResourceBarrier(&[uav_barrier(), transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
+    }
+}
+
+/// Whether an execution can have its clamp hoisted ([`hoist_on`]): not a
+/// dispatch, no count buffer (its records past the count are the title's
+/// to leave unfilled; the clamp reads the count when the list runs), some
+/// records, shaders that store to no buffer, and the list's first part
+/// still open.
+pub(crate) fn hoistable(kind: u32, has_count: bool, records: u32, stores: bool, closed: bool) -> bool {
+    kind != 2 && !has_count && records > 0 && !stores && !closed
+}
+
+/// Hoists the clamp of an execution of `records` records of `kind`,
+/// `stride` bytes apart, at `src_offset` in `src`, into `list`'s prelude
+/// ([`hoist_on`]): the buffer and offset the execution reads its clamped
+/// records from. `None` (the caller ends the first part and clamps as
+/// before) if the part is over, the layout does not fit, or the list's
+/// buffers are full.
+pub(crate) fn hoist(list: &HostList, (src, src_offset): (&ID3D12Resource, u64), (kind, stride, records): (u32, u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    hoist_clamp()?;
+    let bytes = validate_layout((kind, stride, records), src_offset, None)?;
+    if records == 0 || src_offset.checked_add(bytes)? > u64::from(u32::MAX) {
+        return None;
+    }
+    // SAFETY: a live buffer.
+    if !unsafe { src.GetGPUVirtualAddress() }.is_multiple_of(4) {
+        return None;
+    }
+    let budget = {
+        let h = list.hoisted();
+        if h.closed || h.jobs.len() >= HOIST_JOBS {
+            return None;
+        }
+        h.budget.clone()
+    };
+    // The first job: the prelude zeroes the budget, so nothing of the list
+    // may have charged it yet.
+    let budget = match budget {
+        Some(b) => b,
+        None => list.budget_for_prelude()?,
+    };
+    let mut h = list.hoisted();
+    if h.dst.is_none() {
+        let dst = host()?.uav_buffer(HOIST_BYTES)?;
+        crate::host::name(&dst, || "hoisted indirect arguments".to_owned());
+        h.dst = Some(dst);
+    }
+    if h.jobs_up.is_none() {
+        let (up, mapped) = host()?.shared_buffer((HOIST_JOBS * 16) as u64)?;
+        crate::host::name(&up, || "hoisted indirect argument jobs".to_owned());
+        h.jobs_up = Some((up, mapped as usize));
+    }
+    let at = h.used.next_multiple_of(16);
+    if at + bytes > HOIST_BYTES {
+        return None;
+    }
+    h.used = at + bytes;
+    h.budget = Some(budget);
+    h.jobs.push((src.clone(), [src_offset as u32, at as u32, (kind & 0xff) | (stride << 8), records]));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectHoisted, 1);
+    Some((h.dst.clone()?, at))
+}
+
 /// Whether every draw served from a window is checked against a fresh
 /// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
 /// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
@@ -1066,6 +1483,163 @@ void main() {
     /// ahead with the relay, whose pieces are fetched flight by flight) it
     /// stores the hash it made: each compare flags what changed since the
     /// compare before it, also a change back.
+    /// The clamps hoisted into a list's prelude (`HOIST_SOURCE`, upstream
+    /// #2472 adapted) leave every record as the clamp at each execution
+    /// does, one after the other in the list's order (#864's lane order),
+    /// for runs of single records over 64, a job of several records, two
+    /// buffers taking turns, a record over MOST_DRAW, mesh records (their
+    /// notes in the budget's words 4 and 8) and a budget that runs out
+    /// midway; the title's records stay as they were.
+    #[test]
+    fn warp_hoisted_clamps_match_the_clamp_at_each_execution() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let hoist = compile_cs(&warp.device, HOIST_SOURCE).expect("the hoisted clamp must compile on WARP");
+        const BYTES: usize = 64 << 10;
+        let (src_a, a_ptr, a_gpu) = warp.shared_buffer(BYTES as u64);
+        let (src_b, b_ptr, b_gpu) = warp.shared_buffer(BYTES as u64);
+        // SAFETY (each): inside the mapping.
+        let word = |ptr: *mut u8, at: usize, v: u32| unsafe { ptr.add(at).cast::<u32>().write_unaligned(v) };
+        for i in 0..BYTES / 4 {
+            word(a_ptr, i * 4, 0xA5A5_0000 ^ i as u32);
+            word(b_ptr, i * 4, 0x5B5B_0000 ^ i as u32);
+        }
+        // Jobs: (on buffer A, byte offset, kind, stride, records).
+        let mut jobs: Vec<(bool, u32, u32, u32, u32)> = Vec::new();
+        // 70 single indexed records of A: small ones, one at MOST_DRAW, and
+        // 40 of 2^22 each, which run the budget (2^27) out at the 32nd.
+        for i in 0..70u32 {
+            let at = i * 20;
+            let (count, instances) = match i {
+                10 => (1 << 23, 1),
+                20..60 => (1 << 20, 4),
+                _ => (3, 1),
+            };
+            word(a_ptr, at as usize, count);
+            word(a_ptr, at as usize + 4, instances);
+            jobs.push((true, at, 1, 20, 1));
+        }
+        // A job of ten draw records of B.
+        for r in 0..10u32 {
+            word(b_ptr, (4096 + r * 16) as usize, 7);
+            word(b_ptr, (4096 + r * 16) as usize + 4, 2);
+        }
+        jobs.push((false, 4096, 0, 16, 10));
+        // Mesh records of A (after the budget ran out: empty, but noted).
+        for r in 0..3u32 {
+            let at = 8192 + r * 12;
+            word(a_ptr, at as usize, 70_000 + r);
+            word(a_ptr, at as usize + 4, 2);
+            word(a_ptr, at as usize + 8, 3);
+            jobs.push((true, at, 10, 12, 1));
+        }
+        // Back to A's small records, then B again.
+        for i in 0..5u32 {
+            jobs.push((true, i * 20, 1, 20, 1));
+        }
+        jobs.push((false, 4096, 0, 16, 10));
+        // SAFETY: the mappings hold BYTES bytes.
+        let (a_before, b_before) =
+            unsafe { (std::slice::from_raw_parts(a_ptr, BYTES).to_vec(), std::slice::from_raw_parts(b_ptr, BYTES).to_vec()) };
+
+        // The clamp at each execution, one after the other, each into a
+        // buffer of its own, with one budget.
+        let (_budget_one, budget_one_ptr, budget_one_gpu) = warp.shared_buffer(256);
+        // SAFETY: the mapping holds 256 bytes.
+        unsafe { std::ptr::write_bytes(budget_one_ptr, 0, 256) };
+        let mut each = Vec::new();
+        for &(on_a, at, kind, stride, records) in &jobs {
+            let (dst, dst_ptr, _) = warp.shared_buffer(u64::from(stride * records));
+            let src = if on_a { &src_a } else { &src_b };
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                (&dst, D3D12_RESOURCE_STATE_COMMON),
+                budget_one_gpu,
+                (src, u64::from(at)),
+                None,
+                (kind, stride, records),
+                false,
+            ));
+            each.push((dst, dst_ptr, (stride * records) as usize));
+        }
+        warp.submit_and_wait();
+
+        // The hoisted pass over the same jobs, into one buffer.
+        let (dst_all, dst_all_ptr, _) = warp.shared_buffer(1 << 16);
+        let (_budget_all, budget_all_ptr, budget_all_gpu) = warp.shared_buffer(256);
+        let (_jobs_up, jobs_ptr, jobs_gpu) = warp.shared_buffer((jobs.len() * 16) as u64);
+        // SAFETY: the mapping holds 256 bytes.
+        unsafe { std::ptr::write_bytes(budget_all_ptr, 0, 256) };
+        let mut at_all = Vec::new();
+        let mut used = 0u32;
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        for (k, &(on_a, at, kind, stride, records)) in jobs.iter().enumerate() {
+            let dst_at = used.next_multiple_of(16);
+            used = dst_at + stride * records;
+            at_all.push(dst_at as usize);
+            let job = [at, dst_at, kind | (stride << 8), records];
+            // SAFETY: inside the jobs' mapping.
+            unsafe { jobs_ptr.add(k * 16).cast::<[u32; 4]>().write_unaligned(job) };
+            let src = if on_a { a_gpu } else { b_gpu };
+            match runs.last_mut() {
+                Some(run) if run.0 == src => run.2 += 1,
+                _ => runs.push((src, k as u32, 1)),
+            }
+        }
+        // SAFETY: an open list; live buffers; our root signature.
+        unsafe { record_hoisted(&hoist, &warp.list, jobs_gpu, &dst_all, budget_all_gpu, &runs) };
+        warp.submit_and_wait();
+
+        for (k, (_, dst_ptr, bytes)) in each.iter().enumerate() {
+            // SAFETY: both mappings hold these bytes; the card is done.
+            let (one, all) =
+                unsafe { (std::slice::from_raw_parts(*dst_ptr, *bytes), std::slice::from_raw_parts(dst_all_ptr.add(at_all[k]), *bytes)) };
+            assert_eq!(one, all, "job {k} ({:?}): the hoisted records differ from the clamp's", jobs[k]);
+        }
+        // SAFETY (each): inside the mapping.
+        let budget = |ptr: *mut u8| unsafe { [0, 4, 8].map(|at| ptr.add(at).cast::<u32>().read_unaligned()) };
+        assert_eq!(budget(budget_all_ptr), budget(budget_one_ptr), "budget and mesh notes");
+        assert_eq!(budget(budget_all_ptr)[0], 1 << 27, "the budget ran out");
+        assert_eq!(budget(budget_all_ptr)[1], 70_002, "the largest mesh group count asked");
+        // Emptied as the clamp empties: record 10 (MOST_DRAW), and the
+        // records of 2^22 once the budget is out: the small ones before
+        // them took 57, so 31 of them fit.
+        let first_out = 20 + 31;
+        // SAFETY (each): inside the mapping.
+        let rec = |k: usize| unsafe { [0, 4].map(|w| dst_all_ptr.add(at_all[k] + w).cast::<u32>().read_unaligned()) };
+        assert_eq!(rec(10), [0, 0]);
+        assert_eq!(rec(first_out - 1), [1 << 20, 4]);
+        assert_eq!(rec(first_out), [0, 0]);
+        // The title's records are as they were.
+        // SAFETY: the mappings hold BYTES bytes.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(a_ptr, BYTES), &a_before[..], "buffer A untouched");
+            assert_eq!(std::slice::from_raw_parts(b_ptr, BYTES), &b_before[..], "buffer B untouched");
+        }
+    }
+
+    /// Which executions are hoisted: not a dispatch, not with a count
+    /// buffer, not after the list's first part ended (its first compute
+    /// work, buffer-writing draw or copy), not with shaders that store.
+    #[test]
+    fn executions_with_a_count_or_after_the_first_part_are_not_hoisted() {
+        assert!(hoistable(1, false, 1, false, false));
+        assert!(hoistable(10, false, 4, false, false));
+        assert!(!hoistable(1, true, 1, false, false), "a count buffer");
+        assert!(!hoistable(2, false, 1, false, false), "a dispatch");
+        assert!(!hoistable(1, false, 0, false, false), "no records");
+        assert!(!hoistable(1, false, 1, true, false), "shaders that store");
+        assert!(!hoistable(1, false, 1, false, true), "after the first part");
+        let mut h = Hoisted::default();
+        assert!(!h.closed());
+        h.end();
+        assert!(h.closed(), "a compute or a copy ends the part");
+        h.reset();
+        assert!(!h.closed() && h.is_empty(), "a reset opens it again");
+    }
+
     /// The compare's groups (a thread per 16-byte line of a piece, their
     /// hashes folded) flag every kind of change and only its piece: one
     /// byte at the start, the middle and the end of a piece; the same bit

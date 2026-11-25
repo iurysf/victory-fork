@@ -127,6 +127,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Indirect executions whose clamp went to the list's prelude
+    /// (`indirect::hoist_on`).
+    IndirectHoisted,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
@@ -1296,10 +1299,11 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each), {:.0} clamped in their list's prelude (VICTORY_INDIRECT_HOIST); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::IndirectHoisted as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of
