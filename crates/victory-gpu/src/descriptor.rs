@@ -598,11 +598,22 @@ fn constant_of(i: u32, generation: u32) -> View {
 
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    // Words 1 and 13 of the resource description are its layout's filler
+    // (`crate::resource::texture_at` leaves them out of its key too): what
+    // the title's stack held there made a new shape each time (59,176 in
+    // run P3-0, on the bench none without them).
+    // `VICTORY_PLACED_FILLER=1` keeps them, as it does there.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut resource = *resource;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1176,6 +1187,26 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Placed views whose resource descriptions differ only in the filler
+    /// words (1 and 13) are one shape.
+    #[test]
+    fn placed_shapes_leave_out_the_filler() {
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        resource[2] = 512;
+        let desc = [7u32; 16];
+        let (first, at) = shape_of(false, &resource, &desc);
+        for junk in 1..50u32 {
+            resource[1] = junk.wrapping_mul(0x9e37_79b9);
+            resource[13] = junk;
+            let (shape, at2) = shape_of(false, &resource, &desc);
+            assert_eq!(shape, first);
+            assert_eq!(at2, at);
+        }
+        resource[2] = 1024;
+        assert_ne!(shape_of(false, &resource, &desc).0, first, "other words still count");
+    }
     use crate::object::{S_OK, slot};
 
     /// What newer titles pass; tests use it throughout, so that reading the
