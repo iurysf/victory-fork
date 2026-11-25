@@ -423,7 +423,9 @@ pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, written: &mut
     // false: the texture refresh asks the write watch first, then the
     // guards): it gets None at once, without the failing call. The
     // watch_remap's 185-191 failed askings a frame were mostly those.
-    let known_view = known_view(first * PAGE);
+    // `VICTORY_WATCH_VIEW_EARLY=0`: only for askers that take the guards'
+    // answer, as before.
+    let known_view = (guarded || watch_view_early()) && known_view(first * PAGE);
     if known_view && !guarded {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
@@ -1111,6 +1113,14 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             block += 1;
             continue;
         }
+        if !guard_runs() {
+            // As before: every block asked on its own.
+            if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+            block += 1;
+            continue;
+        }
         let end = uncommitted_end(block).min(to);
         if end > block {
             g.absent.extend(block..end);
@@ -1119,6 +1129,23 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             block += 1;
         }
     }
+}
+
+/// Whether a refused protection skips each uncommitted run whole
+/// ([`protect_here`], fork #987; on by default). `VICTORY_GUARD_RUNS=0`:
+/// block by block, as before.
+fn guard_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Whether an asking that does not take the guards' answer returns at once
+/// for memory known as a view ([`writes_into`]; on by default).
+/// `VICTORY_WATCH_VIEW_EARLY=0`: the kernel's write watch is asked first,
+/// as before.
+fn watch_view_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEW_EARLY").is_none_or(|v| v != "0"))
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
