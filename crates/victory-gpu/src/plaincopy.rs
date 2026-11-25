@@ -193,6 +193,46 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
+/// Whether reads of title memory whose bytes are all real (a host copy's
+/// refresh, what shaders wrote merged back) go in place however few they
+/// are ([`copy_buffer`]), the floor of [`least`] kept for the reads that ask
+/// whether a page is there (`crate::host::read_into`)
+/// (`VICTORY_COPY_READ_ONLY=1`; off by default; with `VICTORY_COPY_PLAIN`).
+/// Reads only: our memory is written, never the title's. After fork #1058
+/// (UwUCammie); the bench measured 3.60 -> 2.18 ms in the yard's heavy case
+/// (block 2, B2-1). May turn within a run (`crate::ab`): a copy is whole
+/// either way.
+pub(crate) fn read_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_READ_ONLY").is_some_and(|v| v == "1"));
+    on() && crate::ab::flag(crate::ab::Key::CopyReadOnly, run)
+}
+
+/// [`copy`] without the floor of [`least`], for bytes that are all real
+/// ([`read_only`]): false if a source page was not there (the caller then
+/// copies through the kernel, as before).
+pub(crate) fn copy_buffer(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !read_only() {
+        return copy(to, from, len);
+    }
+    if len == 0 {
+        return true;
+    }
+    if faulted_lately(from as usize, len) {
+        COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
 /// false if it is off or a source page was not there (the caller then
 /// copies through the kernel, as before).
@@ -251,6 +291,22 @@ mod tests {
         assert_eq!(to, from);
         // Nothing to copy is a copy.
         assert!(guarded(to.as_mut_ptr(), from.as_ptr(), 0));
+    }
+
+    /// [`copy_buffer`]'s copy has no floor: a few bytes (a stretch shaders
+    /// wrote, read to be merged) are copied in place like any other, the
+    /// same bytes the kernel's read gives (fork #1058).
+    #[test]
+    fn a_buffer_of_a_few_bytes_is_copied() {
+        let from: Vec<u8> = (0..64u32).map(|i| (i * 3 + 1) as u8).collect();
+        for len in [1, 4, 16, 64] {
+            let mut to = vec![0u8; len];
+            assert!(guarded(to.as_mut_ptr(), from.as_ptr(), len));
+            assert_eq!(to, from[..len]);
+            let mut kernel = vec![0u8; len];
+            assert!(crate::host::read_into(from.as_ptr(), &mut kernel));
+            assert_eq!(to, kernel);
+        }
     }
 
     /// Three pages reserved, the first committed: a copy that stays in the
