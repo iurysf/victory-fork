@@ -538,6 +538,44 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
     out
 }
 
+/// Every `VICTORY_FRAME_MARK`th frame (off unless set; 1 to 10,000): one line
+/// with the frame's number, when it ended, its length and where it went, so
+/// that two runs of a scene that is the same at every opening (the first
+/// cutscene) are set side by side frame by frame, by the same shot, not by
+/// readings of five seconds that see different shots.
+fn mark_every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_FRAME_MARK").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n >= 1).map(|n| n.min(10_000))
+    })
+}
+
+/// The mark line of frame `f`, if it is one to mark.
+fn mark(f: &Frame) -> Option<String> {
+    let every = mark_every()?;
+    f.number.is_multiple_of(every).then(|| mark_line(f))
+}
+
+fn mark_line(f: &Frame) -> String {
+    let ms = |t: T| f.t[t as usize] / 1e3;
+    format!(
+        "frame mark {} at {:.2} s: {:.1} ms; preparing {:.1}, copies {:.1}, heap views {:.1}, sync_heaps {:.1}, watches {:.1}, \
+         waiting for the card {:.1}, all other lists {:.1} (the card's clock, lists of a moment ago); {:.0} submissions, {:.0} draws",
+        f.number,
+        f.at,
+        f.us / 1e3,
+        ms(T::PrepareUs),
+        ms(T::CopyUs),
+        ms(T::HeapViewsUs),
+        ms(T::SyncHeapsUs),
+        ms(T::WatchUs),
+        ms(T::CardWaitUs),
+        ms(T::CardListsUs),
+        f.t[T::Submissions as usize],
+        f.s[S_DRAWS]
+    )
+}
+
 /// Frames whose lengths give the usual one, and the long frames listed in
 /// a reading at most.
 const RECENT: usize = 64;
@@ -583,6 +621,9 @@ pub fn frame() {
         if thread != thread0 {
             // Another thread presented: its processor time is not this frame's.
             (f.s[S_THREAD_USER], f.s[S_THREAD_KERNEL]) = (0.0, 0.0);
+        }
+        if let Some(line) = mark(&f) {
+            tracing::info!("{line}");
         }
         state.frames.push(f);
     }
@@ -657,6 +698,17 @@ mod tests {
         assert!(out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[2]);
         assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
         assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
+    }
+
+    #[test]
+    fn a_frame_mark_names_the_frame_and_where_it_went() {
+        let mut f = frame(120, 150.0);
+        f.t[T::PrepareUs as usize] = 40_000.0;
+        f.t[T::HeapViewsUs as usize] = 12_500.0;
+        f.s[S_DRAWS] = 2900.0;
+        let line = mark_line(&f);
+        assert!(line.starts_with("frame mark 120 at 120.00 s: 150.0 ms; preparing 40.0, copies 0.0, heap views 12.5,"), "{line}");
+        assert!(line.ends_with("0 submissions, 2900 draws"), "{line}");
     }
 
     #[test]
