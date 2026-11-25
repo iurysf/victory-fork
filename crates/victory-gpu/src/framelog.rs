@@ -688,6 +688,7 @@ pub fn frame() {
             remap: ms(T::RemapUs),
         })
     };
+    tracing::info!("{}", crate::background::line(elapsed.as_secs_f64()));
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
         if i == 0 {
             tracing::info!("{line}{ab}");

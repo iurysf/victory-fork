@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ab;
+#[cfg(windows)]
+mod background;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
