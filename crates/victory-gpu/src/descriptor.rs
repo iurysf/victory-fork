@@ -1413,6 +1413,27 @@ mod tests {
                 key_a,
                 "raw-copying A back after unmake must not be skipped by stale copied cache"
             );
+
+            // Scenario D: a slot the API makes keeps the fingerprint of its
+            // record: the next pass over copied records sees it as it was
+            // and does not mirror it again (run P5-0: some 6,000 a frame).
+            let slot8 = memory as u64 + 8 * 16;
+            create_sampler(std::ptr::null(), &sampler_b, slot8);
+            let (held, now) = host.copied_print(8, slot8);
+            assert_eq!(held, now, "an API-made slot holds its record's fingerprint");
+            assert_eq!(host.made_key(8), key_b);
+            // A raw copy of another record over it still differs, and goes in.
+            unsafe { std::ptr::copy_nonoverlapping(scratch_a.as_ptr(), slot8 as *mut u8, 16) };
+            sync_heaps();
+            assert_eq!(host.made_key(8), key_a, "a different record copied over it is mirrored");
+
+            // Scenario E: a slot a draw makes (mirror for a draw) keeps the
+            // fingerprint of the record it was made from too.
+            let slot9 = memory as u64 + 9 * 16;
+            unsafe { std::ptr::copy_nonoverlapping(scratch_b.as_ptr(), slot9 as *mut u8, 16) };
+            let _ = host.mirror(9, slot9, true);
+            let (held, now) = host.copied_print(9, slot9);
+            assert_eq!(held, now, "a slot made for a draw holds its record's fingerprint");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.

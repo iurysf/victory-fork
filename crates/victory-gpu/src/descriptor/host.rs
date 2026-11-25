@@ -1426,6 +1426,23 @@ impl HostHeap {
         true
     }
 
+    /// Notes the record at `handle` (the title's slot `index`, a record of
+    /// the heap's size) as the one the slot was made from
+    /// ([`HostHeap::mirror_copied_page`] compares with it). Must never be
+    /// called while holding `self.made`.
+    fn remember_copied(&self, index: u32, handle: u64) {
+        let bytes = if self.sampler { 16 } else { 32 };
+        // SAFETY: the record of a slot in title memory, as `mirror` reads
+        // its first words (records are aligned to their size, so it lies
+        // in one page).
+        let record = unsafe { std::slice::from_raw_parts(handle as *const u8, bytes) };
+        let print = record_print(record) | 1;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = copied.get_mut(index as usize) {
+            *slot = print;
+        }
+    }
+
     /// Clears the cached raw-copy fingerprint for `index` so a subsequent
     /// raw-byte copy back to an earlier record is not mistakenly skipped.
     /// Must never be called while holding `self.made`.
@@ -2095,7 +2112,12 @@ impl HostHeap {
             }
         };
         if invalidate_copied && self_changed {
-            self.forget_copied(index);
+            // The record the slot is made from now is what the pass over
+            // copied records last saw: a later byte copy of another record
+            // differs from it and is mirrored, the same record is not. A 0
+            // here ("never looked at") had that pass mirror every slot a
+            // draw or the API made again, some 6,000 a frame in run P5-0.
+            self.remember_copied(index, handle);
         }
         for stale in stale_unmade {
             self.forget_copied(stale);
@@ -2107,6 +2129,17 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made_key(index) != 0
+    }
+
+    /// The fingerprint the pass over copied records holds for `index`, and
+    /// what it would be for the record at `handle` now (tests).
+    #[cfg(test)]
+    pub(crate) fn copied_print(&self, index: u32, handle: u64) -> (u64, u64) {
+        let bytes = if self.sampler { 16 } else { 32 };
+        // SAFETY: a test's slot.
+        let record = unsafe { std::slice::from_raw_parts(handle as *const u8, bytes) };
+        let held = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        (held, record_print(record) | 1)
     }
 
     /// The active host descriptor key at `index`, or `0` if null/unmade (tests).
