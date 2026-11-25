@@ -3119,6 +3119,11 @@ impl Shadow {
             .filter(|&&(a, e)| a < to && e > from)
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
+        // In order and joined (upstream ab93ea0): two declared ranges that
+        // touch, the higher first, gave two short runs the room counted as
+        // patches where the send joins them into one long range, a copy the
+        // room never counted; and a page is looked at once.
+        let busy = joined(busy);
         if busy.is_empty() {
             return false;
         }
