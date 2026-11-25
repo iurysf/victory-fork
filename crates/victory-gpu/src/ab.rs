@@ -1,5 +1,6 @@
-//! A/B within one run: `VICTORY_AB=<KEY>[=<B>],<readings>[,<blocks>]`
-//! turns one switch between its value as the run sets it (A) and another
+//! A/B within one run: `VICTORY_AB=<KEY>[=<B>][+<KEY>[=<B>]...],<readings>[,<blocks>]`
+//! turns one switch (or a group of them, together; the group is refused
+//! whole if one of them may not turn) between its value as the run sets it (A) and another
 //! (B) in quartets of blocks A B B A, `<readings>` frame-log readings (five
 //! seconds each, `crate::framelog`) a block, from the moment the world is
 //! steady: three readings in a row of at least 3,000 draws a frame, a
@@ -36,7 +37,7 @@
 //! its own setting, each call (an atomic load when the A/B is on another
 //! switch or off).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 /// Switches the A/B knows.
@@ -85,7 +86,6 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 19] = [
         Some(
             "the guards kept as runs of blocks or as single blocks are two stores of the same state; a turn would have              to carry one into the other under the guards' lock",
         ),
-    ),
     (Key::CopyReadOnly, "COPY_READ_ONLY", None),
     (Key::WaitGuarded, "WAIT_GUARDED", None),
     (
@@ -110,10 +110,11 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 19] = [
 /// What `VICTORY_AB` asks for.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Plan {
-    key: Key,
-    name: &'static str,
-    /// B's value for a switch with a number; `None`: the other usual one.
-    b: Option<u64>,
+    /// The switches turned together, each with B's value for a switch with
+    /// a number (`None`: the other usual one).
+    keys: Vec<(Key, Option<u64>)>,
+    /// Their names, joined with `+`.
+    name: String,
     readings: u32,
     /// Blocks in all, a multiple of 4 (`None`: to the end of the run).
     blocks: Option<u32>,
@@ -132,21 +133,39 @@ pub(crate) struct Plan {
 pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
     let mut parts = spec.split(',').map(str::trim);
     let head = parts.next().unwrap_or("");
-    let (name, b) = match head.split_once('=') {
-        Some((name, b)) => (name, Some(b.trim().parse::<u64>().map_err(|_| format!("B's value {b:?} is not a number"))?)),
-        None => (head, None),
-    };
-    let name = name.trim().trim_start_matches("VICTORY_");
-    let Some(&(key, name, refused)) = KEYS.iter().find(|k| k.1.eq_ignore_ascii_case(name)) else {
-        let known: Vec<&str> = KEYS.iter().filter(|k| k.2.is_none()).map(|k| k.1).collect();
-        return Err(format!("{name:?} is not a switch the A/B can turn (it can: {})", known.join(", ")));
-    };
-    if let Some(why) = refused {
-        return Err(format!("{name} cannot turn within a run: {why}"));
+    let items: Vec<&str> = head.split('+').map(str::trim).collect();
+    let group = items.len() > 1;
+    let whole = if group { " (the group is refused whole)" } else { "" };
+    let mut keys: Vec<(Key, Option<u64>)> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    for item in items {
+        let (name, b) = match item.split_once('=') {
+            Some((name, b)) => {
+                (name, Some(b.trim().parse::<u64>().map_err(|_| format!("B's value {b:?} is not a number{whole}"))?))
+            }
+            None => (item, None),
+        };
+        let name = name.trim().trim_start_matches("VICTORY_");
+        let Some(&(key, name, refused)) = KEYS.iter().find(|k| k.1.eq_ignore_ascii_case(name)) else {
+            let known: Vec<&str> = KEYS.iter().filter(|k| k.2.is_none()).map(|k| k.1).collect();
+            return Err(format!("{name:?} is not a switch the A/B can turn (it can: {}){whole}", known.join(", ")));
+        };
+        if let Some(why) = refused {
+            return Err(format!("{name} cannot turn within a run: {why}{whole}"));
+        }
+        if b.is_some() && !matches!(key, Key::TextureHashEvery | Key::CopyPlainLeast) {
+            return Err(format!("{name} is on or off: B is the other one, no value{whole}"));
+        }
+        if keys.iter().any(|k| k.0 == key) {
+            return Err(format!("{name} is named twice{whole}"));
+        }
+        if group && key == Key::None {
+            return Err("NONE turns nothing: alone, not in a group".into());
+        }
+        keys.push((key, b));
+        names.push(name);
     }
-    if b.is_some() && !matches!(key, Key::TextureHashEvery | Key::CopyPlainLeast) {
-        return Err(format!("{name} is on or off: B is the other one, no value"));
-    }
+    let name = names.join("+");
     let readings = match parts.next() {
         None | Some("") => 4,
         Some(n) => n.parse::<u32>().map_err(|_| format!("readings a block {n:?} is not a number"))?,
@@ -163,7 +182,7 @@ pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
                 .ok_or_else(|| format!("blocks {n:?}: a multiple of 4 (quartets A B B A)"))?,
         ),
     };
-    Ok(Plan { key, name, b, readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0 })
+    Ok(Plan { keys, name, readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0 })
 }
 
 /// A number of seconds or draws from the environment: `None` if unset, not
@@ -187,7 +206,7 @@ fn plan() -> Option<&'static Plan> {
                 plan.after_s = after_s(env("VICTORY_AB_AFTER_S").as_deref());
                 plan.start_s = amount(env("VICTORY_AB_START_S").as_deref());
                 plan.min_draws = amount(env("VICTORY_AB_MIN_DRAWS").as_deref()).unwrap_or(3000.0);
-                KEY.store(plan.key as u8, Relaxed);
+                MASK.store(plan.keys.iter().fold(0, |m, k| m | 1 << k.0 as u32), Relaxed);
                 let from = match plan.start_s {
                     Some(at) => format!("from the reading ending {at} s after the first frame (VICTORY_AB_START_S)"),
                     None => format!(
@@ -213,17 +232,20 @@ fn plan() -> Option<&'static Plan> {
     .as_ref()
 }
 
-/// The switch the A/B turns ([`Key`] as a number; `u8::MAX`: none yet).
-static KEY: AtomicU8 = AtomicU8::new(u8::MAX);
+/// The switches the A/B turns, a bit each ([`Key`] as a number).
+static MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether the plan was read.
+static READ: AtomicBool = AtomicBool::new(false);
 /// Whether arm B is on.
 static B: AtomicBool = AtomicBool::new(false);
 
 fn turning(key: Key) -> bool {
-    if KEY.load(Relaxed) == u8::MAX {
-        // Read once: the plan sets KEY if it names a switch.
+    if !READ.load(Relaxed) {
+        // Read once: the plan sets MASK if it names switches.
         let _ = plan();
+        READ.store(true, Relaxed);
     }
-    KEY.load(Relaxed) == key as u8 && B.load(Relaxed)
+    MASK.load(Relaxed) & 1 << key as u32 != 0 && B.load(Relaxed)
 }
 
 /// A switch that is on or off: `run` as the run sets it (A), its opposite
@@ -238,7 +260,8 @@ pub(crate) fn flag(key: Key, run: bool) -> bool {
 /// bytes).
 pub(crate) fn number(key: Key, run: u64) -> u64 {
     let b = turning(key);
-    arm_value(key, run, b, if b { plan().and_then(|p| p.b) } else { None })
+    let given = if b { plan().and_then(|p| p.keys.iter().find(|k| k.0 == key)).and_then(|k| k.1) } else { None };
+    arm_value(key, run, b, given)
 }
 
 /// A number switch's value in arm A (`run`) or B (`given`, else the other
@@ -298,9 +321,15 @@ pub(crate) struct State {
     blocks: u32,
     into: u32,
     block: Vec<Reading>,
-    /// The open quartet's block medians, and every quartet closed.
-    quartet: Vec<Reading>,
+    /// The open quartet's block medians (`None`: a block that kept no
+    /// reading), and every quartet closed whole.
+    quartet: Vec<Option<Reading>>,
     quartets: Vec<[Reading; 4]>,
+    /// Readings of the blocks: kept; left out as the switch turned in them,
+    /// with host pipelines being made, under the draws' floor. Quartets
+    /// left out (a block of them kept no reading).
+    counts: [u64; 4],
+    left_out: u64,
     /// Every reading kept: when, and its frame (for the slope).
     kept: Vec<(f64, f64)>,
 }
@@ -378,7 +407,16 @@ impl State {
         let b = ORDER[self.blocks as usize % 4];
         let first = self.into == 0;
         self.into += 1;
-        if !first {
+        if first {
+            self.counts[1] += 1;
+        } else if r.making > 0 {
+            // Pipelines being made: the frame waits for them, not the switch.
+            self.counts[2] += 1;
+        } else if r.draws < s.min_draws {
+            // Another scene (a loading screen, a cut).
+            self.counts[3] += 1;
+        } else {
+            self.counts[0] += 1;
             self.block.push(r);
             self.kept.push((r.at, r.frame));
         }
@@ -392,16 +430,19 @@ impl State {
             return Step { tag, b_next: b, line: None };
         }
         // The block closes.
-        self.quartet.push(medians(&std::mem::take(&mut self.block)));
+        let block = std::mem::take(&mut self.block);
+        self.quartet.push((!block.is_empty()).then(|| medians(&block)));
         self.into = 0;
         self.blocks += 1;
         let last = s.blocks.is_some_and(|n| self.blocks >= n);
         let mut line = None;
         if self.quartet.len() == 4 {
-            let q: [Reading; 4] = std::array::from_fn(|i| self.quartet[i]);
+            match (self.quartet[0], self.quartet[1], self.quartet[2], self.quartet[3]) {
+                (Some(a), Some(b), Some(c), Some(d)) => self.quartets.push([a, b, c, d]),
+                _ => self.left_out += 1,
+            }
             self.quartet.clear();
-            self.quartets.push(q);
-            line = Some(self.line(name, last));
+            line = Some(self.line(name, last, s.min_draws));
         }
         if last {
             self.done = true;
@@ -411,8 +452,16 @@ impl State {
     }
 
     /// The line of the quartets so far.
-    fn line(&self, name: &str, end: bool) -> String {
+    fn line(&self, name: &str, end: bool, floor: f64) -> String {
         let k = self.quartets.len();
+        let readings = format!(
+            "readings: {} kept, {} left out as the switch turned in them, {} with host pipelines being made, {} under {floor} \
+             draws a frame; {} quartets left out (a block kept no reading)",
+            self.counts[0], self.counts[1], self.counts[2], self.counts[3], self.left_out
+        );
+        if k == 0 {
+            return format!("A/B {name}{}: no quartet kept yet; {readings}", if end { " (the end: A from here on)" } else { "" });
+        }
         let summary = |d: &[f64]| -> String {
             let m = median(d.to_vec());
             let lo = d.iter().copied().fold(f64::INFINITY, f64::min);
@@ -431,7 +480,7 @@ impl State {
         format!(
             "A/B {name}{}: quartet {k} (blocks A B B A): frame A {qa:.1} B {qb:.1} ms, B - A {:+.1}; all {k} quartets: frame median \
              A {:.1} B {:.1} ms, B - A by quartet {}, median {}; the frame's slope over the run {:+.2} ms a minute, within the \
-             quartets (the second A block less the first) {}; B - A of where a frame goes (median, range, sign): {}",
+             quartets (the second A block less the first) {}; B - A of where a frame goes (median, range, sign): {}; {readings}",
             if end { " (the end: A from here on)" } else { "" },
             qb - qa,
             median(self.quartets.iter().map(a).collect()),
@@ -462,7 +511,7 @@ pub(crate) fn reading(r: Reading) -> String {
         start_s: plan.start_s,
         min_draws: plan.min_draws,
     };
-    let step = state.step(&settings, r, plan.name);
+    let step = state.step(&settings, r, &plan.name);
     if let Some(line) = &step.line {
         tracing::info!("{line}");
     }
@@ -477,9 +526,9 @@ mod tests {
     #[test]
     fn the_plan_names_a_switch_that_may_turn() {
         let p = parse("back_own_view,3").unwrap();
-        assert_eq!((p.key, p.readings, p.blocks, p.b), (Key::BackOwnView, 3, None, None));
+        assert_eq!((p.keys.clone(), p.readings, p.blocks), (vec![(Key::BackOwnView, None)], 3, None));
         let p = parse("VICTORY_TEXTURE_HASH_EVERY=8,4,12").unwrap();
-        assert_eq!((p.key, p.b, p.blocks), (Key::TextureHashEvery, Some(8), Some(12)));
+        assert_eq!((p.keys.clone(), p.blocks), (vec![(Key::TextureHashEvery, Some(8))], Some(12)));
         assert_eq!(parse("NONE").unwrap().readings, 4);
         let refused = parse("SKIP_UNCHANGED,4").unwrap_err();
         assert!(refused.contains("cannot turn within a run"), "{refused}");
@@ -491,6 +540,51 @@ mod tests {
         assert_eq!(after_s(Some(" 60 ")), 60.0);
         assert_eq!(after_s(Some("x")), 0.0);
         assert_eq!(after_s(None), 0.0);
+    }
+
+    /// A group of switches turned together; refused whole if one of them
+    /// may not turn, is named twice, or is NONE.
+    #[test]
+    fn a_group_turns_together_or_not_at_all() {
+        let p = parse("HEAP_LESS+heap_lockfree+TEXTURE_HASH_EVERY=8,4,8").unwrap();
+        assert_eq!(
+            p.keys,
+            vec![(Key::HeapLess, None), (Key::HeapLockfree, None), (Key::TextureHashEvery, Some(8))]
+        );
+        assert_eq!(p.name, "HEAP_LESS+HEAP_LOCKFREE+TEXTURE_HASH_EVERY");
+        let refused = parse("HEAP_LESS+SKIP_UNCHANGED,4").unwrap_err();
+        assert!(refused.contains("SKIP_UNCHANGED") && refused.contains("refused whole"), "{refused}");
+        assert!(parse("HEAP_LESS+HEAP_LESS").unwrap_err().contains("twice"));
+        assert!(parse("HEAP_LESS+NONE").unwrap_err().contains("alone"));
+    }
+
+    /// The readings of the blocks are kept, or left out as the switch
+    /// turned in them, with pipelines being made, or under the draws'
+    /// floor; a block that kept none leaves its quartet out.
+    #[test]
+    fn readings_are_counted_by_why_they_are_left_out() {
+        let s = settings(3, Some(8));
+        let mut state = State::default();
+        let mut lines = Vec::new();
+        for i in 0..5 + 24 {
+            let mut r = reading(i, 100.0);
+            // Second quartet's first block (readings 17 to 19): the first is
+            // where the switch turned, the other two are lost.
+            if i == 18 {
+                r.making = 3;
+            }
+            if i == 19 {
+                r.draws = 10.0;
+            }
+            lines.extend(state.step(&s, r, "TEST").line);
+        }
+        assert_eq!(state.counts, [14, 8, 1, 1]);
+        assert_eq!((state.quartets.len(), state.left_out), (1, 1));
+        let last = lines.last().unwrap();
+        assert!(
+            last.ends_with("readings: 14 kept, 8 left out as the switch turned in them, 1 with host pipelines being made, 1 under 3000 draws a frame; 1 quartets left out (a block kept no reading)"),
+            "{last}"
+        );
     }
 
     #[test]
