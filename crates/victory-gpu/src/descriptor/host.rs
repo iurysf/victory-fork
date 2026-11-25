@@ -1918,6 +1918,9 @@ impl HostHeap {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
+        // Zero records of slots never raw-copied: as it was, unless the
+        // slot holds a view the API made (#807: then the zeroing goes in).
+        let mut zeroed: Vec<(u32, u64, u64)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1948,17 +1951,33 @@ impl HostHeap {
                 }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                // The record last seen: as it was.
+                if *last == print {
+                    continue;
+                }
+                if *last == 0 && record.iter().all(|&b| b == 0) {
+                    zeroed.push((index as u32, handle, print));
                     continue;
                 }
                 *last = print;
                 due.push((index as u32, handle));
             }
         }
+        if !zeroed.is_empty() {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            zeroed.retain(|&(index, _, _)| made.get(index as usize).is_some_and(|&key| key != 0));
+            drop(made);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, handle, print) in &zeroed {
+                if let Some(last) = copied.get_mut(index as usize) {
+                    *last = print;
+                }
+                due.push((index, handle));
+            }
+        }
+        // As `mirror_copied` (#807): a slot made here keeps its print.
         for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+            self.mirror_inner(index, handle, false, false);
         }
         (looked, due.len() as u64)
     }
