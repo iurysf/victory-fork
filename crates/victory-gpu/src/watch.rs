@@ -580,9 +580,109 @@ fn kept_view_check(block: usize) {
     }
 }
 
+/// A set of blocks: one by one as before, or as runs of blocks that
+/// follow one another with [`guard_intervals`] (chosen once for the run).
+struct BlockSet {
+    set: BTreeSet<usize>,
+    runs: CleanBlocks,
+}
+
+impl BlockSet {
+    const fn new() -> Self {
+        Self { set: BTreeSet::new(), runs: CleanBlocks(BTreeMap::new()) }
+    }
+
+    fn contains(&self, block: &usize) -> bool {
+        if guard_intervals() {
+            self.runs.uncovered(*block, *block + 1).is_empty()
+        } else {
+            self.set.contains(block)
+        }
+    }
+
+    fn insert(&mut self, block: usize) {
+        if guard_intervals() {
+            self.runs.insert(block, block + 1);
+        } else {
+            self.set.insert(block);
+        }
+    }
+
+    fn remove(&mut self, block: &usize) {
+        if guard_intervals() {
+            self.runs.remove(*block);
+        } else {
+            self.set.remove(block);
+        }
+    }
+
+    fn extend(&mut self, range: std::ops::Range<usize>) {
+        if guard_intervals() {
+            self.runs.insert(range.start, range.end);
+        } else {
+            self.set.extend(range);
+        }
+    }
+
+    /// The blocks of `range` in the set, in order.
+    fn blocks_in(&self, range: std::ops::Range<usize>) -> Vec<usize> {
+        if !guard_intervals() {
+            return self.set.range(range).copied().collect();
+        }
+        runs_blocks_in(&self.runs, range)
+    }
+
+    /// How many blocks of `range` are in the set.
+    fn count_in(&self, range: std::ops::Range<usize>) -> usize {
+        if !guard_intervals() {
+            return self.set.range(range).count();
+        }
+        runs_count_in(&self.runs, range)
+    }
+}
+
+/// The blocks of `range` in `runs`, in order ([`BlockSet::blocks_in`]).
+fn runs_blocks_in(runs: &CleanBlocks, range: std::ops::Range<usize>) -> Vec<usize> {
+    if range.start >= range.end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut at = range.start;
+    for (from, to) in runs.uncovered(range.start, range.end) {
+        out.extend(at..from);
+        at = to;
+    }
+    out.extend(at..range.end.max(at));
+    out
+}
+
+/// How many blocks of `range` are in `runs` ([`BlockSet::count_in`]).
+fn runs_count_in(runs: &CleanBlocks, range: std::ops::Range<usize>) -> usize {
+    if range.start >= range.end {
+        return 0;
+    }
+    let missing: usize = runs.uncovered(range.start, range.end).iter().map(|(a, b)| b - a).sum();
+    range.end - range.start - missing
+}
+
+/// Whether the guards keep the blocks they made read-only, and those known
+/// as view memory, as runs of blocks that follow one another rather than
+/// one by one (`VICTORY_GUARD_INTERVALS=1`; off by default; read once): the
+/// title's view memory is guarded in some 150,000 blocks lying in a few
+/// runs, each guarding and opening wrote or walked every block. And `guard`
+/// takes the guards' lock once for a range all clean. After fork #1067
+/// (UwUCammie), adapted: the clean blocks were runs here already (#979),
+/// and what `guard` registers for the refresh stays (`register_refreshing`).
+/// The bench measured 1.73 -> 0.74 ms in the yard (block 3, B3-1). Not
+/// turned within a run (`crate::ab`): the two are two stores of one state.
+fn guard_intervals() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_INTERVALS").is_some_and(|v| v == "1"))
+}
+
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: BlockSet,
     /// Of those, the ones not written since a copy took them.
     clean: CleanBlocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
@@ -599,7 +699,7 @@ struct Guards {
     /// With [`view_known`]: blocks made read-only at least once since the
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
-    viewed: BTreeSet<usize>,
+    viewed: BlockSet,
     /// With `VICTORY_BACK_OWN_CHECK=1` ([`back_check`]): blocks the runtime
     /// mapped or unmapped that were not made read-only since.
     remapped: CleanBlocks,
@@ -786,12 +886,12 @@ fn view_known() -> bool {
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
+    protected: BlockSet::new(),
     clean: CleanBlocks(BTreeMap::new()),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     watchers: BTreeMap::new(),
-    viewed: BTreeSet::new(),
+    viewed: BlockSet::new(),
     remapped: CleanBlocks(BTreeMap::new()),
 });
 
@@ -919,7 +1019,7 @@ pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Uncha
         return None;
     }
     let mut g = guards();
-    if g.protected.range(first..last).count() != last - first {
+    if g.protected.count_in(first..last) != last - first {
         return None;
     }
     watch_buckets(&mut g, first, last, w);
@@ -1037,7 +1137,32 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    if guard_intervals() && !ask {
+        // One lock of the guards ([`guard_intervals`]): a range all clean,
+        // nearly every asking, is done with under it; Windows is asked
+        // whether the memory is a view only when the guards do not know,
+        // with the lock let go. (The handler is registered first: a fault
+        // being dispatched holds the loader's lock while its handler waits
+        // for the guards'.)
+        install();
+        let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+        let mut g = guards();
+        if first < last && g.clean.uncovered(first, last).is_empty() {
+            register_refreshing(&mut g, first, last);
+            return Some(Vec::new());
+        }
+        let known = g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first));
+        if !known {
+            drop(g);
+            if !is_view(start, end) {
+                return None;
+            }
+            g = guards();
+        }
+        return guard_locked(g, start, end);
+    }
+    let known = !ask && {
         let g = guards();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
@@ -1046,7 +1171,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
-    let mut g = guards();
+    guard_locked(guards(), start, end)
+}
+
+/// [`guard`] with the guards locked, the range known to be a view.
+fn guard_locked(mut g: std::sync::MutexGuard<'static, Guards>, start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Large heaps are usually clean (#979): one lookup when all of the
@@ -1435,7 +1564,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let mut g = guards();
-        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        let guarded = g.protected.count_in(at / BLOCK..end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
@@ -1546,7 +1675,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    let blocks: Vec<usize> = g.protected.blocks_in(range.clone());
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(block);
@@ -1588,7 +1717,7 @@ fn remapped_viewed(g: &mut Guards, at: usize, len: usize, keep: bool) {
         return;
     }
     // What the range shows is new: no longer known to be a view.
-    let viewed: Vec<usize> = g.viewed.range(range).copied().collect();
+    let viewed: Vec<usize> = g.viewed.blocks_in(range);
     for block in viewed {
         g.viewed.remove(&block);
     }
