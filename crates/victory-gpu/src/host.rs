@@ -1550,6 +1550,12 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// [`CARD_PATCH`], if it compiled: root signature and pipeline.
+    patch: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    /// Buffers in the PC's memory for a plan's patches (buffer, mapping,
+    /// bytes), not in use: a plan takes one and gives it back with its
+    /// lists.
+    patch_buffers: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1675,6 +1681,52 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 }
 "#;
+
+/// Title bytes put into a copy in the card's memory without a copy per
+/// run: a patch per dword of the copy (`crate::shadow::dword_patches`):
+/// its index, the title's bytes and the mask of those to put in. The other
+/// bytes of the dword stay as the card holds them (a flight's writes):
+/// each atomic step changes only the mask's bits, so a write of the dword's
+/// other bytes at the same time stays, where a load and a store would put
+/// the old bytes back. The offsets are below 4 GiB ([`card_patchable`]).
+/// Upstream Marvisak/VIctory cee598f and a638f4e (PR #2257).
+pub(crate) const CARD_PATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0)"
+cbuffer Patches : register(b0) { uint count; };
+ByteAddressBuffer patches : register(t0);
+RWByteAddressBuffer copy : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count) {
+        return;
+    }
+    uint3 p = patches.Load3(id.x * 12u);
+    uint at = p.x * 4u;
+    copy.InterlockedAnd(at, ~p.z | p.y);
+    copy.InterlockedOr(at, p.y & p.z);
+}
+"#;
+
+/// Threads per group of [`CARD_PATCH`].
+pub(crate) const CARD_PATCH_PER_GROUP: u32 = 64;
+
+/// Whether the copies in the card's memory take title bytes by
+/// [`CARD_PATCH`] (it compiled, and `VICTORY_CARD_PATCH=0` does not say
+/// otherwise): then the short runs put in under flights are not held to the
+/// copies a list can take (`stale_under_flights`).
+static CARD_PATCHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a copy of `size` bytes in the card's memory can take patches
+/// (byte offsets of a raw view are 32 bits).
+pub(crate) fn card_patchable(size: u64) -> bool {
+    CARD_PATCHES.load(Ordering::Relaxed) && size <= 1 << 32
+}
+
+/// Since the last frame line: patches of [`CARD_PATCH`] sent up, the
+/// copies they were for, and plans whose patches found no buffer (a copy
+/// per range then).
+static CARD_PATCHED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Pieces per dispatch of [`CARD_COMPARE`] at most (a group each).
 pub(crate) const CARD_COMPARE_MOST: u32 = 65535;
@@ -1939,6 +1991,9 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// The buffer its patches of title bytes were in ([`CARD_PATCH`]),
+    /// given back with its lists.
+    patches: Option<(ID3D12Resource, usize, u64)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3115,11 +3170,17 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // (`VICTORY_MERGE_RUNS`: the cap. Run 218 had 500 to 5,400 changed
         // runs a frame of a few bytes each, and the cap of 512 settled the
         // flights twice a frame, 50 ms of the submitting thread.)
+        // With [`CARD_PATCH`] the runs shorter than
+        // `crate::shadow::CARD_PATCH_RUN` take dword patches instead, 16 MiB
+        // of them (the bus scene of upstream run dd56178 put in 20-80
+        // thousand runs of about 3 bytes a frame; run P3-0 here 56.6 ms a
+        // frame of settles for them).
         static RUNS: OnceLock<usize> = OnceLock::new();
-        let mut runs_left = *RUNS.get_or_init(|| {
+        let copies = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let mut room = crate::shadow::Room::new(copies, CARD_PATCHES.load(Ordering::Relaxed));
+        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut room));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -3537,10 +3598,13 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [patches, patched, unpatched] = [0, 1, 2].map(|i| CARD_PATCHED[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {patches:.0} dword patches sent up to {patched:.1} copies in the card's memory \
+             (CARD_PATCH{}), {unpatched:.2} sends without memory for their patches",
+            bytes / (1 << 20) as f64,
+            if CARD_PATCHES.load(Ordering::Relaxed) { "" } else { ": off" }
         );
     }
 }
@@ -4033,8 +4097,62 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                patch: self.make_card_patch(),
+                patch_buffers: Vec::new(),
             })
         }
+    }
+
+    /// [`CARD_PATCH`]'s root signature and pipeline; none (and title bytes
+    /// go up by a copy per run, as before) if it does not compile or
+    /// `VICTORY_CARD_PATCH=0`.
+    fn make_card_patch(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        if std::env::var_os("VICTORY_CARD_PATCH").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; the out
+        // pointer is ours; the blob's own bytes, the root signature inside.
+        let made = unsafe {
+            D3DCompile(
+                CARD_PATCH.as_ptr().cast(),
+                CARD_PATCH.len(),
+                windows::core::s!("card patch"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .ok()
+            .and(code)
+            .and_then(|code| {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).ok()?;
+                let pso: ID3D12PipelineState = self
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()?;
+                Some((root, pso))
+            })
+        };
+        if made.is_none() {
+            tracing::warn!("no patch of title bytes into copies in the card's memory: a copy per run, as before");
+        }
+        CARD_PATCHES.store(made.is_some(), Ordering::Relaxed);
+        made
     }
 
     /// [`CardInflight`] for `results` bytes of the compare's results; `None`
@@ -4247,6 +4365,60 @@ impl Host {
                 landed = Some(landing);
             }
         }
+        let mut patches_in: Option<(ID3D12Resource, usize, u64)> = None;
+        // Per copy of `dirty`: where its patches are in the plan's buffer
+        // ([`CARD_PATCH`]): its ranges shorter than
+        // `crate::shadow::CARD_PATCH_RUN`, which title bytes put in under
+        // flights are (thousands of runs of a few bytes a frame). Empty: a
+        // copy per range, as before.
+        let mut split: Vec<std::ops::Range<usize>> = vec![0..0; dirty.len()];
+        if !dirty.is_empty() && landed.is_none() && work.patch.is_some() {
+            let mut patches: Vec<[u32; 3]> = Vec::new();
+            for ((shadow, ranges), at) in dirty.iter().zip(split.iter_mut()) {
+                if !shadow.card_sides().is_some_and(|(_, _, size)| card_patchable(size)) {
+                    continue;
+                }
+                let short: Vec<(usize, usize)> =
+                    ranges.iter().copied().filter(|&(a, b)| b - a < crate::shadow::CARD_PATCH_RUN).collect();
+                let first = patches.len();
+                shadow.card_patches(&short, &mut patches);
+                *at = first..patches.len();
+            }
+            if !patches.is_empty() {
+                let bytes = (patches.len() * 12) as u64;
+                patches_in = match work.patch_buffers.iter().position(|b| b.2 >= bytes && b.2 <= (bytes * 4).max(1 << 20)) {
+                    Some(i) => Some(work.patch_buffers.swap_remove(i)),
+                    None => {
+                        let size = bytes.next_power_of_two().max(1 << 20);
+                        self.shared_buffer(size).map(|(buffer, data)| {
+                            name(&buffer, || "patches of title bytes for copies in the card's memory".into());
+                            (buffer, data as usize, size)
+                        })
+                    }
+                };
+                // The pool keeps a few: the smallest go first.
+                if work.patch_buffers.len() > 8 {
+                    work.patch_buffers.sort_unstable_by_key(|b| std::cmp::Reverse(b.2));
+                    work.patch_buffers.truncate(8);
+                }
+                match &patches_in {
+                    // SAFETY: the mapping holds `bytes` or more; the buffer
+                    // is no plan's, so the card does not read it now.
+                    Some((_, data, _)) => unsafe {
+                        std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), *data as *mut u8, bytes as usize);
+                        CARD_PATCHED[0].fetch_add(patches.len() as u64, Ordering::Relaxed);
+                        CARD_PATCHED[1].fetch_add(split.iter().filter(|p| !p.is_empty()).count() as u64, Ordering::Relaxed);
+                    },
+                    // No memory for them: a copy per range, as before.
+                    None => {
+                        CARD_PATCHED[2].fetch_add(1, Ordering::Relaxed);
+                        split = vec![0..0; dirty.len()];
+                    }
+                }
+            } else {
+                split = vec![0..0; dirty.len()];
+            }
+        }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4262,19 +4434,48 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
-                    for (shadow, ranges) in &dirty {
+                    for ((shadow, ranges), patched) in dirty.iter().zip(&split) {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        let mut copied = false;
                         for &(a, b) in ranges {
+                            // Its patch goes up below.
+                            if !patched.is_empty() && b - a < crate::shadow::CARD_PATCH_RUN {
+                                at += (b - a) as u64;
+                                crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                continue;
+                            }
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
                                 None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                             }
+                            copied = true;
                             at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // The card side's state: common at the list's start
+                        // (a buffer's decays when its submission has run).
+                        let mut state = if copied { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON };
+                        if let (false, Some((buffer, _, _)), Some((root, pso))) = (patched.is_empty(), &patches_in, &work.patch) {
+                            // After the copies; each patch puts the title's
+                            // bytes into its dword over what the card holds.
+                            list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            list.SetComputeRootSignature(root);
+                            list.SetPipelineState(pso);
+                            list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                            const MOST: usize = 65535 * CARD_PATCH_PER_GROUP as usize;
+                            let mut first = patched.start;
+                            while first < patched.end {
+                                let n = (patched.end - first).min(MOST);
+                                list.SetComputeRoot32BitConstant(0, n as u32, 0);
+                                list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress() + first as u64 * 12);
+                                list.Dispatch((n as u32).div_ceil(CARD_PATCH_PER_GROUP), 1, 1);
+                                first += n;
+                            }
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -4284,12 +4485,8 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                        if state != D3D12_RESOURCE_STATE_COMMON {
+                            list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
                         }
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
@@ -4330,6 +4527,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            patches: patches_in,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4467,6 +4665,9 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        if let Some(buffer) = plan.patches {
+            work.patch_buffers.push(buffer);
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }

@@ -960,6 +960,104 @@ void main() {
         }
     }
 
+    /// The patch of title bytes into a copy in the card's memory
+    /// (`crate::host::CARD_PATCH`) on WARP: the bytes of the ranges land as
+    /// a copy per range would put them, the card's other bytes stay (in
+    /// the same dwords too), threads past the count write nothing, and a
+    /// dispatch from a later patch (the view moved on) finds its own.
+    /// Patches of one dword in threads side by side (a byte each, as two
+    /// merges' patches of one dword could be): each atomic step changes only
+    /// its mask's bits, so every byte lands; a load and a store would put
+    /// the other threads' old bytes back (upstream a638f4e: 7,680 of 14,336
+    /// bytes lost on WARP).
+    #[test]
+    fn warp_card_patches_of_one_dword_side_by_side_all_land() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let patch = compile_cs(&warp.device, crate::host::CARD_PATCH).expect("the card patch must compile on WARP");
+        const DWORDS: usize = 3584;
+        const SIZE: usize = DWORDS * 4;
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        // SAFETY: the mapping holds `SIZE` bytes.
+        unsafe { std::ptr::write_bytes(card_ptr, 0xEE, SIZE) };
+        let wanted: Vec<u8> = (0..SIZE).map(|i| (i * 37 + 11) as u8).collect();
+        // Byte k of every dword in patches k * DWORDS.., so the four patches
+        // of a dword run in threads of the same few groups.
+        let mut patches: Vec<[u32; 3]> = Vec::new();
+        for dword in 0..DWORDS {
+            for byte in 0..4 {
+                let at = dword * 4 + byte;
+                patches.push([dword as u32, u32::from(wanted[at]) << (byte * 8), 0xFF << (byte * 8)]);
+            }
+        }
+        let bytes = patches.len() * 12;
+        let (_list, list_ptr, list_gpu) = warp.shared_buffer(bytes as u64);
+        // SAFETY: the mapping holds `bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), list_ptr, bytes) };
+        // SAFETY: our open list, live buffers, the patch's own root signature.
+        unsafe {
+            warp.list.SetComputeRootSignature(&patch.root);
+            warp.list.SetPipelineState(&patch.pso);
+            warp.list.SetComputeRootUnorderedAccessView(2, card_gpu);
+            warp.list.SetComputeRoot32BitConstant(0, patches.len() as u32, 0);
+            warp.list.SetComputeRootShaderResourceView(1, list_gpu);
+            warp.list.Dispatch((patches.len() as u32).div_ceil(crate::host::CARD_PATCH_PER_GROUP), 1, 1);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mapping holds `SIZE` bytes; the card is done.
+        let card = unsafe { std::slice::from_raw_parts(card_ptr, SIZE) };
+        let lost = (0..SIZE).filter(|&i| card[i] != wanted[i]).count();
+        assert_eq!(lost, 0, "bytes lost");
+    }
+
+    #[test]
+    fn warp_card_patch_puts_in_only_the_title_bytes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let patch = compile_cs(&warp.device, crate::host::CARD_PATCH).expect("the card patch must compile on WARP");
+        const SIZE: usize = 64 << 10;
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        let card0: Vec<u8> = (0..SIZE).map(|i| (i * 29 + i / 509) as u8).collect();
+        let cpu: Vec<u8> = (0..SIZE).map(|i| (i * 7 + 101) as u8).collect();
+        // SAFETY: the mapping holds `SIZE` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(card0.as_ptr(), card_ptr, SIZE) };
+        let mut ranges = vec![(0usize, 1usize), (5, 8), (9, 10), (11, 13), (4093, 4099), (SIZE - 3, SIZE)];
+        // Many runs of three bytes a few bytes apart, as the title's writes
+        // under flights are: more than one dispatch group.
+        ranges.extend((0..300).map(|k| (20_000 + k * 6, 20_000 + k * 6 + 3)));
+        ranges.sort_unstable();
+        let mut patches = Vec::new();
+        crate::shadow::dword_patches(&ranges, &cpu, &mut patches);
+        let bytes = patches.len() * 12;
+        let (_list, list_ptr, list_gpu) = warp.shared_buffer(bytes as u64);
+        // SAFETY: the mapping holds `bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), list_ptr, bytes) };
+        // Two dispatches, the second from patch `half` on.
+        let half = patches.len() / 2 + 1;
+        // SAFETY: our open list, live buffers, the patch's own root signature.
+        unsafe {
+            warp.list.SetComputeRootSignature(&patch.root);
+            warp.list.SetPipelineState(&patch.pso);
+            warp.list.SetComputeRootUnorderedAccessView(2, card_gpu);
+            for (first, n) in [(0usize, half), (half, patches.len() - half)] {
+                warp.list.SetComputeRoot32BitConstant(0, n as u32, 0);
+                warp.list.SetComputeRootShaderResourceView(1, list_gpu + first as u64 * 12);
+                warp.list.Dispatch((n as u32).div_ceil(crate::host::CARD_PATCH_PER_GROUP), 1, 1);
+            }
+        }
+        warp.submit_and_wait();
+        let mut expected = card0.clone();
+        for &(a, b) in &ranges {
+            expected[a..b].copy_from_slice(&cpu[a..b]);
+        }
+        // SAFETY: the mapping holds `SIZE` bytes; the card is done.
+        let card = unsafe { std::slice::from_raw_parts(card_ptr, SIZE) };
+        let wrong: Vec<usize> = (0..SIZE).filter(|&i| card[i] != expected[i]).take(8).collect();
+        assert!(wrong.is_empty(), "bytes wrong at {wrong:?}");
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed

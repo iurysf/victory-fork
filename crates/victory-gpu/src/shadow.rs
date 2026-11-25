@@ -400,6 +400,77 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// A run of title bytes shorter than this goes to the card's side as
+/// patches of dwords (`crate::host::CARD_PATCH`), a longer one by a copy
+/// of its own.
+pub(crate) const CARD_PATCH_RUN: usize = 256;
+
+/// Patches a submission's merges may put in (16 MiB of them, 12 bytes
+/// each; upstream a638f4e).
+const PATCH_ROOM: usize = (16 << 20) / 12;
+
+/// What title bytes put in under flights may still take in one
+/// submission ([`Shadow::merge_under_writes`]): copies of runs of
+/// [`CARD_PATCH_RUN`] bytes or more (512, or `VICTORY_MERGE_RUNS`), and
+/// dword patches for the shorter ones, if the card can take patches.
+/// Past either a settle is due, as before the patches.
+pub(crate) struct Room {
+    copies: usize,
+    patches: usize,
+}
+
+impl Room {
+    pub(crate) fn new(copies: usize, patching: bool) -> Room {
+        Room {
+            copies,
+            patches: if patching { PATCH_ROOM } else { 0 },
+        }
+    }
+
+    /// Takes room for `runs` (offset, bytes) of one page, all or nothing:
+    /// patches for the short ones if `patchable`, a copy for each other.
+    pub(crate) fn take(&mut self, runs: &[(usize, usize)], patchable: bool) -> bool {
+        let (mut copies, mut patches) = (0usize, 0usize);
+        for &(at, n) in runs {
+            if patchable && self.patches > 0 && n < CARD_PATCH_RUN {
+                // The dwords it touches.
+                patches += (at + n).div_ceil(4) - at / 4;
+            } else {
+                copies += 1;
+            }
+        }
+        if copies > self.copies || patches > self.patches {
+            return false;
+        }
+        self.copies -= copies;
+        self.patches -= patches;
+        true
+    }
+}
+
+/// `ranges` of `data` (offsets in order, apart) as patches of dwords
+/// (`crate::host::CARD_PATCH`), appended to `out`: the dword's index, its
+/// bytes from `data` where the ranges hold them (zero elsewhere), and the
+/// mask of those bytes. A dword two ranges share is one patch, so that no
+/// two threads of the patch write the same dword.
+pub(crate) fn dword_patches(ranges: &[(usize, usize)], data: &[u8], out: &mut Vec<[u32; 3]>) {
+    let first = out.len();
+    for &(a, b) in ranges {
+        for (at, &byte) in data[a..b].iter().enumerate().map(|(i, v)| (a + i, v)) {
+            let (dword, shift) = ((at / 4) as u32, (at % 4) * 8);
+            let (byte, mask) = (u32::from(byte) << shift, 0xFFu32 << shift);
+            let ours = out.len() > first;
+            match out.last_mut() {
+                Some(p) if ours && p[0] == dword => {
+                    p[1] |= byte;
+                    p[2] |= mask;
+                }
+                _ => out.push([dword, byte, mask]),
+            }
+        }
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -469,7 +540,107 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CARD_PATCH_RUN, CardSpan, PIECE, PATCH_ROOM, Room, card_piece_of, card_span_of, dword_patches, joined, joined_piece_runs};
+
+    /// The room of a submission's merges: runs of 256 bytes or more take
+    /// a copy each, 512 at most; shorter ones the dwords they touch, 16 MiB
+    /// of patches at most; a page that does not fit takes nothing (its
+    /// settle is due) and leaves the room as it was; without patches every
+    /// run is a copy, as before.
+    #[test]
+    fn the_room_counts_copies_and_patch_dwords() {
+        let mut room = Room::new(512, true);
+        // 600 short runs of 3 bytes, unaligned: dwords, no copies.
+        let short: Vec<(usize, usize)> = (0..600).map(|k| (k * 7 + 3, 3)).collect();
+        assert!(room.take(&short, true));
+        assert_eq!(room.copies, 512);
+        let dwords: usize = short.iter().map(|&(a, n)| (a + n).div_ceil(4) - a / 4).sum();
+        assert_eq!(room.patches, PATCH_ROOM - dwords);
+        // One run that straddles two dwords counts both.
+        let mut one = Room::new(512, true);
+        assert!(one.take(&[(3, 2)], true));
+        assert_eq!(one.patches, PATCH_ROOM - 2);
+        // Long runs: a copy each, up to 512.
+        let long: Vec<(usize, usize)> = (0..512).map(|k| (k * 1024, CARD_PATCH_RUN)).collect();
+        assert!(room.take(&long, true));
+        assert_eq!(room.copies, 0);
+        let before = room.patches;
+        // A page with one long run more and short ones: none taken.
+        assert!(!room.take(&[(0, 3), (10, CARD_PATCH_RUN)], true));
+        assert_eq!((room.copies, room.patches), (0, before));
+        // Short runs still fit.
+        assert!(room.take(&[(0, 3)], true));
+        // A copy that cannot take patches counts its short runs as copies.
+        let mut plain = Room::new(2, true);
+        assert!(!plain.take(&[(0, 3), (8, 3), (16, 3)], false));
+        assert!(plain.take(&[(0, 3), (8, 3)], false));
+        // Without the patch: copies, as before.
+        let mut off = Room::new(512, false);
+        assert!(!off.take(&short, true));
+        assert!(off.take(&short[..512], true));
+        // The patch room runs out.
+        let mut full = Room::new(512, true);
+        let page: Vec<(usize, usize)> = (0..16_384).map(|k| (k * 4, 1)).collect();
+        let pages_fit = PATCH_ROOM / page.len();
+        for _ in 0..pages_fit {
+            assert!(full.take(&page, true));
+        }
+        assert!(!full.take(&page, true));
+    }
+
+    /// Ranges past the CPU side are cut, not read past its end.
+    #[test]
+    fn patches_of_ranges_past_the_end_are_cut() {
+        let data: Vec<u8> = (0..10u8).collect();
+        let mut out = Vec::new();
+        let cut: Vec<(usize, usize)> =
+            [(8usize, 14usize), (12, 20)].iter().map(|&(a, b)| (a.min(10), b.min(10))).filter(|r| r.0 < r.1).collect();
+        dword_patches(&cut, &data, &mut out);
+        assert_eq!(out, [[2, 0x0908, 0xFFFF]]);
+    }
+
+    /// What the patch shader does with `patches` to `card` (one thread per
+    /// patch; they name distinct dwords).
+    fn apply(card: &mut [u8], patches: &[[u32; 3]]) {
+        for &[dword, value, mask] in patches {
+            let at = dword as usize * 4;
+            let old = u32::from_le_bytes(card[at..at + 4].try_into().unwrap());
+            card[at..at + 4].copy_from_slice(&((old & !mask) | (value & mask)).to_le_bytes());
+        }
+    }
+
+    /// Patches put in exactly the bytes of the ranges, as a copy per range
+    /// would, and keep every other byte as the card holds it (a flight's
+    /// writes beside them, in the same dwords too); a dword two ranges
+    /// share is one patch.
+    #[test]
+    fn patches_put_in_the_ranges_bytes_and_nothing_else() {
+        const N: usize = 96;
+        let cpu: Vec<u8> = (0..N as u32).map(|i| (i * 7 + 3) as u8).collect();
+        let card0: Vec<u8> = (0..N as u32).map(|i| (i * 13 + 200) as u8).collect();
+        // Runs of one to five bytes, at every alignment; 9..10 and 11..13
+        // share dword 2, 13..14 is the next byte of the same dword's end.
+        let ranges = [(0usize, 1usize), (5, 8), (9, 10), (11, 13), (17, 22), (40, 41), (63, 64), (90, 96)];
+        let mut patches = vec![[u32::MAX; 3]];
+        dword_patches(&ranges, &cpu, &mut patches);
+        assert_eq!(patches[0], [u32::MAX; 3], "what was in `out` before is left alone");
+        let patches = &patches[1..];
+        let dwords: Vec<u32> = patches.iter().map(|p| p[0]).collect();
+        let mut distinct = dwords.clone();
+        distinct.dedup();
+        assert_eq!(dwords, distinct, "each dword once, in order");
+        assert_eq!(dwords, [0, 1, 2, 3, 4, 5, 10, 15, 22, 23]);
+        let mut card = card0.clone();
+        apply(&mut card, patches);
+        let mut copied = card0.clone();
+        for &(a, b) in &ranges {
+            copied[a..b].copy_from_slice(&cpu[a..b]);
+        }
+        assert_eq!(card, copied);
+        for p in patches {
+            assert_eq!(p[1] & !p[2], 0, "no byte outside the mask");
+        }
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -2926,15 +3097,15 @@ impl Shadow {
     /// it is now is compared with what the copy held when the range was
     /// given to the shaders: the copy's CPU side for a copy in the card's
     /// memory (the changed runs go up before the next submission, each a
-    /// copy of its own bytes, `runs_left` of them at most), the snapshot
+    /// copy of its own bytes or dword patches, as `room` holds), the snapshot
     /// for the others (the changed bytes go into the copy and into the
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
     /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// cannot say what was written, a snapshot is missing, or `room` ran
+    /// out. Pages done before that stay done.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, room: &mut Room) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -2998,10 +3169,10 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
+                    let patchable = self.card_sides().is_some_and(|(_, _, size)| crate::host::card_patchable(size));
+                    if !room.take(&runs, patchable) {
                         return true;
                     }
-                    *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
@@ -3257,6 +3428,26 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+    }
+
+    /// Of a copy in the card's memory: `ranges` of its CPU side (offsets,
+    /// in order and apart) as patches of dwords ([`dword_patches`]),
+    /// appended to `out`. Under the CPU side's lock, which the merges that
+    /// write it hold ([`Shadow::merge_under_writes`],
+    /// [`Shadow::card_merge_relay`]): the bytes are taken now, where a copy
+    /// takes them when the card runs it; both are the title's bytes noted
+    /// in `dirty` by then.
+    pub(crate) fn card_patches(&self, ranges: &[(usize, usize)], out: &mut Vec<[u32; 3]>) {
+        if ranges.is_empty() || self.card.is_none() {
+            return;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let len = self.len as usize;
+        // SAFETY: the CPU side's mapping holds the copy's bytes; the ranges
+        // are offsets in it (`card_dirty`), cut to it here.
+        let data = unsafe { std::slice::from_raw_parts(self.data, len) };
+        let cut: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (a.min(len), b.min(len))).filter(|r| r.0 < r.1).collect();
+        dword_patches(&cut, data, out);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
