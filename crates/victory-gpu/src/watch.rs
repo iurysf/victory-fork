@@ -872,6 +872,12 @@ fn unchanged_gone(at: usize, len: usize) {
     take_out_range(&g, at, at.saturating_add(len));
 }
 
+/// Whether the block `block` is read-only by our hand and unwritten since a
+/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
+pub(crate) fn clean(block: usize) -> bool {
+    guards().clean.uncovered(block, block + 1).is_empty()
+}
+
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
