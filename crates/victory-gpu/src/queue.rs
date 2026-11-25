@@ -58,10 +58,20 @@ enum Held {
     /// title can add to its end meanwhile; whatever is added stays behind
     /// this (the line is not empty), signals too.
     Running,
-    /// With [`present_behind`]: the title's present of a frame, due after
-    /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// With [`present_behind`] or [`present_queued`]: the title's present
+    /// of a frame, due after what the queue holds before it: the host
+    /// texture shown (none in the tests), the state the title's lists
+    /// leave it in, and the frame's number.
+    /// With [`present_queued`] also the title's resource whose host state
+    /// is read when the frame is shown ([`Lines::present_state`]; 0: the
+    /// state given, as [`present_behind`] gives it).
+    Present(Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>, u32, u64, usize),
+    /// With [`present_queued`]: where another queue's line stood when the
+    /// title presented frame `.0`. What is ahead of it ran before that
+    /// present when the present ran the lines itself, and still does: the
+    /// present waits until every line has reached its mark, and what is
+    /// behind a mark waits until the frame has been shown.
+    Mark(u64),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -142,7 +152,7 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(Some(texture), state, frame, 0)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -155,6 +165,225 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
 /// ([`send_behind`]), for the line every 512 of them.
 #[cfg(windows)]
 static PRESENTS_BEHIND: AtomicU64 = AtomicU64::new(0);
+
+/// How many presents may wait in the lines (`VICTORY_PRESENT_QUEUED=1` or
+/// `2`; 0, off, by default; needs [`behind`] and presents that do not
+/// settle the flights, `crate::host::late_free_present`).
+///
+/// Why: with `VICTORY_ASYNC_SUBMIT=1` the title's render thread still
+/// stood 42-46 ms of a 96 ms frame inside the present (`present_now` ->
+/// `release_held_now` -> the one-releaser lock): the present ran the lines
+/// itself, so it stood until our thread had prepared and sent the whole
+/// frame, and only then did the title record the next one, while our
+/// thread waited for work about as long. The frames went one after the
+/// other through two threads that each stood half the time.
+///
+/// With the switch the present goes into the line of its queue
+/// ([`Held::Present`]) and a mark into every other line that holds anything
+/// ([`Held::Mark`]); the title's call returns at once and it records the
+/// next frame while our thread ([`worker`]) prepares, sends and shows this
+/// one. The order is the one the present made when it ran the lines:
+/// - everything in the lines ahead of the present and its marks runs
+///   before the frame is shown; first what is free to run, and once
+///   nothing else moves, a wait ahead of a mark is passed, as the present
+///   forced it ([`forces`]: a wait is not kept across frames);
+/// - the present runs once every other line has reached its mark;
+/// - what the title gives the queues after the present (behind the marks)
+///   runs after the frame has been shown;
+/// - signals and bottom-of-pipe writes stay in their lines' order and are
+///   told when the card has run what is ahead of them, as before.
+///
+/// At most this many presents wait: the title's next present stands until
+/// the oldest has been shown (as a swap chain's frame latency does), so
+/// the title is that many frames ahead at most. A frame that is saved or
+/// listed still runs the old way. `VICTORY_ASYNC_PRESENT=1` is left as it
+/// is: one present behind the line at most, the next one running the lines
+/// itself on the title's thread.
+#[cfg(windows)]
+pub(crate) fn present_queued() -> u64 {
+    let run = present_queued_run();
+    if !present_possible() {
+        return 0;
+    }
+    // May turn within a run (`crate::ab`): presents queued before a turn
+    // off are shown in their turn (the marks stay), and empty lines are
+    // opened behind them still (`frame_in_flight`).
+    crate::ab::number(crate::ab::Key::PresentQueued, run).min(2)
+}
+
+/// [`present_queued`] as the run sets it.
+#[cfg(windows)]
+fn present_queued_run() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_PRESENT_QUEUED").as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        };
+        let most = if asked > 0 && present_possible() { asked } else { 0 };
+        if most > 0 {
+            tracing::info!(
+                most,
+                "presents go into the queue's line and return at once; our thread shows the frame in order, and the title's next present waits while {most} wait (VICTORY_PRESENT_QUEUED={most})"
+            );
+        } else if asked > 0 {
+            tracing::warn!("VICTORY_PRESENT_QUEUED needs VICTORY_ASYNC_SUBMIT=1 and presents sent ahead (the relay, or VICTORY_LATE_WAIT=3): off");
+        }
+        most
+    })
+}
+
+/// Whether presents may be queued at all: asynchronous submission
+/// ([`behind`]) and presents that do not settle the flights.
+#[cfg(windows)]
+fn present_possible() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| behind() && crate::host::late_free_present())
+}
+
+/// The last frame shown from a line ([`Lines::present`]), and the word for
+/// a present waiting at [`present_queued`]'s bound.
+#[cfg(windows)]
+static SHOWN: (std::sync::Mutex<u64>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Since the last line ([`present_line`]): presents queued, presents the
+/// old way, microseconds the title stood at the bound, presents in the
+/// lines summed over the queued ones (at their call), the most at once,
+/// microseconds of the title's present calls in all.
+#[cfg(windows)]
+static QUEUED_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// With [`present_queued`]: puts the present of the next frame into the
+/// line of `this`, marks the other lines, and returns: false if it has to
+/// run the old way. Waits first while [`present_queued`] presents wait.
+#[cfg(windows)]
+fn queue_present(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
+    let most = present_queued();
+    if most == 0 || this.is_null() || planes == 0 {
+        return false;
+    }
+    let frame = FRAMES.load(Ordering::Relaxed) + 1;
+    // A frame that is saved or listed is read back at once.
+    #[cfg(feature = "diagnostics")]
+    if crate::capture::wanted(frame) || crate::capture::listed(frame) {
+        return false;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
+        return false;
+    };
+    if plane.count == 0 || plane.resources.is_null() {
+        return false;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return false;
+    };
+    let texture = texture.clone();
+    // The bound: the oldest present waiting is shown first.
+    let held = PRESENTS_HELD.load(Ordering::Acquire);
+    if held >= most {
+        let waiting = std::time::Instant::now();
+        let mut shown = lock(&SHOWN.0);
+        while PRESENTS_HELD.load(Ordering::Acquire) >= most {
+            // (Woken by every present shown; looked at again now and then
+            // in case the lines were run the old way meanwhile.)
+            shown = SHOWN.1.wait_timeout(shown, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+            wake();
+        }
+        drop(shown);
+        QUEUED_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    // The state the texture is in is read when the frame is shown: the
+    // submissions ahead of the present in the lines have not been prepared
+    // yet, and their transitions are made then (the bench: read here, 0x4
+    // where the copy found 0x800).
+    let in_lines = PRESENTS_HELD.fetch_add(1, Ordering::AcqRel) + 1;
+    QUEUED_FRAME.fetch_max(frame, Ordering::AcqRel);
+    queue_present_into(&Queues, this as usize, Some(texture), resource as usize, frame);
+    QUEUED_STATS[0].fetch_add(1, Ordering::Relaxed);
+    QUEUED_STATS[3].fetch_add(in_lines, Ordering::Relaxed);
+    QUEUED_STATS[4].fetch_max(in_lines, Ordering::Relaxed);
+    wake();
+    true
+}
+
+/// [`queue_present`]'s work on the lines: the marks first, then the present,
+/// so that a present found in a line has its marks in place.
+#[cfg(windows)]
+fn queue_present_into<L: Lines>(
+    lines: &L,
+    q: usize,
+    texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    resource: usize,
+    frame: u64,
+) {
+    for other in lines.all_lines() {
+        if other == q {
+            continue;
+        }
+        let mut held = lock(lines.line(other));
+        if !held.is_empty() {
+            held.push(Held::Mark(frame));
+        }
+    }
+    lock(lines.line(q)).push(Held::Present(texture, 0, frame, resource));
+    lines.join_waiting(q);
+}
+
+/// With [`present_queued`]: the frame of the last present queued
+/// ([`queue_present`]); not shown while it is above [`SHOWN`].
+#[cfg(windows)]
+static QUEUED_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// With [`present_queued`]: the frame of a present queued and not shown
+/// yet, if any.
+#[cfg(windows)]
+fn frame_in_flight() -> Option<u64> {
+    // (Not asked of the switch: one turned off by the A/B leaves presents
+    // queued behind it, shown in their turn.)
+    let queued = QUEUED_FRAME.load(Ordering::Acquire);
+    (queued > *lock(&SHOWN.0)).then_some(queued)
+}
+
+/// Before work goes into a line that is empty: with a frame in flight
+/// (`in_flight`, [`frame_in_flight`]) the line is opened behind its mark,
+/// and true is returned (the line holds something now). A line empty when
+/// the present was queued got no mark ([`queue_present_into`]), and what
+/// the title gave it afterwards ran before the frame was shown; it ran
+/// after, when the present ran the lines itself (the bench's
+/// empty_queue_leak).
+#[cfg(windows)]
+fn open_line(held: &mut Vec<Held>, in_flight: Option<u64>) -> bool {
+    match in_flight {
+        Some(frame) if held.is_empty() => {
+            held.push(Held::Mark(frame));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// For the frame-rate line, with [`present_queued`], every 256 presents.
+#[cfg(windows)]
+fn present_line(frames: u64) {
+    let s: Vec<u64> = QUEUED_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
+    let f = frames.max(1) as f64;
+    tracing::info!(
+        "presents queued behind the lines (VICTORY_PRESENT_QUEUED={}) over the last {frames} frames: {} queued, {} the old way; \
+         the title's present calls took {:.1} ms a frame, {:.1} of them waiting for an earlier frame to be shown; frames in \
+         flight when a present was queued {:.2} on average, {} at most",
+        present_queued(),
+        s[0],
+        s[1],
+        s[5] as f64 / 1000.0 / f,
+        s[2] as f64 / 1000.0 / f,
+        if s[0] > 0 { s[3] as f64 / s[0] as f64 } else { 0.0 },
+        s[4],
+    );
+}
 
 /// The queues that hold something (their addresses).
 #[cfg(windows)]
@@ -289,6 +518,7 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
+            open_line(&mut held, frame_in_flight());
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push(Held::Run(taken, order));
@@ -314,7 +544,7 @@ fn submit_split(this: This, lists: &[This]) {
     };
     let by = crate::list::waits_by_list(lists);
     // Behind what the queue already holds, nothing runs now.
-    let cut = if lock(&queue(this).held).is_empty() {
+    let cut = if lock(&queue(this).held).is_empty() && frame_in_flight().is_none() {
         (0..lists.len())
             .find(|&i| by[i].iter().any(|w| !w.met()))
             .unwrap_or(lists.len())
@@ -375,7 +605,11 @@ fn submit_split(this: This, lists: &[This]) {
             pieces.push(Held::Run(taken, order));
             from = to;
         }
-        lock(&queue(this).held).extend(pieces);
+        {
+            let mut held = lock(&queue(this).held);
+            open_line(&mut held, frame_in_flight());
+            held.extend(pieces);
+        }
         let mut waiting = lock(&WAITING);
         if !waiting.contains(&(this as usize)) {
             waiting.push(this as usize);
@@ -395,7 +629,16 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     }
     let mut held = lock(&queue(this).held);
     if held.is_empty() {
-        return false;
+        if !open_line(&mut held, frame_in_flight()) {
+            return false;
+        }
+        held.push(what());
+        drop(held);
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+        return true;
     }
     held.push(what());
     true
@@ -720,7 +963,9 @@ fn release_held_now(all: bool) {
     // Parts taken and not sent yet ([`join_parts`]): none when the lines
     // are forced, and none is left when this returns.
     let joining = !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
-    walk(&Queues, all, joining);
+    // Presents queued and not shown keep their order even when the switch
+    // was turned off since (`crate::ab`).
+    walk(&Queues, all, joining, present_queued() > 0 || frame_in_flight().is_some());
 }
 
 /// What [`walk`] works on: the queues' lines and what is done with what
@@ -732,6 +977,13 @@ trait Lines {
     fn waiting(&self) -> Vec<usize>;
     /// `q`'s line is empty: off [`Lines::waiting`].
     fn leave(&self, q: usize);
+    /// The queues with something in their lines, looked at without
+    /// anything else ([`Lines::waiting`] may do more in the tests).
+    fn all_lines(&self) -> Vec<usize>;
+    /// `q`'s line holds something now: on [`Lines::waiting`].
+    fn join_waiting(&self, q: usize);
+    /// The last frame shown from a line ([`Held::Present`]).
+    fn shown(&self) -> u64;
     fn line(&self, q: usize) -> &std::sync::Mutex<Vec<Held>>;
     /// Whether the fence (its address) has reached `value`.
     fn reached(&self, fence: usize, value: u64) -> bool;
@@ -759,12 +1011,16 @@ trait Lines {
         order: Vec<usize>,
         all: bool,
     ) -> std::sync::MutexGuard<'a, Vec<Held>>;
+    /// The host state of the title's resource `resource` (its address)
+    /// now: what the copy of a queued present finds it in, the submissions
+    /// ahead of it prepared (looked at, not changed).
+    fn present_state(&self, resource: usize) -> u32;
     /// A present in a line, as [`Lines::run`].
     fn present<'a>(
         &self,
         line: &'a std::sync::Mutex<Vec<Held>>,
         held: std::sync::MutexGuard<'a, Vec<Held>>,
-        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
         state: u32,
         frame: u64,
         all: bool,
@@ -790,6 +1046,21 @@ impl Lines for Queues {
         unsafe { &(*(q as *const Queue)).held }
     }
 
+    fn all_lines(&self) -> Vec<usize> {
+        lock(&WAITING).clone()
+    }
+
+    fn join_waiting(&self, q: usize) {
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&q) {
+            waiting.push(q);
+        }
+    }
+
+    fn shown(&self) -> u64 {
+        *lock(&SHOWN.0)
+    }
+
     fn reached(&self, fence: usize, value: u64) -> bool {
         crate::fence::completed(fence as This) >= value
     }
@@ -800,6 +1071,14 @@ impl Lines for Queues {
 
     fn joined_blocks(&self, joined: &Joined, lists: &[crate::list::Detached], order: &[usize]) -> bool {
         joined.blocks(lists, order)
+    }
+
+    fn present_state(&self, resource: usize) -> u32 {
+        const COPY_SOURCE: u32 = 0x800;
+        let resource = resource as This;
+        let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+        crate::resource::host_transition(resource, state);
+        state
     }
 
     fn joined_wait(&self, joined: &Joined, wait: &crate::list::ValueWait) -> (Option<bool>, bool) {
@@ -884,14 +1163,16 @@ impl Lines for Queues {
         &self,
         line: &'a std::sync::Mutex<Vec<Held>>,
         mut held: std::sync::MutexGuard<'a, Vec<Held>>,
-        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        texture: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
         state: u32,
         frame: u64,
         all: bool,
     ) -> std::sync::MutexGuard<'a, Vec<Held>> {
         let show = || {
-            if let Some(host) = crate::host::host() {
-                let _ = host.present(&texture, state, frame);
+            if let Some(host) = crate::host::host()
+                && let Some(texture) = &texture
+            {
+                let _ = host.present(texture, state, frame);
             }
         };
         if all {
@@ -907,7 +1188,12 @@ impl Lines for Queues {
                 held.remove(0);
             }
         }
-        PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
+        PRESENTS_HELD.fetch_sub(1, Ordering::AcqRel);
+        {
+            let mut shown = lock(&SHOWN.0);
+            *shown = (*shown).max(frame);
+        }
+        SHOWN.1.notify_all();
         held
     }
 }
@@ -917,11 +1203,18 @@ impl Lines for Queues {
 /// ([`join_parts`]) parts that follow one another go to the host
 /// together. One caller at a time ([`release_held_now`]).
 #[cfg(windows)]
-fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
+fn walk<L: Lines>(lines: &L, all: bool, joining: bool, marks: bool) {
     let mut joined = Joined::default();
+    // With `marks` ([`present_queued`]): a pass in which a wait ahead of a
+    // queued present or its mark is passed, as the present forced it when
+    // it ran the lines itself; only once nothing else moves.
+    let mut forcing = false;
     loop {
+        let force_now = std::mem::take(&mut forcing);
         let queues = lines.waiting();
         let mut moved = false;
+        // A line stands at a wait with a present or a mark behind it.
+        let mut stuck_before_mark = false;
         for q in queues {
             let line = lines.line(q);
             let mut held = lock(line);
@@ -929,13 +1222,20 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
                 // A queue with a part in `joined` has our mark at the head
                 // of its line: what is looked at is behind the mark.
                 let base = usize::from(joined.marked.contains(&q));
+                let marked = marks && held.iter().skip(base + 1).any(|h| matches!(h, Held::Present(..) | Held::Mark(_)));
+                // Waits passed: at a present the old way, or ahead of a
+                // queued one when nothing else moves.
+                let pass = all || (force_now && marked);
                 match held.get(base) {
                     None | Some(Held::Running) => break,
-                    Some(&Held::Wait(fence, value)) if !all && !lines.reached(fence, value) => break,
+                    Some(&Held::Wait(fence, value)) if !pass && !lines.reached(fence, value) => {
+                        stuck_before_mark |= marked;
+                        break;
+                    }
                     // With parts taken and not sent: only what is known
                     // without a wait for the card. A wait that stays is
                     // looked at again when the parts have been sent.
-                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
+                    Some(Held::Value(wait)) if !pass && !joined.is_empty() => {
                         // The newest known write first: a part taken, then
                         // the flights, memory last (#2611: memory asked
                         // first passed a wait for 7 that a part taken turns
@@ -949,18 +1249,26 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
                             _ => break,
                         }
                     }
-                    Some(Held::Value(wait)) if !all && !lines.value_met(wait) => break,
+                    Some(Held::Value(wait)) if !pass && !lines.value_met(wait) => {
+                        stuck_before_mark |= marked;
+                        break;
+                    }
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
+                    // A queued present: once every other line has reached
+                    // its mark of the frame.
+                    Some(&Held::Present(_, _, frame, _)) if marks && !all && ahead_of_mark(lines, q, frame) => break,
+                    // Behind a mark: once the frame has been shown.
+                    Some(&Held::Mark(frame)) if !all && lines.shown() < frame => break,
                     Some(_) => {}
                 }
                 match held.remove(base) {
-                    Held::Wait(..) | Held::Running => {}
+                    Held::Wait(..) | Held::Running | Held::Mark(_) => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
-                        if all && !lines.value_met(&wait) {
+                        if pass && !lines.value_met(&wait) {
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -1020,7 +1328,9 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
                         }
                         held = lines.run(line, held, lists, order, all);
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, resource) => {
+                        // (3): read now, behind what was ahead of it.
+                        let state = if resource != 0 { lines.present_state(resource) } else { state };
                         held = lines.present(line, held, texture, state, frame, all);
                     }
                     // Behind what was sent to the card and not waited
@@ -1042,6 +1352,14 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
         }
         if !moved {
             if joined.is_empty() {
+                if stuck_before_mark && !force_now {
+                    // Nothing else moves: what stands ahead of a queued
+                    // present is forced, as the present forced it.
+                    if forces() {
+                        forcing = true;
+                        continue;
+                    }
+                }
                 break;
             }
             // Nothing more is free to run behind the parts taken: they go
@@ -1049,6 +1367,18 @@ fn walk<L: Lines>(lines: &L, all: bool, joining: bool) {
             send_joined(lines, &mut joined);
         }
     }
+}
+
+/// With [`present_queued`]: whether a line other than `q` still holds
+/// something ahead of its mark of `frame` (the present of that frame
+/// waits). Called with `q`'s line locked: the other lines are locked one
+/// at a time, by the one thread that runs the lines.
+#[cfg(windows)]
+fn ahead_of_mark<L: Lines>(lines: &L, q: usize, frame: u64) -> bool {
+    lines.all_lines().into_iter().filter(|&o| o != q).any(|o| {
+        let held = lock(lines.line(o));
+        held.iter().position(|h| matches!(h, Held::Mark(f) if *f == frame)).is_some_and(|i| i > 0)
+    })
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -1350,8 +1680,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
         let behind = {
             let mut held = lock(&queue(this).held);
-            let behind = !held.is_empty() || now < value;
+            let in_flight = frame_in_flight();
+            let behind = !held.is_empty() || now < value || in_flight.is_some();
             if behind && waits() {
+                open_line(&mut held, in_flight);
                 held.push(Held::Wait(fence as usize, value));
             }
             behind
@@ -1462,6 +1794,9 @@ extern "system" fn present(
     let hr = present_now(this, planes, plane_parameters);
     #[cfg(windows)]
     {
+        if present_queued() > 0 {
+            QUEUED_STATS[5].fetch_add(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
@@ -1480,7 +1815,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
+    let sent_behind = (present_behind() && send_behind(this, planes, plane_parameters))
+        || (present_queued() > 0 && queue_present(this, planes, plane_parameters));
     #[cfg(not(windows))]
     let _ = this;
     // Submissions sent to the card and not waited for are settled first,
@@ -1511,7 +1847,16 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
-    if sent_behind && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
+    if present_queued() > 0 {
+        if !sent_behind {
+            QUEUED_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        if frame.is_multiple_of(256) {
+            present_line(256);
+        }
+    }
+    #[cfg(windows)]
+    if sent_behind && present_queued() == 0 && PRESENTS_BEHIND.load(Ordering::Relaxed).is_multiple_of(512) {
         tracing::info!(
             frame,
             behind = PRESENTS_BEHIND.load(Ordering::Relaxed),
@@ -1859,10 +2204,14 @@ mod join_tests {
         /// A part not joined ([`Lines::run`]).
         Ran(Vec<usize>),
         Signal(usize, u64),
+        /// A frame shown ([`Lines::present`]).
+        Present(u64),
     }
 
     #[derive(Default)]
     struct Fake {
+        /// The last frame shown.
+        shown: std::sync::atomic::AtomicU64,
         lines: Vec<Mutex<Vec<Held>>>,
         waiting: Mutex<Vec<usize>>,
         fences: Mutex<HashMap<usize, u64>>,
@@ -1875,6 +2224,12 @@ mod join_tests {
         /// Parts that read on the CPU what a part taken before them writes
         /// (`crate::host::join_blocked`): they do not join it.
         blocked: HashSet<usize>,
+        /// Host states of resources (by address), as the submissions ahead
+        /// leave them: a part named in `transitions` sets one when it runs.
+        states: Mutex<HashMap<usize, u32>>,
+        transitions: HashMap<usize, (usize, u32)>,
+        /// The state each frame was shown with.
+        shown_states: Mutex<Vec<(u64, u32)>>,
         done: Mutex<Vec<Done>>,
     }
 
@@ -1907,6 +2262,18 @@ mod join_tests {
         }
         fn leave(&self, q: usize) {
             lock(&self.waiting).retain(|&w| w != q);
+        }
+        fn all_lines(&self) -> Vec<usize> {
+            lock(&self.waiting).clone()
+        }
+        fn join_waiting(&self, q: usize) {
+            let mut waiting = lock(&self.waiting);
+            if !waiting.contains(&q) {
+                waiting.push(q);
+            }
+        }
+        fn shown(&self) -> u64 {
+            self.shown.load(std::sync::atomic::Ordering::Relaxed)
         }
         fn line(&self, q: usize) -> &Mutex<Vec<Held>> {
             &self.lines[q]
@@ -1946,24 +2313,97 @@ mod join_tests {
             _: bool,
         ) -> std::sync::MutexGuard<'a, Vec<Held>> {
             lock(&self.done).push(Done::Ran(order.clone()));
+            for p in &order {
+                if let Some(&(resource, state)) = self.transitions.get(p) {
+                    lock(&self.states).insert(resource, state);
+                }
+            }
             lock(&self.sent).extend(order);
             held
+        }
+        fn present_state(&self, resource: usize) -> u32 {
+            lock(&self.states).get(&resource).copied().unwrap_or(0x800)
         }
         fn present<'a>(
             &self,
             _: &'a Mutex<Vec<Held>>,
-            _: std::sync::MutexGuard<'a, Vec<Held>>,
-            _: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-            _: u32,
-            _: u64,
+            held: std::sync::MutexGuard<'a, Vec<Held>>,
+            _: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+            state: u32,
+            frame: u64,
             _: bool,
         ) -> std::sync::MutexGuard<'a, Vec<Held>> {
-            unreachable!("no presents in these lines")
+            lock(&self.done).push(Done::Present(frame));
+            lock(&self.shown_states).push((frame, state));
+            self.shown.fetch_max(frame, std::sync::atomic::Ordering::Relaxed);
+            held
         }
     }
 
     const F: usize = 0xF0;
     const G: usize = 0xF8;
+
+    /// The bench's empty_queue_leak: a queue whose line was empty when the
+    /// present was queued got no mark, and what the title gave it after the
+    /// present ran before the frame was shown. Opened behind the frame in
+    /// flight ([`open_line`]), it runs after.
+    #[test]
+    fn work_given_to_an_empty_line_after_a_queued_present_runs_after_the_frame() {
+        let fake = Fake::new(vec![vec![Held::Wait(F, 1), part(1)], vec![]]);
+        queue_present_into(&fake, 0, None, 0, 1);
+        assert!(lock(&fake.lines[1]).is_empty(), "no mark in an empty line");
+        // The title gives queue 1 a part after the present returned.
+        {
+            let mut held = lock(&fake.lines[1]);
+            assert!(open_line(&mut held, Some(1)));
+            held.push(part(2));
+        }
+        fake.join_waiting(1);
+        walk(&fake, false, false, true);
+        // Nothing may run part 2 before frame 1 is shown.
+        let done = fake.done();
+        let ran = done.iter().position(|d| *d == Done::Ran(vec![2]));
+        let shown = done.iter().position(|d| *d == Done::Present(1));
+        assert!(ran.is_none() || shown.is_some_and(|s| s < ran.unwrap()), "{done:?}");
+        // The fence comes: part 1, the frame, then part 2.
+        lock(&fake.fences).insert(F, 1);
+        walk(&fake, false, false, true);
+        let done = fake.done();
+        assert_eq!(done, [Done::Ran(vec![1]), Done::Present(1), Done::Ran(vec![2])]);
+        // A line that is not empty, or no frame in flight: nothing to open.
+        let mut held = vec![part(3)];
+        assert!(!open_line(&mut held, Some(1)));
+        assert!(!open_line(&mut Vec::new(), None));
+    }
+
+    /// The bench's stale present state: the texture's host state is what the
+    /// submissions ahead of the present leave it in, read when the frame is
+    /// shown (0x800 here); read when the present was queued it was the
+    /// state before them (0x4).
+    #[test]
+    fn a_queued_present_shows_the_state_the_submissions_ahead_left() {
+        const TEXTURE: usize = 0xABC0;
+        let mut fake = Fake::new(vec![vec![part(1)]]);
+        lock(&fake.states).insert(TEXTURE, 0x4);
+        fake.transitions.insert(1, (TEXTURE, 0x800));
+        queue_present_into(&fake, 0, None, TEXTURE, 1);
+        assert_eq!(fake.present_state(TEXTURE), 0x4, "as the queue's call found it");
+        walk(&fake, false, false, true);
+        assert_eq!(fake.done(), [Done::Ran(vec![1]), Done::Present(1)]);
+        assert_eq!(lock(&fake.shown_states).clone(), [(1, 0x800)]);
+    }
+
+    /// JOIN_PARTS' guards hold in front of a queued present too: a part that
+    /// reads what a part taken writes goes after it, and both run before
+    /// the frame is shown.
+    #[test]
+    fn parts_join_or_not_by_the_guards_before_a_queued_present() {
+        let mut fake = Fake::new(vec![vec![part(1), part(2), part(3)]]);
+        fake.blocked.insert(2);
+        queue_present_into(&fake, 0, None, 0, 1);
+        walk(&fake, false, true, true);
+        assert_eq!(fake.done(), [Done::Sent(vec![1]), Done::Sent(vec![2, 3]), Done::Present(1)]);
+    }
 
     #[test]
     fn a_wait_a_part_taken_meets_joins_and_signals_follow_the_parts_they_followed() {
@@ -1971,21 +2411,21 @@ mod join_tests {
         // queue 1: waits for F=1, part 3
         let mut fake = Fake::new(vec![vec![part(1), value(0x1000), part(2), Held::Signal(F, 1)], vec![Held::Wait(F, 1), part(3)]]);
         fake.writes.insert(0x1000, 1);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         assert_eq!(fake.done(), [Done::Sent(vec![1, 2]), Done::Signal(F, 1), Done::Sent(vec![3])]);
         assert!(fake.lines.iter().all(|l| lock(l).is_empty()), "every line ran out");
         assert!(fake.waiting().is_empty());
         // Without joining: the same parts in the same order, one host submission each.
         let mut fake = Fake::new(vec![vec![part(1), value(0x1000), part(2), Held::Signal(F, 1)], vec![Held::Wait(F, 1), part(3)]]);
         fake.writes.insert(0x1000, 1);
-        walk(&fake, false, false);
+        walk(&fake, false, false, false);
         assert_eq!(fake.done(), [Done::Ran(vec![1]), Done::Ran(vec![2]), Done::Signal(F, 1), Done::Ran(vec![3])]);
     }
 
     #[test]
     fn a_wait_not_known_to_be_met_sends_what_was_taken_and_holds_the_rest() {
         let fake = Fake::new(vec![vec![part(1), value(0x2000), part(2), Held::Signal(F, 1)]]);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         assert_eq!(fake.done(), [Done::Sent(vec![1])]);
         // The line stands at the wait, with nothing of ours at its head.
         {
@@ -1996,7 +2436,7 @@ mod join_tests {
         assert_eq!(fake.waiting(), [0], "still in line");
         // Memory comes to meet it.
         lock(&fake.met).insert(0x2000);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         assert_eq!(fake.done(), [Done::Sent(vec![1]), Done::Sent(vec![2]), Done::Signal(F, 1)]);
         assert!(fake.waiting().is_empty());
     }
@@ -2004,7 +2444,7 @@ mod join_tests {
     #[test]
     fn a_signal_another_queue_waits_for_is_given_after_its_part_and_never_joins_across() {
         let fake = Fake::new(vec![vec![part(1), Held::Signal(F, 1), part(2)], vec![Held::Wait(F, 1), part(3)]]);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         // Part 2 follows part 1 on its own queue; part 3 waits for the signal
         // behind part 1, which is only given once part 1 has been sent.
         assert_eq!(fake.done(), [Done::Sent(vec![1, 2]), Done::Signal(F, 1), Done::Sent(vec![3])]);
@@ -2015,7 +2455,7 @@ mod join_tests {
         let fake = Fake::new(vec![vec![Held::Wait(G, 5), part(1)], vec![value(0x3000), part(2)]]);
         lock(&fake.fences).insert(G, 7);
         lock(&fake.met).insert(0x3000);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         assert_eq!(fake.done(), [Done::Sent(vec![1, 2])]);
     }
 
@@ -2023,15 +2463,245 @@ mod join_tests {
     fn at_most_join_most_parts_go_together() {
         let n = join_most() + 1;
         let fake = Fake::new(vec![(1..=n).map(part).collect()]);
-        walk(&fake, false, true);
+        walk(&fake, false, true, false);
         assert_eq!(fake.done(), [Done::Sent((1..n).collect()), Done::Sent(vec![n])]);
     }
 
     #[test]
     fn forced_lines_run_every_part_alone_in_order() {
         let fake = Fake::new(vec![vec![part(1), value(0x4000), part(2), Held::Signal(F, 1)], vec![Held::Wait(G, 3), part(3)]]);
-        walk(&fake, true, false);
+        walk(&fake, true, false, false);
         assert_eq!(fake.done(), [Done::Ran(vec![1]), Done::Ran(vec![2]), Done::Signal(F, 1), Done::Ran(vec![3])]);
+    }
+
+    /// One thing the title gives a queue, for the present tests.
+    #[derive(Clone, Copy, Debug)]
+    enum Given {
+        Part(usize, usize),
+        Signal(usize, usize, u64),
+        WaitFence(usize, usize, u64),
+        /// Waits for the value part `.1` writes.
+        WaitPart(usize, usize),
+        /// Waits for a value nothing writes: forced at the next present.
+        WaitNever(usize, usize),
+        /// The title presents (queue 0).
+        Present,
+    }
+
+    fn held_of(g: Given) -> (usize, Held) {
+        match g {
+            Given::Part(q, p) => (q, part(p)),
+            Given::Signal(q, f, v) => (q, Held::Signal(f, v)),
+            Given::WaitFence(q, f, v) => (q, Held::Wait(f, v)),
+            Given::WaitPart(q, by) => (q, value(0x10_0000 + 0x100 * by)),
+            Given::WaitNever(q, n) => (q, value(0x20_0000 + 0x100 * n)),
+            Given::Present => unreachable!(),
+        }
+    }
+
+    /// `n` things for `queues` queues (seeded), each waiting only for
+    /// things given before it, with a present now and then.
+    fn given(seed: u64, queues: usize, n: usize) -> (Vec<Given>, HashMap<usize, usize>) {
+        let mut seed = seed;
+        let mut next = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m) as usize
+        };
+        let mut out = Vec::new();
+        let mut writes = HashMap::new();
+        let (mut parts, mut nevers) = (0, 0);
+        let mut signals: Vec<(usize, u64)> = Vec::new();
+        let mut fence_values: HashMap<usize, u64> = HashMap::new();
+        for _ in 0..n {
+            let q = next(queues as u64);
+            match next(12) {
+                0..=4 => {
+                    parts += 1;
+                    out.push(Given::Part(q, parts));
+                }
+                5 if parts > 0 => {
+                    let fence = 0x100 + next(3);
+                    let v = fence_values.entry(fence).or_insert(0);
+                    *v += 1;
+                    out.push(Given::Signal(q, fence, *v));
+                    signals.push((fence, *v));
+                }
+                6 if !signals.is_empty() => {
+                    let (fence, v) = signals[next(signals.len() as u64)];
+                    out.push(Given::WaitFence(q, fence, v));
+                }
+                7 | 8 if parts > 0 => {
+                    let by = 1 + next(parts as u64);
+                    writes.insert(0x10_0000 + 0x100 * by, by);
+                    out.push(Given::WaitPart(q, by));
+                }
+                9 => {
+                    nevers += 1;
+                    out.push(Given::WaitNever(q, nevers));
+                }
+                10 | 11 => out.push(Given::Present),
+                _ => {}
+            }
+        }
+        (out, writes)
+    }
+
+    fn fake_lines(queues: usize, writes: &HashMap<usize, usize>) -> Fake {
+        let mut fake = Fake::new((0..queues).map(|_| Vec::new()).collect());
+        fake.writes = writes.clone();
+        fake
+    }
+
+    fn give(fake: &Fake, g: Given) {
+        let (q, h) = held_of(g);
+        lock(&fake.lines[q]).push(h);
+        fake.join_waiting(q);
+    }
+
+    /// 10,000 things given in rounds, the lines run after each (as our
+    /// thread does when it is woken): a present queued into the lines
+    /// ([`present_queued`]) gives the same runs, signals and frames shown,
+    /// in the same order, as the present that ran the lines itself (free
+    /// first, then forced, then shown), and the same swap-chain sequence.
+    #[test]
+    fn a_queued_present_runs_and_shows_what_the_present_ran_and_showed() {
+        let mut total = 0;
+        let mut presents = 0;
+        for round in 0..110u64 {
+            let queues = 1 + (round % 4) as usize;
+            let (given, writes) = given(0x9E37_79B9_7F4A_7C15 ^ round.wrapping_mul(0x1000_0001), queues, 100);
+            total += given.len();
+            // The present runs the lines itself.
+            let old = fake_lines(queues, &writes);
+            let mut frame = 0;
+            for &g in &given {
+                if let Given::Present = g {
+                    frame += 1;
+                    walk(&old, false, false, false);
+                    walk(&old, true, false, false);
+                    lock(&old.done).push(Done::Present(frame));
+                    old.shown.store(frame, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    give(&old, g);
+                    walk(&old, false, false, false);
+                }
+            }
+            walk(&old, false, false, false);
+            walk(&old, true, false, false);
+            // Queued.
+            let new = fake_lines(queues, &writes);
+            let mut frame = 0;
+            for &g in &given {
+                if let Given::Present = g {
+                    frame += 1;
+                    queue_present_into(&new, 0, None, 0, frame);
+                } else {
+                    give(&new, g);
+                }
+                walk(&new, false, false, true);
+            }
+            walk(&new, false, false, true);
+            walk(&new, true, false, true);
+            presents += frame;
+            assert_eq!(new.shown(), frame, "round {round}: every frame shown");
+            assert_eq!(old.done(), new.done(), "round {round}: queued presents changed the order");
+            assert!(new.lines.iter().all(|l| lock(l).is_empty()), "round {round}: every line ran out");
+        }
+        assert!(total >= 10_000 && presents > 1000, "{total} things, {presents} presents");
+    }
+
+    /// With the title ahead (our thread runs the lines only now and then,
+    /// with parts joined or not): everything given before a present runs
+    /// before its frame is shown, what the present's queue is given after
+    /// it runs after, frames are shown in order and each once, every part
+    /// runs once in its line's order, and at most `most` presents wait in
+    /// the lines (the title stands at the bound until the oldest is shown,
+    /// which always comes: no deadlock).
+    #[test]
+    fn queued_presents_keep_the_frame_order_and_the_bound() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut coin = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for round in 0..200u64 {
+            let queues = 1 + (round % 3) as usize;
+            let most = 1 + round % 2;
+            let joining = round % 4 >= 2;
+            let (given, writes) = given(0xC0FF_EE00 ^ round.wrapping_mul(0x9E37_79B9), queues, 60);
+            let fake = fake_lines(queues, &writes);
+            let mut frame = 0u64;
+            // Per part: the frames queued before it was given.
+            let mut epoch: HashMap<usize, (usize, u64)> = HashMap::new();
+            for &g in &given {
+                if let Given::Present = g {
+                    // The bound: the title waits while `most` wait.
+                    let mut looks = 0;
+                    while frame - fake.shown() >= most {
+                        walk(&fake, false, joining, true);
+                        looks += 1;
+                        assert!(looks < 64, "round {round}: the title stood at the bound for good: {:?}", fake.done());
+                    }
+                    frame += 1;
+                    queue_present_into(&fake, 0, None, 0, frame);
+                } else {
+                    if let Given::Part(q, p) = g {
+                        epoch.insert(p, (q, frame));
+                    }
+                    give(&fake, g);
+                }
+                assert!(frame - fake.shown() <= most, "round {round}: more presents waiting than the bound");
+                if coin(3) == 0 {
+                    walk(&fake, false, joining, true);
+                }
+            }
+            walk(&fake, false, joining, true);
+            assert_eq!(fake.shown(), frame, "round {round}: every frame shown: {:?}", fake.done());
+            walk(&fake, true, joining, true);
+            let done = fake.done();
+            let shown: Vec<u64> = done.iter().filter_map(|d| if let Done::Present(f) = d { Some(*f) } else { None }).collect();
+            assert_eq!(shown, (1..=frame).collect::<Vec<_>>(), "round {round}: frames shown in order, each once");
+            // Where each part ran, and how many frames had been shown then.
+            let mut ran: HashMap<usize, ((usize, usize), u64)> = HashMap::new();
+            let mut shown_now = 0u64;
+            for (e, d) in done.iter().enumerate() {
+                match d {
+                    Done::Present(f) => shown_now = *f,
+                    Done::Sent(ps) | Done::Ran(ps) => {
+                        for (i, &p) in ps.iter().enumerate() {
+                            assert!(ran.insert(p, ((e, i), shown_now)).is_none(), "round {round}: part {p} ran twice");
+                        }
+                    }
+                    Done::Signal(..) => {}
+                }
+            }
+            assert_eq!(ran.len(), epoch.len(), "round {round}: every part ran");
+            for (p, &(q, before)) in &epoch {
+                let (_, shown_then) = ran[p];
+                // Given after `before` frames were queued: it ran before frame
+                // before + 1 was shown ...
+                assert!(shown_then <= before, "round {round}: part {p} (given after frame {before}) ran after frame {shown_then} was shown");
+                // ... and in the present's queue, after frame `before`.
+                if q == 0 {
+                    assert!(shown_then >= before, "round {round}: part {p} of the present's queue ran before frame {before} was shown");
+                }
+            }
+            // Each line's parts in its order.
+            for q in 0..queues {
+                let order: Vec<usize> = given
+                    .iter()
+                    .filter_map(|g| match *g {
+                        Given::Part(gq, p) if gq == q => Some(p),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(order.windows(2).all(|w| ran[&w[0]].0 < ran[&w[1]].0), "round {round}: queue {q} out of order");
+            }
+        }
     }
 
     /// Lines made at random, each thing waiting only for things made
@@ -2106,7 +2776,7 @@ mod join_tests {
                     .collect();
                 let mut fake = Fake::new(lines);
                 fake.writes = writes.clone();
-                walk(&fake, false, joining);
+                walk(&fake, false, joining, false);
                 let done = fake.done();
                 // Where each part went: (event, place in it).
                 let mut at: HashMap<usize, (usize, usize)> = HashMap::new();
@@ -2126,6 +2796,7 @@ mod join_tests {
                         Done::Signal(f, v) => {
                             signal_at.insert((*f, *v), e);
                         }
+                        Done::Present(_) => {}
                     }
                 }
                 assert_eq!(at.len(), parts, "round {round} (joining {joining}): every part sent: {done:?}");

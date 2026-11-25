@@ -1859,12 +1859,6 @@ pub(crate) struct ValueWait {
 }
 
 impl ValueWait {
-    /// A 32-bit wait for `reference` at `address`, for tests.
-    #[cfg(test)]
-    pub(crate) fn equal(address: u64, reference: u64) -> Self {
-        Self { address, comparison: 3, reference, wide: false }
-    }
-
     /// A wait for tests: `comparison` as the title's codes (3: equal).
     #[cfg(test)]
     pub(crate) fn for_test(address: u64, comparison: u32, reference: u64, wide: bool) -> Self {
