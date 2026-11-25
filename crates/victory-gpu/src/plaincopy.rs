@@ -222,12 +222,15 @@ pub(crate) fn copy_buffer(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
+    let started = std::time::Instant::now();
     let whole = guarded(to, from, len);
+    crate::framelog::add(crate::framelog::T::InPlaceUs, started.elapsed().as_micros() as u64);
     if whole {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
     } else {
         COUNT[2].fetch_add(1, Relaxed);
+        crate::framelog::add(crate::framelog::T::InPlaceFaults, 1);
         note_fault(from as usize, len);
     }
     whole

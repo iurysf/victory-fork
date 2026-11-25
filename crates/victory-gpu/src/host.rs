@@ -358,6 +358,11 @@ fn submission_us(i: usize, us: u64) {
     }
 }
 
+/// Adds a step of preparing a submission to the frame log's totals.
+fn prep(t: crate::framelog::T, took: std::time::Duration) {
+    crate::framelog::add(t, took.as_micros() as u64);
+}
+
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
@@ -6104,6 +6109,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        let asking = std::time::Instant::now();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6137,6 +6143,8 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        prep(crate::framelog::T::PrepAskUs, asking.elapsed().saturating_sub(settled));
+        let steps = std::time::Instant::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6145,15 +6153,20 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        prep(crate::framelog::T::PrepStepsUs, steps.elapsed());
+        let flushing = std::time::Instant::now();
         batch.flush();
         crate::watch::ask_once_end();
+        prep(crate::framelog::T::PrepFlushUs, flushing.elapsed());
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            let taking = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            prep(crate::framelog::T::PrepSnapshotsUs, taking.elapsed());
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
@@ -6161,12 +6174,16 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
+        let planning = std::time::Instant::now();
+        let mut card_settled = std::time::Duration::ZERO;
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
-            settled += settling.elapsed();
+            card_settled = settling.elapsed();
+            settled += card_settled;
         }
         let card = self.card_before(runs, flown, *submitted);
+        prep(crate::framelog::T::PrepCardUs, planning.elapsed().saturating_sub(card_settled));
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -7696,7 +7713,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let working = std::time::Instant::now();
                     work();
+                    prep(crate::framelog::T::PrepWorkUs, working.elapsed());
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -7718,7 +7737,9 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    let writing = std::time::Instant::now();
                     shadow.writing(*address, *len);
+                    prep(crate::framelog::T::PrepGpuWriteUs, writing.elapsed());
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -7728,7 +7749,9 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        let refreshing = std::time::Instant::now();
                         staging.refresh();
+                        prep(crate::framelog::T::PrepTextureUs, refreshing.elapsed());
                     }
                     continue;
                 }

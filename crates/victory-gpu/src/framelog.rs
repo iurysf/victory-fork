@@ -106,6 +106,33 @@ pub enum T {
     HeapViewsUs,
     SyncHeapsUs,
     WatchUs,
+    /// "preparing" by step (`crate::host`'s submit): the submission's one
+    /// write-watch asking, its lists' steps (of them the deferred work,
+    /// the snapshots of ranges shaders write and the textures' refreshes),
+    /// the last flush of refreshes, the snapshots taken after it, and the
+    /// plan of copies in the card's memory (its merges among them).
+    PrepAskUs,
+    PrepStepsUs,
+    PrepWorkUs,
+    PrepGpuWriteUs,
+    PrepTextureUs,
+    PrepFlushUs,
+    PrepSnapshotsUs,
+    PrepCardUs,
+    /// The switches' own paths, on every thread: waits for the guards'
+    /// lock and the turns of their store (`VICTORY_GUARD_INTERVALS`);
+    /// protections asked over runs and refused, and the time of those
+    /// calls (`VICTORY_GUARD_COALESCE`); in-place copies without the floor
+    /// and the faults among them (`VICTORY_COPY_READ_ONLY`); copies of
+    /// title buffers and windows made outside the lock
+    /// (`VICTORY_SHADOW_SHARED`).
+    GuardsLockUs,
+    GuardsStoreUs,
+    CoalesceRefused,
+    CoalesceRefusedUs,
+    InPlaceUs,
+    InPlaceFaults,
+    SharedBuildUs,
     Count,
 }
 
@@ -576,6 +603,39 @@ fn mark_line(f: &Frame) -> String {
     )
 }
 
+/// The line of where "preparing" goes and of the switches' own paths, for
+/// the mean frame `f` of a reading.
+fn preparing_line(f: &Frame) -> String {
+    let ms = |t: T| f.t[t as usize] / 1e3;
+    let listed = ms(T::PrepAskUs) + ms(T::PrepStepsUs) + ms(T::PrepFlushUs) + ms(T::PrepSnapshotsUs) + ms(T::PrepCardUs);
+    format!(
+        "preparing by step (the mean frame): {:.1} ms; the submission's one asking {:.1}, the lists' steps {:.1} (deferred \
+         work {:.1}, snapshots of ranges shaders write {:.1}, textures' refreshes {:.1}, copies and the rest {:.1}), the last \
+         flush {:.1}, snapshots {:.1}, the card's plan {:.1}, not in a step {:.1} | the switches' own paths, all threads: \
+         waits for the guards' lock {:.2} ms, their store turned {:.2} ms (GUARD_INTERVALS); {:.0} protections over runs \
+         refused, {:.2} ms in them (GUARD_COALESCE); in-place copies {:.2} ms, {:.1} faults (COPY_READ_ONLY); copies made \
+         outside the lock {:.2} ms (SHADOW_SHARED)",
+        ms(T::PrepareUs),
+        ms(T::PrepAskUs),
+        ms(T::PrepStepsUs),
+        ms(T::PrepWorkUs),
+        ms(T::PrepGpuWriteUs),
+        ms(T::PrepTextureUs),
+        ms(T::PrepStepsUs) - ms(T::PrepWorkUs) - ms(T::PrepGpuWriteUs) - ms(T::PrepTextureUs),
+        ms(T::PrepFlushUs),
+        ms(T::PrepSnapshotsUs),
+        ms(T::PrepCardUs),
+        ms(T::PrepareUs) - listed,
+        ms(T::GuardsLockUs),
+        ms(T::GuardsStoreUs),
+        f.t[T::CoalesceRefused as usize],
+        ms(T::CoalesceRefusedUs),
+        ms(T::InPlaceUs),
+        f.t[T::InPlaceFaults as usize],
+        ms(T::SharedBuildUs),
+    )
+}
+
 /// Frames whose lengths give the usual one, and the long frames listed in
 /// a reading at most.
 const RECENT: usize = 64;
@@ -689,6 +749,7 @@ pub fn frame() {
         })
     };
     tracing::info!("{}", crate::background::line(elapsed.as_secs_f64()));
+    tracing::info!("{}", preparing_line(&mean(&frames.iter().collect::<Vec<_>>())));
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
         if i == 0 {
             tracing::info!("{line}{ab}");

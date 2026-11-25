@@ -1159,11 +1159,24 @@ fn unchanged_gone(at: usize, len: usize) {
 
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::framelog::{T, add};
+    let mut g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Another thread holds them: the wait goes to the frame log.
+            let waiting = std::time::Instant::now();
+            let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            add(T::GuardsLockUs, waiting.elapsed().as_micros() as u64);
+            g
+        }
+    };
     let runs = guard_intervals();
     if g.protected.runs_mode != runs {
+        let turning = std::time::Instant::now();
         g.protected.store_as(runs);
         g.viewed.store_as(runs);
+        add(T::GuardsStoreUs, turning.elapsed().as_micros() as u64);
     }
     g
 }
@@ -1361,7 +1374,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     aliases.sort_unstable();
     aliases.dedup();
     for (first, last) in block_runs(&aliases) {
-        if first + 1 == last || !protect_run(first, last) {
+        if first + 1 == last || !refused_timed(|| protect_run(first, last)) {
             for block in first..last {
                 protect_alias(g, block);
             }
@@ -1408,6 +1421,18 @@ fn block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
         }
     }
     runs
+}
+
+/// `call` (a protection asked over a run, [`guard_coalesce`]): its answer;
+/// a refusal and its time go to the frame log.
+fn refused_timed(call: impl FnOnce() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    let done = call();
+    if !done {
+        crate::framelog::add(crate::framelog::T::CoalesceRefused, 1);
+        crate::framelog::add(crate::framelog::T::CoalesceRefusedUs, started.elapsed().as_micros() as u64);
+    }
+    done
 }
 
 /// Makes blocks `[first, last)` read-only in one call; false if Windows refused.
@@ -1593,8 +1618,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
             }
             let mut old = 0;
             // SAFETY: blocks we made read-only.
-            let set = unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) };
-            if set == 0 && last - first > 1 {
+            let mut call = || unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READWRITE, &mut old) != 0 };
+            let set = if last - first > 1 { refused_timed(call) } else { call() };
+            if !set && last - first > 1 {
                 // A run over regions Windows takes one at a time.
                 for block in first..last {
                     let mut old = 0;

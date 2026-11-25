@@ -4282,7 +4282,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // graphics kernel's time), and known as a copy in the card's memory
         // before anyone can find it (a change queued for the card before
         // that would find it in no list: `card_dirty`).
-        let built = buffer_copy_of(key.0, bytes)?;
+        let building = std::time::Instant::now();
+        let built = buffer_copy_of(key.0, bytes);
+        crate::framelog::add(crate::framelog::T::SharedBuildUs, building.elapsed().as_micros() as u64);
+        let built = built?;
         if built.card.is_some() {
             note_carded(&built);
         }
@@ -4593,7 +4596,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             }
             picked
         };
-        let built = window_copy_of(picked.0, picked.1)?;
+        let building = std::time::Instant::now();
+        let built = window_copy_of(picked.0, picked.1);
+        crate::framelog::add(crate::framelog::T::SharedBuildUs, building.elapsed().as_micros() as u64);
+        let built = built?;
         if built.card.is_some() {
             note_carded(&built);
         }
