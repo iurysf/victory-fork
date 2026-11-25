@@ -1559,9 +1559,14 @@ impl State {
             let key = slot_key(handle);
             // One look for the slot's copy: making its view and finding the
             // copy it shows ask the same (`crate::shadow::with_find_memo`).
+            // With `VICTORY_HEAP_LESS=1`, the copy making the view just
+            // resolved, when it made one (fork #1043), else looked up.
             let Some((_view, copy)) = crate::shadow::with_find_memo(|| {
-                let view = host.mirror(index, handle, true)?;
-                let copy = crate::descriptor::host::buffer_copy(&view);
+                let (view, resolved) = host.mirror_heap_buffer(index, handle)?;
+                let copy = match resolved {
+                    Some(copy) if crate::descriptor::host::heap_less() => Some(copy),
+                    _ => crate::descriptor::host::buffer_copy(&view),
+                };
                 Some((view, copy))
             }) else {
                 continue;
