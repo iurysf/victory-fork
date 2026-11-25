@@ -1020,10 +1020,14 @@ impl Staging {
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            // `VICTORY_TEXTURE_HASH_EVERY=n` (1 to 256; 8 by default): the
+            // turn's length. Run P4-0 hashed 17.8 MB a frame this way of
+            // which none had changed. A texture never read (`asked` 0) and
+            // one the guards or the write watch found written are read
+            // now whatever the turn.
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(hash_every());
             if unwritten && !turn {
                 return 0;
             }
@@ -1611,4 +1615,13 @@ mod title_memory_tests {
             }
         }
     }
+}
+
+/// How many frames apart a guarded texture that nothing was seen to write
+/// is hashed (`VICTORY_TEXTURE_HASH_EVERY`, 1 to 256; 8 by default).
+fn hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(8, |n| n.clamp(1, 256))
+    })
 }
