@@ -2559,7 +2559,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2577,7 +2577,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::ahead(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2677,6 +2677,32 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
+    /// Whether a flight that changed bytes a fill had read ahead of it
+    /// makes only fills of that 64 KiB wait from then on, not every fill
+    /// (`VICTORY_FILL_WAIT_PIECE=1`; off by default). Run 0942 (merged
+    /// build): one such fill in the whole run, and every fill after it
+    /// waited: 1.8 settles a frame, 27 ms of the submitting thread.
+    fn per_piece() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_PIECE").is_some_and(|v| v == "1"))
+    }
+
+    /// With [`per_piece`]: the pieces whose fills wait.
+    static WAIT_PIECES: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+    /// Whether a fill (or a copy that only reads) of `len` bytes at `src`
+    /// may read ahead of flights that may write them.
+    pub(super) fn ahead(src: usize, len: usize) -> bool {
+        if !on() {
+            return false;
+        }
+        if !per_piece() || len == 0 {
+            return true;
+        }
+        let waiting = WAIT_PIECES.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.is_empty() || waiting.range(src / PIECE..=(src + len - 1) / PIECE).next().is_none()
+    }
+
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
     pub(super) fn read(src: usize, len: usize) {
@@ -2732,6 +2758,21 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if per_piece() {
+                let mut waiting = WAIT_PIECES.lock().unwrap_or_else(|e| e.into_inner());
+                for piece in from / PIECE..=(to - 1) / PIECE {
+                    waiting.insert(piece);
+                }
+                if waiting.len() <= 16 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed                          them (first at {:#x}, landed in frame {frame}): fills of those 64 KiB wait for flights from here on                          (VICTORY_FILL_WAIT_PIECE=1; {} pieces wait, {n} such fills)",
+                        to - from,
+                        a + first,
+                        waiting.len()
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -6872,6 +6913,16 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Refreshed already and nothing wrote those bytes since
+        // (`crate::watch::skip_unchanged`): nothing to copy.
+        if crate::watch::skip_unchanged() && shadow.unchanged_at(address, len) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::SkippedUnchanged, 1);
+                crate::copystat::add(crate::copystat::C::SkippedUnchangedBytes, len as u64);
+            }
+            return;
+        }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         // Brought up to date in this submission already ([`refresh_once`];
@@ -7438,11 +7489,14 @@ impl Meter {
         // dispatch runs; the counter went when the clamp's budget moved to
         // the card's memory.)
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, loop_us, intact] =
+                [0, 1, 2, 3].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views, {:.1} ms              in that loop (views made, copies found), {:.0} of them left as they were (VICTORY_HEAP_SKIP_INTACT)",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                loop_us as f64 / 1e3 / frames,
+                intact as f64 / frames
             );
         }
         crate::shadow::exact_line(frames);

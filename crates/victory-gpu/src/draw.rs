@@ -371,8 +371,33 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
-/// slots the pass over buffer views looked at; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// slots the pass over buffer views looked at; the microseconds of its
+/// loop over those slots (views made, copies found); slots left as they
+/// were ([`heap_skip_intact`]); since the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether the heap pass leaves a slot written since the last pass alone
+/// when its record names the same view as when the pass last took it
+/// (`VICTORY_HEAP_SKIP_INTACT=1`; off by default): no view made or looked
+/// up, no host copy found again. The pass over all slots every sixteenth
+/// time is as before (a view of a released resource goes stale without a
+/// write). After the bench model of the M3 change (bancada-replay 978e481).
+fn heap_skip_intact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SKIP_INTACT").is_some_and(|v| v == "1"))
+}
+
+/// The view a heap slot's record names (its index and generation in our
+/// view table), 0 for none; what `HostHeap::mirror` keys a made slot by.
+fn slot_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory (as `mirror`
+    // reads it).
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != crate::descriptor::VIEW_TAG {
+        return 0;
+    }
+    u64::from(generation) << 32 | u64::from(i)
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1405,7 +1430,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1414,12 +1439,15 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let sweep = *passes % 16 == 0;
+        let slots = if sweep {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
+        let intact = heap_skip_intact() && !sweep;
+        let looping = std::time::Instant::now();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
@@ -1427,10 +1455,20 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
+            if intact
+                && let Some(handle) = heap.handle(index)
+                && let Some(kept) = ranges.get(&index)
+                && kept.3 != 0
+                && kept.3 == slot_key(handle)
+            {
+                HEAP_PASS_PARTS[3].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            let key = slot_key(handle);
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
             };
@@ -1458,13 +1496,14 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            ranges.insert(index, (shadow, address, address + len, key));
         }
+        HEAP_PASS_PARTS[2].fetch_add(looping.elapsed().as_micros() as u64, Ordering::Relaxed);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (shadow, from, to, _) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);

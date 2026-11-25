@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::watch::skip_unchanged`: the title ranges refreshed into
+    /// the copy that nothing wrote since.
+    unchanged: Arc<crate::watch::Unchanged>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1937,6 +1940,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if crate::watch::skip_unchanged() {
+            crate::watch::unwatch_unchanged(self.start as usize, self.len as usize, &self.unchanged);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2317,7 +2323,15 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            unchanged: Arc::default(),
         }
+    }
+
+    /// Whether `[address, address + len)` of title memory was refreshed
+    /// into the copy and nothing wrote it since
+    /// (`crate::watch::skip_unchanged`): its refresh would copy nothing.
+    pub(crate) fn unchanged_at(&self, address: usize, len: usize) -> bool {
+        self.place.is_none() && self.unchanged.covers(address, len)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2346,6 +2360,10 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Shaders may change the copy: nothing of it is held current.
+        if crate::watch::skip_unchanged() {
+            self.unchanged.clear();
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2984,6 +3002,26 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        if !crate::watch::skip_unchanged() {
+            return self.update_inner(address, len);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        let seen = if from < to && !self.writes_pending() {
+            crate::watch::watch_unchanged(from, to - from, &self.unchanged)
+        } else {
+            None
+        };
+        let copied = self.update_inner(address, len);
+        if let Some(seen) = seen
+            && !self.writes_pending()
+        {
+            self.unchanged.note(from, to, seen);
+        }
+        copied
+    }
+
+    fn update_inner(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {

@@ -262,6 +262,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    unchanged_gone(at, len);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
@@ -288,6 +289,10 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// last found `page` written (0: never) and the new one, for the copy
 /// that wrote to note itself current.
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
+    unchanged_gone(page * PAGE, PAGE);
+    for &other in others {
+        unchanged_gone(other * PAGE, PAGE);
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     j.asked += 1;
@@ -536,6 +541,10 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Per guarded block: the host copies holding title bytes of it as
+    /// current ([`watch_unchanged`]); opening or remapping the block takes
+    /// those bytes out of what they hold current.
+    watchers: BTreeMap<usize, Vec<std::sync::Arc<Unchanged>>>,
     /// With [`view_known`]: blocks made read-only at least once since the
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
@@ -564,8 +573,145 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    watchers: BTreeMap::new(),
     viewed: BTreeSet::new(),
 });
+
+/// Whether host copies are not refreshed again over ranges that nothing
+/// wrote since their last refresh (`VICTORY_SKIP_UNCHANGED=1`; off by
+/// default). Only guarded view memory counts: every write to it opens a
+/// guard first (the title's fault, a kernel write, a remapping, our own
+/// writes), and that opening takes the block's bytes out of what each
+/// copy holds current. After upstream Marvisak/VIctory#2136 (r4tedx).
+pub(crate) fn skip_unchanged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_UNCHANGED").is_some_and(|v| v == "1"))
+}
+
+/// Of one host copy ([`skip_unchanged`]): the title ranges (addresses, in
+/// no order) refreshed into it and not written since, and a count of the
+/// takings-out, so that a refresh a write overlapped notes nothing.
+#[derive(Default)]
+pub(crate) struct Unchanged {
+    inner: Mutex<(u64, Vec<(usize, usize)>)>,
+}
+
+impl Unchanged {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, Vec<(usize, usize)>)> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `[at, at + len)` is held current.
+    pub(crate) fn covers(&self, at: usize, len: usize) -> bool {
+        let end = at.saturating_add(len);
+        self.lock().1.iter().any(|&(a, b)| a <= at && end <= b)
+    }
+
+    /// `[from, to)` was refreshed, begun at count `seen`
+    /// ([`watch_unchanged`]): held current unless something was taken out
+    /// meanwhile.
+    pub(crate) fn note(&self, from: usize, to: usize, seen: u64) {
+        let mut inner = self.lock();
+        if inner.0 != seen || from >= to || inner.1.iter().any(|&(a, b)| a <= from && to <= b) {
+            return;
+        }
+        if inner.1.len() >= 64 {
+            inner.1.clear();
+        }
+        inner.1.push((from, to));
+    }
+
+    /// Nothing is held current any more.
+    pub(crate) fn clear(&self) {
+        let mut inner = self.lock();
+        inner.0 += 1;
+        inner.1.clear();
+    }
+
+    /// `[from, to)` was written: out of every range held current.
+    fn take_out(&self, from: usize, to: usize) {
+        let mut inner = self.lock();
+        inner.0 += 1;
+        let ranges = std::mem::take(&mut inner.1);
+        for (a, b) in ranges {
+            if b <= from || to <= a {
+                inner.1.push((a, b));
+                continue;
+            }
+            if a < from {
+                inner.1.push((a, from));
+            }
+            if to < b {
+                inner.1.push((to, b));
+            }
+        }
+    }
+}
+
+/// The copies watching `block` let go of its bytes.
+fn invalidate(g: &mut Guards, block: usize) {
+    if let Some(list) = g.watchers.remove(&block) {
+        for w in list {
+            w.take_out(block * BLOCK, (block + 1) * BLOCK);
+        }
+    }
+}
+
+/// Before a refresh of `[start, start + len)` into the copy that `w` is
+/// of: if every block of the range is guarded now, `w` watches them (any
+/// opening from here on takes their bytes out of it) and the count to
+/// hand to [`Unchanged::note`] after the refresh; `None` otherwise
+/// (write-watched memory is never held current).
+pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unchanged>) -> Option<u64> {
+    let (first, last) = (start / BLOCK, start.saturating_add(len).div_ceil(BLOCK));
+    if first >= last {
+        return None;
+    }
+    let mut g = guards();
+    if g.protected.range(first..last).count() != last - first {
+        return None;
+    }
+    for block in first..last {
+        let list = g.watchers.entry(block).or_default();
+        if !list.iter().any(|x| std::sync::Arc::ptr_eq(x, w)) {
+            list.push(w.clone());
+        }
+    }
+    // Read under the guards' lock, which every taking-out holds.
+    Some(w.lock().0)
+}
+
+/// A copy watching `[start, start + len)` goes.
+pub(crate) fn unwatch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unchanged>) {
+    let (first, last) = (start / BLOCK, start.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let blocks: Vec<usize> = g.watchers.range(first..last).map(|(&b, _)| b).collect();
+    for block in blocks {
+        if let Some(list) = g.watchers.get_mut(&block) {
+            list.retain(|x| !std::sync::Arc::ptr_eq(x, w));
+            if list.is_empty() {
+                g.watchers.remove(&block);
+            }
+        }
+    }
+}
+
+/// Title memory `[at, at + len)` was written by a way that opens no guard
+/// (our own views, the journal's own notes): out of every copy's current
+/// ranges.
+fn unchanged_gone(at: usize, len: usize) {
+    if len == 0 || !skip_unchanged() {
+        return;
+    }
+    let mut g = guards();
+    if g.watchers.is_empty() {
+        return;
+    }
+    let blocks: Vec<usize> = g.watchers.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    for block in blocks {
+        invalidate(&mut g, block);
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -846,6 +992,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        invalidate(g, block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1039,10 +1186,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let watched: Vec<usize> = g.watchers.range(range).map(|(&b, _)| b).collect();
+    for block in watched {
+        invalidate(&mut g, block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1649,5 +1800,100 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod unchanged_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Blocks far past any address the tests map: no other test guards them.
+    const FAR: usize = (1 << 46) / BLOCK;
+
+    fn guard_fake(first: usize, n: usize) {
+        let mut g = guards();
+        for b in first..first + n {
+            g.protected.insert(b);
+        }
+    }
+
+    fn unguard_fake(first: usize, n: usize, w: &Arc<Unchanged>) {
+        unwatch_unchanged(first * BLOCK, n * BLOCK, w);
+        let mut g = guards();
+        for b in first..first + n {
+            g.protected.remove(&b);
+        }
+    }
+
+    /// A refresh of guarded memory is noted current; the next ask for it
+    /// is skipped; a write to one block takes only that block's bytes out.
+    #[test]
+    fn refreshed_guarded_range_is_skipped_until_written() {
+        let first = FAR;
+        guard_fake(first, 4);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, 4 * BLOCK);
+        let seen = watch_unchanged(start, len, &w).expect("all blocks guarded");
+        w.note(start, start + len, seen);
+        assert!(w.covers(start, len), "refreshed and not written: skipped");
+        assert!(w.covers(start + BLOCK + 8, 100));
+        // The title writes block 2 (the guard opens).
+        open_here(&mut guards(), (first + 2) * BLOCK, (first + 2) * BLOCK + 1);
+        assert!(!w.covers(start, len), "a written block is refreshed again");
+        assert!(!w.covers((first + 2) * BLOCK, 16));
+        assert!(w.covers(start, 2 * BLOCK), "the blocks before it stay current");
+        assert!(w.covers((first + 3) * BLOCK, BLOCK), "the block after it stays current");
+        unguard_fake(first, 4, &w);
+    }
+
+    /// A write during the refresh: nothing is noted current.
+    #[test]
+    fn a_write_during_the_refresh_notes_nothing() {
+        let first = FAR + 64;
+        guard_fake(first, 2);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, 2 * BLOCK);
+        let seen = watch_unchanged(start, len, &w).expect("all blocks guarded");
+        open_here(&mut guards(), start, start + 1);
+        w.note(start, start + len, seen);
+        assert!(!w.covers(start, len));
+        assert!(!w.covers(start + BLOCK, 8));
+        unguard_fake(first, 2, &w);
+    }
+
+    /// Memory not all guarded (write-watched, or a block open) is never
+    /// held current.
+    #[test]
+    fn unguarded_memory_is_never_held() {
+        let first = FAR + 128;
+        guard_fake(first, 1);
+        let w = Arc::new(Unchanged::default());
+        assert!(watch_unchanged(first * BLOCK, 2 * BLOCK, &w).is_none());
+        unguard_fake(first, 1, &w);
+    }
+
+    /// Shaders that may write the copy, or the copy going: all out.
+    #[test]
+    fn clear_and_remap_take_everything_out() {
+        let first = FAR + 192;
+        guard_fake(first, 2);
+        let w = Arc::new(Unchanged::default());
+        let (start, len) = (first * BLOCK, 2 * BLOCK);
+        let seen = watch_unchanged(start, len, &w).unwrap();
+        w.note(start, start + len, seen);
+        w.clear();
+        assert!(!w.covers(start, 8));
+        let seen = watch_unchanged(start, len, &w).unwrap();
+        w.note(start, start + len, seen);
+        assert!(w.covers(start, len));
+        // As `title_memory_remapped` does for every watched block of its range.
+        {
+            let mut g = guards();
+            invalidate(&mut g, first + 1);
+        }
+        assert!(w.covers(start, BLOCK));
+        assert!(!w.covers(start + BLOCK, 8));
+        unguard_fake(first, 2, &w);
     }
 }

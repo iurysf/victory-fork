@@ -133,6 +133,10 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Refreshes not asked for: nothing wrote their range since it was last
+    /// refreshed (`watch::skip_unchanged`).
+    SkippedUnchanged,
+    SkippedUnchangedBytes,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1097,7 +1101,7 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
+         {:.0} skipped {:.1} MB, {:.0} skipped unchanged {:.1} MB (VICTORY_SKIP_UNCHANGED); {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
@@ -1108,6 +1112,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::RefreshBytes as usize]),
         c[C::Skipped as usize],
         mb(c[C::SkippedBytes as usize]),
+        c[C::SkippedUnchanged as usize],
+        mb(c[C::SkippedUnchangedBytes as usize]),
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
         c[C::Queries as usize],
