@@ -1604,32 +1604,107 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 shared_h[256];
+// One group of 256 threads per piece: each thread hashes every 256th
+// 16-byte line, seeded by its lane, and the lanes' hashes are folded in
+// the group's memory. A thread per piece walked its 4,096 lines one after
+// the other (271 passes, 29 ms a frame of the card in run P3-0; 60 times
+// faster on the bench, bancada_gpu_passes).
 [RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    if (gid.x >= pieces) return;
+    uint piece = first + gid.x;
+    uint lane = gtid.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (lane * 0x9E3779B9u);
+    const uint4 mul = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    for (uint base = lo + lane * 16u; base < hi; base += 16384u) {
+        h = (h ^ now.Load4(base)) * mul;
         h = h.yzwx ^ (h >> 15);
+        uint at1 = base + 4096u;
+        if (at1 < hi) {
+            h = (h ^ now.Load4(at1)) * mul;
+            h = h.yzwx ^ (h >> 15);
+        }
+        uint at2 = base + 8192u;
+        if (at2 < hi) {
+            h = (h ^ now.Load4(at2)) * mul;
+            h = h.yzwx ^ (h >> 15);
+        }
+        uint at3 = base + 12288u;
+        if (at3 < hi) {
+            h = (h ^ now.Load4(at3)) * mul;
+            h = h.yzwx ^ (h >> 15);
+        }
     }
-    if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-        // With the copy-back on its own thread: the next compare of the
-        // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
-    } else {
-        hashes.Store4(piece * 16u, h);
+    shared_h[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    // Folded with a mix of the upper half first, so that two lanes' equal
+    // changes do not cancel out.
+    [unroll]
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            uint4 a = shared_h[lane];
+            uint4 b = shared_h[lane + stride];
+            b ^= b >> 16;
+            b *= uint4(0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu, 0x165667B1u);
+            b ^= b >> 13;
+            b *= uint4(0xC2B2AE35u, 0x27D4EB2Fu, 0x165667B1u, 0x85EBCA6Bu);
+            b ^= b >> 16;
+            a = (a ^ b.zwxy) * mul;
+            shared_h[lane] = a.yzwx ^ (a >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u) {
+        uint4 hash = shared_h[0];
+        if (compare != 0u) {
+            differs.Store(out_at + gid.x * 4u, any(hash != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            // With the copy-back on its own thread: the next compare of the
+            // piece finds what is written from here on.
+            if (compare == 2u) hashes.Store4(piece * 16u, hash);
+        } else {
+            hashes.Store4(piece * 16u, hash);
+        }
     }
 }
 "#;
+
+/// Pieces per dispatch of [`CARD_COMPARE`] at most (a group each).
+pub(crate) const CARD_COMPARE_MOST: u32 = 65535;
+
+/// Records [`CARD_COMPARE`] over `pieces` pieces from `first`, a group per
+/// piece, in dispatches of [`CARD_COMPARE_MOST`] at most.
+///
+/// # Safety
+/// An open list with the compare's root signature, pipeline and views set.
+pub(crate) unsafe fn dispatch_card_compare(
+    list: &ID3D12GraphicsCommandList,
+    first: u32,
+    skew: u32,
+    size: u32,
+    pieces: u32,
+    out_at: u32,
+    compare: u32,
+) {
+    let mut done = 0u32;
+    while done < pieces {
+        let n = (pieces - done).min(CARD_COMPARE_MOST);
+        let constants = [first + done, skew, size, n, out_at + done * 4, compare];
+        // SAFETY: as the caller says.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(n, 1, 1);
+        }
+        done += n;
+    }
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -4231,9 +4306,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
                         }
                     }
                     crate::cardmeter::end(list, timed);
@@ -4320,11 +4393,9 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        dispatch_card_compare(list, r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind

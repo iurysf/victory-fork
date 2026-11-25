@@ -968,6 +968,99 @@ void main() {
     /// ahead with the relay, whose pieces are fetched flight by flight) it
     /// stores the hash it made: each compare flags what changed since the
     /// compare before it, also a change back.
+    /// The compare's groups (a thread per 16-byte line of a piece, their
+    /// hashes folded) flag every kind of change and only its piece: one
+    /// byte at the start, the middle and the end of a piece; the same bit
+    /// in two lanes' lines and in two lines of one lane (an XOR of the
+    /// lanes would let them cancel); two lines swapped; a whole line
+    /// zeroed. Pieces of a copy that starts 40 bytes into its first one.
+    #[test]
+    fn warp_card_compare_flags_each_kind_of_change() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        const SKEW: u32 = 40;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES + 1));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251 + i / 65536 * 7) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                crate::host::dispatch_card_compare(&warp.list, 0, SKEW, size as u32, PIECES, 0, mode);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize).map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() }).collect()
+        };
+        // SAFETY (each): inside the mapping.
+        let get = |at: usize| unsafe { now_ptr.add(at).read_volatile() };
+        let put = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        assert_eq!(run(&mut warp, 0), [7, 7, 7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0, 0]);
+        // Piece p of the copy covers [p * 64 KiB - 40, (p + 1) * 64 KiB - 40),
+        // widened to 16 bytes at both ends (a byte within 16 of an edge
+        // flags both pieces, as documented).
+        let start = |piece: usize| (piece * PIECE).saturating_sub(SKEW as usize);
+        let cases: Vec<(&str, usize, Vec<usize>)> = vec![
+            ("near the start of piece 1", 1, vec![start(1) + 16]),
+            ("middle of piece 2", 2, vec![start(2) + 30_001]),
+            ("near the end of piece 2", 2, vec![start(3) - 17]),
+            ("near the end of piece 3", 3, vec![start(4) - 17]),
+            ("same bit in two lanes' lines", 1, vec![start(1) + 64, start(1) + 64 + 16]),
+            ("same bit in two lines of one lane", 2, vec![start(2) + 160, start(2) + 160 + 4096]),
+            ("same bit 16 KiB apart", 1, vec![start(1) + 512, start(1) + 512 + 16384]),
+        ];
+        for (what, piece, at) in &cases {
+            for &a in at {
+                put(a, get(a) ^ 0x10);
+            }
+            let mut wanted = vec![0u32; PIECES as usize];
+            wanted[*piece] = 1;
+            assert_eq!(run(&mut warp, 1), wanted, "{what}");
+            for &a in at {
+                put(a, content[a]);
+            }
+            assert_eq!(run(&mut warp, 1), [0, 0, 0, 0], "{what}, put back");
+        }
+        // Two lines of piece 2 swapped, then one zeroed.
+        let (x, y) = (start(2) + 4096, start(2) + 8192);
+        let (x, y) = (x & !15, y & !15);
+        for i in 0..16 {
+            put(x + i, content[y + i]);
+            put(y + i, content[x + i]);
+        }
+        assert_ne!(content[x..x + 16], content[y..y + 16]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 1, 0], "two lines swapped");
+        for i in 0..16 {
+            put(x + i, content[x + i]);
+            put(y + i, content[y + i]);
+        }
+        for i in 0..16 {
+            put(x + i, 0);
+        }
+        assert_eq!(run(&mut warp, 1), [0, 0, 1, 0], "a line zeroed");
+        for i in 0..16 {
+            put(x + i, content[x + i]);
+        }
+        assert_eq!(run(&mut warp, 1), [0, 0, 0, 0]);
+    }
+
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -999,7 +1092,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1073,7 +1166,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
