@@ -2069,6 +2069,34 @@ impl Deferred {
     }
 }
 
+impl Deferred {
+    /// Empty again, as `Deferred::default()`, keeping the room its lists
+    /// and sets have (a list is reset some 210 times a frame, and dropping
+    /// and growing them again was most of "lists reset", 18.4 ms a frame in
+    /// run P4-0). What it held is let go as a drop would.
+    fn clear_reuse(&mut self) {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.copies.clear();
+        self.uploads.clear();
+        self.upload_bytes = 0;
+        self.kept.clear();
+        self.refreshed.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
+        // Sets grown past their use are let go (a set keeps its table).
+        if self.refreshed.capacity() > 1 << 14 {
+            self.refreshed = Default::default();
+        }
+        if self.textures.capacity() > 1 << 14 {
+            self.textures = Default::default();
+        }
+    }
+}
+
 impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
@@ -3609,6 +3637,43 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64,
             if CARD_PATCHES.load(Ordering::Relaxed) { "" } else { ": off" }
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::Deferred;
+
+    /// A list's reset empties its deferred work as a new one would be, and
+    /// keeps the room of its lists. Every field is named, so a new one
+    /// fails to compile here until `clear_reuse` empties it too.
+    #[test]
+    fn clear_reuse_empties_every_field_and_keeps_the_room() {
+        let mut d = Deferred::default();
+        d.copies.reserve(64);
+        d.refreshed.insert((1, 2, 3));
+        d.textures.insert(5);
+        d.upload_bytes = 0;
+        d.budget_zeroed = true;
+        d.indirect_readable = 9;
+        let room = d.copies.capacity();
+        d.clear_reuse();
+        let Deferred {
+            copies,
+            uploads,
+            upload_bytes,
+            kept,
+            refreshed,
+            textures,
+            writes,
+            backs,
+            budget_zeroed,
+            indirect_readable,
+        } = &d;
+        assert!(copies.is_empty() && uploads.is_empty() && kept.is_empty() && writes.is_empty() && backs.is_empty());
+        assert!(refreshed.is_empty() && textures.is_empty());
+        assert_eq!((*upload_bytes, *budget_zeroed, *indirect_readable), (0, false, 0));
+        assert_eq!(copies.capacity(), room, "the room is kept");
     }
 }
 
@@ -6268,7 +6333,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear_reuse();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
