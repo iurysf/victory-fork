@@ -1451,7 +1451,16 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let sweep = *passes % 16 == 0;
+        // Every `VICTORY_HEAP_SWEEP` passes (16 by default; 1 to 256) all
+        // slots are looked at: a view of a released resource goes stale
+        // without a write, and a slot written before its memory had a host
+        // copy is only made then. The sweep looked at 34,893 slots in run
+        // P4-0, a sixteenth of the pass's time each time.
+        static SWEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *SWEEP.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_SWEEP").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(16, |n| n.clamp(1, 256))
+        });
+        let sweep = *passes % every == 0;
         let slots = if sweep {
             ranges.clear();
             host.buffer_slots()
@@ -1504,8 +1513,9 @@ impl State {
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 continue;
             };
+            // (Asked on sweeps only: a lock per slot on every pass.)
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
+            if sweep && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             ranges.insert(index, (shadow, address, address + len, key));

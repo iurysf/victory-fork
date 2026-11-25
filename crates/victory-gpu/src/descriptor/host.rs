@@ -1610,12 +1610,14 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
-            buffers.insert(index);
-            true
-        } else {
-            buffers.remove(&index)
-        };
+        // Whether the slot joined or left the buffer views.
+        let moved = if stride.is_some() { buffers.insert(index) } else { buffers.remove(&index) };
+        // A slot the title wrote goes to the heap pass if it is or was a
+        // buffer view; one only seen (a draw or the pass made its host slot
+        // from what it held) only if it joined or left them: the pass that
+        // made it would queue it again for the next one, and that one again
+        // (3,100 intact slots a pass on the bench).
+        let was = if seen { moved } else { stride.is_some() || moved };
         if was {
             self.changed
                 .lock()
@@ -1901,17 +1903,19 @@ impl HostHeap {
                 let Some(last) = copied.get_mut(index as usize) else {
                     continue;
                 };
+                // A table's slot lately: left to its draws, and looked at
+                // again next time; asked first, so that its record is not
+                // fingerprinted for nothing (144,948 such slots a frame on
+                // the bench). The count is of such slots, changed or not.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
                 // The record last seen, or a slot never looked at that
                 // holds nothing: as it was.
                 if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
-                    continue;
-                }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 *last = print;
@@ -2190,20 +2194,28 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
+    // The copy of the buffer's extent, looked up once for both questions
+    // below when both ask (it was looked up twice), and only when one does.
+    let extent = buffer_extent(view);
+    let mut whole: Option<Option<std::sync::Arc<crate::shadow::Shadow>>> = None;
+    if let Some((base, width)) = extent
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
-        && let Some(own) = crate::shadow::exact(start, bytes)
     {
-        return Some((own, start, bytes));
+        let found = crate::shadow::find(base, width);
+        if let Some(copy) = &found
+            && let Some((start, bytes)) = own_bytes(copy.offset(base), base, first, count, element, stride, unknown)
+            && let Some(own) = crate::shadow::exact(start, bytes)
+        {
+            return Some((own, start, bytes));
+        }
+        whole = Some(found);
     }
     if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+        && let Some((base, width)) = extent
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(shadow) = whole.unwrap_or_else(|| crate::shadow::find(base, width))
     {
         return Some((shadow, address, len));
     }
@@ -3448,6 +3460,37 @@ mod tests {
     /// waiting for its first upload is left alone, one uploaded before is
     /// counted, and made due two frames on when that is asked for. (The
     /// ranges are handed over here, not through the list all heaps share.)
+    #[test]
+    fn a_slot_only_seen_is_not_queued_again_for_the_heap_pass() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A raw buffer view of placed memory (resource dimension 1).
+        let mut desc = [0u32; 16];
+        desc[1] = 1;
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let view = View::Placed(false, resource, desc);
+        assert!(view_stride(&view).is_some());
+        let _ = heap.buffer_changes();
+        // Written by the title: queued.
+        let _ = heap.note_buffer(3, Some(&view), false);
+        assert_eq!(heap.buffer_changes(), [3]);
+        // Written again with the same view: queued again (it may read
+        // other bytes now).
+        let _ = heap.note_buffer(3, Some(&view), false);
+        assert_eq!(heap.buffer_changes(), [3]);
+        // Only seen (a pass or a draw made its host slot): not queued.
+        let _ = heap.note_buffer(3, Some(&view), true);
+        assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
+        // Seen as no buffer any more: queued, so the pass lets go of it.
+        let _ = heap.note_buffer(3, None, true);
+        assert_eq!(heap.buffer_changes(), [3]);
+        // Seen as a buffer again: it joined, queued.
+        let _ = heap.note_buffer(3, Some(&view), true);
+        assert_eq!(heap.buffer_changes(), [3]);
+    }
+
     #[test]
     fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
         let Some(heap) = HostHeap::new(false, 8) else {
