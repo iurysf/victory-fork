@@ -2087,7 +2087,14 @@ impl Deferred {
         self.backs.clear();
         self.budget_zeroed = false;
         self.indirect_readable = 0;
-        // Sets grown past their use are let go (a set keeps its table).
+        // Lists and sets grown far past their use are trimmed (a list made
+        // once with thousands of steps kept its room for good).
+        if self.copies.capacity() > 4096 {
+            self.copies.shrink_to(1024);
+        }
+        if self.kept.capacity() > 4096 {
+            self.kept.shrink_to(1024);
+        }
         if self.refreshed.capacity() > 1 << 14 {
             self.refreshed = Default::default();
         }
@@ -3208,7 +3215,11 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // frame of settles for them).
         static RUNS: OnceLock<usize> = OnceLock::new();
         let copies = *RUNS.get_or_init(|| {
-            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
+            // 2048 by default: past 512 the long runs (or the merges of a
+            // copy without its reference) left a settle due, 11-36 ms a frame
+            // of "title memory changed under shader writes" in run P5-0. The
+            // runs stay exact (no gap is ever merged: VICTORY_MERGE_GAP=0).
+            std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2048, |n| n.clamp(1, 1 << 16))
         });
         let mut room = crate::shadow::Room::new(copies, CARD_PATCHES.load(Ordering::Relaxed));
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut room));
