@@ -937,8 +937,63 @@ fn release_held_now(all: bool) {
 /// will once those in the air have run.
 #[cfg(windows)]
 fn value_met(wait: &crate::list::ValueWait) -> bool {
-    wait.met() || (crate::host::late() && crate::host::late_met(wait))
+    if !crate::host::late() {
+        return wait.met();
+    }
+    if wait_guarded() {
+        let (address, bytes) = wait.place();
+        let (flights, unsure) = crate::host::late_last_write(address, bytes);
+        return match crate::host::wait_holds_guarded(wait, None, flights, unsure, || wait.met()) {
+            Some(holds) => holds,
+            None => {
+                WAIT_EARLY[2].fetch_add(1, Ordering::Relaxed);
+                crate::host::settle_for_value();
+                wait.met()
+            }
+        };
+    }
+    if wait.met() {
+        // Memory meets it: is a write ahead of it going to change that
+        // (counted; `VICTORY_WAIT_GUARDED=1` asks those writes first)?
+        #[cfg(feature = "diagnostics")]
+        {
+            let (address, bytes) = wait.place();
+            let (flights, unsure) = crate::host::late_last_write(address, bytes);
+            if flights.is_some() || unsure {
+                WAIT_EARLY[0].fetch_add(1, Ordering::Relaxed);
+                if crate::host::wait_holds_guarded(wait, None, flights, unsure, || true) == Some(false) {
+                    WAIT_EARLY[1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        return true;
+    }
+    crate::host::late_met(wait)
 }
+
+/// Whether a queue's wait for a memory value asks the writes ahead of it
+/// before memory (`VICTORY_WAIT_GUARDED=1`; off by default): the last
+/// bottom-of-pipe write of the flights over the place decides; one the
+/// flights' shaders may make, or one of another kind, settles them first;
+/// memory only when nothing ahead writes there. As it is, memory is asked
+/// first: a wait for 7 that memory meets passes while a flight that stores
+/// 8 is in the air, and the part behind it runs early (upstream #2611's
+/// class; the bench's oracle, "SeparateLate"). May turn within a run
+/// (`crate::ab`): each wait is looked at one way or the other.
+#[cfg(windows)]
+fn wait_guarded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_GUARDED").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::WaitGuarded, run)
+}
+
+/// Since the last frame line: waits for a memory value passed because
+/// memory met them while a write ahead of them (a flight's bottom-of-pipe
+/// write or its shaders) could change that, and of those the ones whose
+/// last known write does not meet them (diagnostics, the way as it is);
+/// and with `VICTORY_WAIT_GUARDED=1`, the settles such waits asked for.
+#[cfg(windows)]
+pub(crate) static WAIT_EARLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.

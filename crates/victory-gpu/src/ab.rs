@@ -58,13 +58,14 @@ pub(crate) enum Key {
     GuardCoalesce,
     GuardRunsStore,
     CopyReadOnly,
+    WaitGuarded,
     SkipUnchanged,
     IndirectHoist,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 18] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 19] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -86,6 +87,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 18] = [
         ),
     ),
     (Key::CopyReadOnly, "COPY_READ_ONLY", None),
+    (Key::WaitGuarded, "WAIT_GUARDED", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",

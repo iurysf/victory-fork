@@ -1183,6 +1183,15 @@ fn reset_line(frames: f64) {
             if crate::texture::canary::on() { "" } else { ": off" }
         );
     }
+    {
+        let early = &crate::queue::WAIT_EARLY;
+        tracing::info!(
+            "waits for a memory value passed on memory while a write ahead of them could change it (upstream #2611's class), per frame:              {:.1}, of them {:.1} whose last known write does not meet them; settles such waits asked for with VICTORY_WAIT_GUARDED=1: {:.1}",
+            early[0].swap(0, Relaxed) as f64 / frames,
+            early[1].swap(0, Relaxed) as f64 / frames,
+            early[2].swap(0, Relaxed) as f64 / frames
+        );
+    }
     let kept = &crate::watch::VIEW_KEPT;
     tracing::info!(
         "blocks known as view memory only by the watch_remap that Windows says are no view (VICTORY_VIEW_KNOWN=1, every 64th asking; 0 expected), \
