@@ -397,11 +397,25 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let queued = std::mem::take(&mut *CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    card_queue_canary(&queued);
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    if !card_queue_on() {
+        // As before the queue: every copy in the card's memory is asked.
+        let all: Vec<Arc<Shadow>> =
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(std::sync::Weak::upgrade).collect();
+        return all
+            .into_iter()
+            .filter_map(|shadow| {
+                let ranges = shadow.card.as_ref().map(|c| card_take(c, sent_as, fetched)).unwrap_or_default();
+                (!ranges.is_empty()).then(|| (shadow, joined(ranges)))
+            })
+            .collect();
+    }
     let mut out = Vec::with_capacity(queued.len());
     if queued.is_empty() {
         return out;
     }
-    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     for at in queued {
         let shadow = CARDED.lock().unwrap_or_else(|e| e.into_inner()).get(&at).and_then(std::sync::Weak::upgrade);
         let Some(shadow) = shadow else {
@@ -410,23 +424,78 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(c) = shadow.card.as_ref() else {
             continue;
         };
-        let ranges = {
-            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            // Under `dirty`'s lock: a change after this queues the copy again.
-            c.queued.store(false, Ordering::Release);
-            let ranges = std::mem::take(&mut *dirty);
-            if relay() {
-                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                sent.retain(|s| s.2 > fetched);
-                sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-            }
-            ranges
-        };
+        let ranges = card_take(c, sent_as, fetched);
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
         }
     }
     out
+}
+
+/// A card copy's changed ranges, taken for send `sent_as` ([`card_dirty`]):
+/// its queue mark cleared under `dirty`'s lock, so a change after this
+/// queues it again.
+fn card_take(c: &Card, sent_as: u64, fetched: u64) -> Vec<(usize, usize)> {
+    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+    c.queued.store(false, Ordering::Release);
+    let ranges = std::mem::take(&mut *dirty);
+    if relay() {
+        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.retain(|s| s.2 > fetched);
+        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+    }
+    ranges
+}
+
+/// Whether [`card_dirty`] takes only the copies queued when they changed
+/// ([`CARD_QUEUE`], fork #987; on by default). `VICTORY_CARD_QUEUE=0`: every
+/// copy in the card's memory is asked at every submission, as before.
+fn card_queue_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_QUEUE").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: card copies found with changed ranges and not queued
+/// (never expected: such a copy's bytes do not go to the card), how many
+/// looks there were, and the copies looked at ([`card_queue_canary`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) static CARD_UNQUEUED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Every 64th [`card_dirty`]: every copy in the card's memory that is not
+/// in `queued` (taken from the queue just now) is looked at, under its
+/// `dirty` lock: one with ranges in `dirty` must be queued.
+#[cfg(feature = "diagnostics")]
+fn card_queue_canary(queued: &[usize]) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if !card_queue_on() || !CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+        return;
+    }
+    let all: Vec<(usize, Arc<Shadow>)> = CARDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&at, w)| w.upgrade().map(|s| (at, s)))
+        .collect();
+    let mut unqueued = 0;
+    for (at, shadow) in &all {
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if !dirty.is_empty() && !queued.contains(at) && !c.queued.load(Ordering::Acquire) {
+            unqueued += 1;
+        }
+    }
+    CARD_UNQUEUED[0].fetch_add(unqueued, Ordering::Relaxed);
+    CARD_UNQUEUED[1].fetch_add(1, Ordering::Relaxed);
+    CARD_UNQUEUED[2].fetch_add(all.len() as u64, Ordering::Relaxed);
+    if unqueued > 0 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if said <= 16 || said.is_power_of_two() {
+            tracing::warn!(unqueued, "card copies with changed bytes left out of the card queue (CARD_QUEUE; 0 expected)");
+        }
+    }
 }
 
 /// A run of title bytes shorter than this goes to the card's side as
@@ -3689,6 +3758,21 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
+        // Queued as `card_changed` queues, under the same lock: `card_dirty`
+        // takes only queued copies (CARD_QUEUE), and a copy changed only
+        // here (the title's bytes put in under flights) kept its ranges
+        // from the card until something else queued it (run P9-0's blocks).
+        if !dirty.is_empty() {
+            self.queue_card(card);
+        }
+    }
+
+    /// Puts the copy in [`CARD_QUEUE`] if it is not there. Under `card`'s
+    /// `dirty` lock, with a range in it.
+    fn queue_card(&self, card: &Card) {
+        if !card.queued.swap(true, Ordering::AcqRel) {
+            CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(self) as usize);
+        }
     }
 
     fn card_changed(&self, from: usize, to: usize) {
@@ -3703,9 +3787,7 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
-        if !card.queued.swap(true, Ordering::AcqRel) {
-            CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(self) as usize);
-        }
+        self.queue_card(card);
     }
 
     /// Of a copy in the card's memory: `ranges` of its CPU side (offsets,
@@ -4587,8 +4669,9 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
-    use std::sync::Mutex;
+    use super::{CARD_QUEUE, Card, PAGE, Shadow, card_take};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -4681,6 +4764,55 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// A copy in the card's memory changed only by `card_changed_runs` (the
+    /// title's bytes put in under flights) is queued for the card, and its
+    /// ranges go with the next `card_dirty`'s taking (run P9-0: they stayed
+    /// out of the queue, the card kept the old bytes). Not put in CARDED:
+    /// a submission of another test may empty the queue, and the copy is of
+    /// a device of its own.
+    #[test]
+    fn a_card_copy_changed_only_by_runs_goes_to_the_card() {
+        let _turn = crate::warp_turn();
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        let mut side = vec![0u8; LEN];
+        let title = vec![0u8; LEN];
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            queued: std::sync::atomic::AtomicBool::new(false),
+            size: 0,
+        });
+        let shadow = Arc::new(shadow);
+        let card = shadow.card.as_ref().unwrap();
+        shadow.card_changed_runs(PAGE, &[(16, 8), (40, 4)]);
+        assert!(card.queued.load(Ordering::Acquire), "queued for the card");
+        let at = Arc::as_ptr(&shadow) as usize;
+        // Taken out again by hand (the copy is not in CARDED), as `card_dirty` takes it.
+        let was_queued = {
+            let mut queue = CARD_QUEUE.lock().unwrap();
+            let had = queue.contains(&at);
+            queue.retain(|&q| q != at);
+            had
+        };
+        let ranges = card_take(card, 0, 0);
+        assert_eq!(ranges, vec![(PAGE + 16, PAGE + 24), (PAGE + 40, PAGE + 44)]);
+        assert!(!card.queued.load(Ordering::Acquire), "taken");
+        // Changed again: queued again.
+        shadow.card_changed_runs(0, &[(0, 4)]);
+        assert!(card.queued.load(Ordering::Acquire), "queued again");
+        CARD_QUEUE.lock().unwrap().retain(|&q| q != at);
+        assert_eq!(card_take(card, 0, 0), vec![(0, 4)]);
+        // In the queue unless a submission of another test took it meanwhile.
+        let _ = was_queued;
+        drop(shadow);
     }
 }
 

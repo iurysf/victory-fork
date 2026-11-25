@@ -1153,6 +1153,14 @@ fn reset_line(frames: f64) {
         "remappings per frame that kept their blocks known as view memory (watch_remap, VICTORY_VIEW_KNOWN=1): {:.1}",
         crate::watch::REMAPS_KEPT.swap(0, Relaxed) as f64 / frames
     );
+    let unqueued = &crate::shadow::CARD_UNQUEUED;
+    tracing::info!(
+        "card copies with changed bytes left out of the card queue (CARD_QUEUE canary, every 64th submission; 0 expected), since the start: {} in {} looks at {} copies{}",
+        unqueued[0].load(Relaxed),
+        unqueued[1].load(Relaxed),
+        unqueued[2].load(Relaxed),
+        if std::env::var_os("VICTORY_CARD_QUEUE").is_some_and(|v| v == "0") { " (VICTORY_CARD_QUEUE=0: not looked)" } else { "" }
+    );
 }
 
 /// A frame was presented.
