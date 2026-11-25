@@ -1412,17 +1412,19 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 16 kept, the largest, and
+/// Returns a snapshot buffer to the pool: at most 128 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    // 8 ran out in run P4-0 ("snapshot buffers kept: 0"): every snapshot
-    // was a fresh allocation, its pages faulted in (3,084 a frame on the
-    // bench, none with 16).
-    pool.truncate(16);
+    // 8 ran out in run P4-0 and 16 in run P5-0 ("snapshot buffers kept:
+    // 0"): every snapshot was a fresh allocation, its pages faulted in.
+    // Some 40-60 copies of about 90 KiB are in the air at once with the
+    // relay; 128 kept no fault on the bench, some 11 MB (the bytes stay
+    // under `KEPT`).
+    pool.truncate(128);
     let (mut seen, mut total) = (0, 0usize);
     pool.retain(|v| {
         seen += 1;
