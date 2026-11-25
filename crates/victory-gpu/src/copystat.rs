@@ -1163,6 +1163,34 @@ fn reset_line(frames: f64) {
         unqueued[2].load(Relaxed),
         if std::env::var_os("VICTORY_CARD_QUEUE").is_some_and(|v| v == "0") { " (VICTORY_CARD_QUEUE=0: not looked)" } else { "" }
     );
+    {
+        use crate::texture::canary::{COUNTS, FOLLOWED, WORST};
+        let worst = *WORST.lock().unwrap_or_else(|e| e.into_inner());
+        let w = |i: usize| format!("{} (largest {:#x}+{:#x})", COUNTS[i].load(Relaxed), worst[i].0, worst[i].1);
+        tracing::info!(
+            "texture canary (every 32nd frame up to 8 textures taken as current; 0 expected; VICTORY_TEXTURE_CANARY=0 off), since the start: \
+             {} looked at, changed: r1 guarded with no write seen {}, r2 write-watched with no write seen {}, r3 partly mapped inside its 30 frames {}; \
+             r4 torn reads {} of {} detilings checked; {} followed now; the canary's own time {:.2} ms a frame, {:.0} ms since the start{}",
+            COUNTS[4].load(Relaxed),
+            w(0),
+            w(1),
+            w(2),
+            w(3),
+            COUNTS[5].load(Relaxed),
+            FOLLOWED.load(Relaxed),
+            COUNTS[7].swap(0, Relaxed) as f64 / 1e6 / frames,
+            COUNTS[6].load(Relaxed) as f64 / 1e6,
+            if crate::texture::canary::on() { "" } else { ": off" }
+        );
+    }
+    let kept = &crate::watch::VIEW_KEPT;
+    tracing::info!(
+        "blocks known as view memory only by the watch_remap that Windows says are no view (VICTORY_VIEW_KNOWN=1, every 64th asking; 0 expected), \
+         since the start: {} of {} looked at (the last at {:#x})",
+        kept[1].load(Relaxed),
+        kept[0].load(Relaxed),
+        kept[2].load(Relaxed)
+    );
 }
 
 /// A frame was presented.

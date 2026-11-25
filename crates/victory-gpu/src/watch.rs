@@ -367,6 +367,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
+    kernel_answered(first, last, &j.found[..count]);
     true
 }
 
@@ -539,7 +540,39 @@ fn known_view(start: usize) -> bool {
     }
     let g = guards();
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    if g.protected.contains(&first) || g.absent.contains(&first) {
+        return true;
+    }
+    let kept = view_known() && g.viewed.contains(&first);
+    drop(g);
+    #[cfg(feature = "diagnostics")]
+    if kept {
+        kept_view_check(first);
+    }
+    kept
+}
+
+/// Of the askings that took a block for view memory only because it is
+/// remembered as one ([`view_known`]; after a remapping, the watch_remap
+/// keeps it), every 64th: Windows is asked whether it is one (`is_view`).
+/// Since the start: askings looked at, those Windows said are no view, and
+/// the address of the last such block. A block that is no view any more
+/// is not write-watched for it: its refreshes go by the guards alone.
+#[cfg(feature = "diagnostics")]
+pub(crate) static VIEW_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(feature = "diagnostics")]
+fn kept_view_check(block: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ASKINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !ASKINGS.fetch_add(1, Relaxed).is_multiple_of(64) {
+        return;
+    }
+    VIEW_KEPT[0].fetch_add(1, Relaxed);
+    if !is_view(block * BLOCK, (block + 1) * BLOCK) {
+        VIEW_KEPT[1].fetch_add(1, Relaxed);
+        VIEW_KEPT[2].store((block * BLOCK) as u64, Relaxed);
+    }
 }
 
 struct Guards {
@@ -562,6 +595,86 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// With `VICTORY_BACK_OWN_CHECK=1` ([`back_check`]): blocks the runtime
+    /// mapped or unmapped that were not made read-only since.
+    remapped: CleanBlocks,
+}
+
+/// Whether `VICTORY_BACK_OWN_CHECK=1` (`Shadow::put_back_own`'s check): the
+/// pages it finds differing are sorted by what stands over them
+/// ([`differing_kind`]); nothing is kept for it otherwise.
+fn back_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// What stands over a block of title memory whose bytes differ from a
+/// copy that holds them current ([`differing_kind`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Over {
+    /// Guarded and not written since a copy took it.
+    Clean = 0,
+    /// View memory, guarded once, its guard opened by a write since (or
+    /// written through the runtime, still read-only).
+    GuardedDirty = 1,
+    /// Not view memory: the kernel's write watch, no guard.
+    Unguarded = 2,
+    /// Noted absent (uncommitted), or mapped or unmapped by the runtime and
+    /// not guarded since.
+    AbsentOrRemapped = 3,
+}
+
+/// For `Shadow::put_back_own`'s check: what stands over `block`. For an
+/// unguarded one, the next kernel asking over it says whether its write bit
+/// was set ([`BACK_UNGUARDED`]).
+pub(crate) fn differing_kind(block: usize) -> Over {
+    {
+        let g = guards();
+        if g.clean.uncovered(block, block + 1).is_empty() {
+            return Over::Clean;
+        }
+        if g.absent.contains(&block) || g.remapped.uncovered(block, block + 1).is_empty() {
+            return Over::AbsentOrRemapped;
+        }
+        if g.protected.contains(&block) {
+            return Over::GuardedDirty;
+        }
+    }
+    if is_view(block * BLOCK, (block + 1) * BLOCK) {
+        return Over::GuardedDirty;
+    }
+    let mut pending = BACK_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.len() < 4096 {
+        pending.push(block * BLOCK / PAGE);
+    }
+    Over::Unguarded
+}
+
+/// Pages of [`Over::Unguarded`] waiting for the next kernel asking over them.
+static BACK_PENDING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Since the start, of the pages of [`Over::Unguarded`]: those the next
+/// kernel asking over them found written (the copy takes them again), and
+/// those it did not (the copy keeps what differs: a defect).
+pub(crate) static BACK_UNGUARDED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A kernel asking over pages `[first, last)` found `found` (addresses) written.
+fn kernel_answered(first: usize, last: usize, found: &[usize]) {
+    if !back_check() {
+        return;
+    }
+    let mut pending = BACK_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_empty() {
+        return;
+    }
+    pending.retain(|&page| {
+        if page < first || page >= last {
+            return true;
+        }
+        let written = found.iter().any(|&at| at / PAGE == page);
+        BACK_UNGUARDED[usize::from(!written)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    });
 }
 
 /// Disjoint, non-touching half-open runs of clean blocks.
@@ -601,6 +714,29 @@ impl CleanBlocks {
         }
         if block + 1 < to {
             self.0.insert(block + 1, to);
+        }
+    }
+
+    /// Takes blocks `[from, to)` out.
+    fn remove_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        if let Some((&start, &end)) = self.0.range(..from).next_back()
+            && end > from
+        {
+            self.0.insert(start, from);
+            if end > to {
+                self.0.insert(to, end);
+                return;
+            }
+        }
+        let inside: Vec<(usize, usize)> = self.0.range(from..to).map(|(&s, &e)| (s, e)).collect();
+        for (start, end) in inside {
+            self.0.remove(&start);
+            if end > to {
+                self.0.insert(to, end);
+            }
         }
     }
 
@@ -647,6 +783,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     aliased: BTreeSet::new(),
     watchers: BTreeMap::new(),
     viewed: BTreeSet::new(),
+    remapped: CleanBlocks(BTreeMap::new()),
 });
 
 /// Whether host copies are not refreshed again over ranges that nothing
@@ -874,11 +1011,6 @@ fn unchanged_gone(at: usize, len: usize) {
     take_out_range(&g, at, at.saturating_add(len));
 }
 
-/// Whether the block `block` is read-only by our hand and unwritten since a
-/// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
-pub(crate) fn clean(block: usize) -> bool {
-    guards().clean.uncovered(block, block + 1).is_empty()
-}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -1093,6 +1225,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.insert(from, to);
+        if back_check() {
+            g.remapped.remove_range(from, to);
+        }
         if view_known() {
             g.viewed.extend(from..to);
         }
@@ -1403,6 +1538,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(block);
     }
+    if back_check() {
+        g.remapped.insert(range.start, range.end);
+    }
     let _ = range;
     take_out_range(&g, at, at.saturating_add(len));
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
@@ -1532,6 +1670,14 @@ mod tests {
         runs.insert(11, 16);
         blocks.extend(11..16);
         check(&runs, &blocks);
+        // Ranges out: inside a run, across runs, at their edges, over none.
+        for (from, to) in [(6, 8), (10, 24), (2, 3), (30, 40), (0, 1), (4, 5)] {
+            runs.remove_range(from, to);
+            for block in from..to {
+                blocks.remove(&block);
+            }
+            check(&runs, &blocks);
+        }
     }
 
     #[test]

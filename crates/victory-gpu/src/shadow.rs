@@ -3154,8 +3154,11 @@ impl Shadow {
         /// and with `VICTORY_BACK_OWN_CHECK=1` (fork fxceless 39731795d):
         /// stores the title's own address did not show afterwards, pages
         /// noted current whose CPU side in the copy differs from title
-        /// memory, and those of them whose guard was clean.
-        static OWN_WRITES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+        /// memory, and those of them whose guard was clean; then the others
+        /// of them by what stands over them (`crate::watch::Over`): guarded
+        /// and written since, unguarded (the kernel's write watch), absent
+        /// or remapped and not guarded since.
+        static OWN_WRITES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
         static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let check = *CHECK.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_CHECK").is_some_and(|v| v == "1"));
         if !crate::inplace::back_own() {
@@ -3198,9 +3201,9 @@ impl Shadow {
                         let held = unsafe { std::slice::from_raw_parts(self.data.add(lo - start).cast_const(), hi - lo) };
                         if crate::host::read_into(lo as *const u8, &mut title) && title != held {
                             OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
-                            if crate::watch::clean(page) {
-                                OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
-                            }
+                            // Clean: 6; guarded and written since: 7;
+                            // unguarded: 8; absent or remapped: 9.
+                            OWN_WRITES[6 + crate::watch::differing_kind(page) as usize].fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -3210,13 +3213,18 @@ impl Shadow {
         let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(16384) {
             tracing::info!(
-                "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way; with VICTORY_BACK_OWN_CHECK=1: {} stores the title's address did not show, {} pages noted current whose CPU side differs from title memory, {} of those with the guard clean",
+                "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way; with VICTORY_BACK_OWN_CHECK=1: {} stores the title's address did not show, {} pages noted current whose CPU side differs from title memory, {} of those with the guard clean, {} guarded and written since, {} unguarded (write-watched; at the next kernel asking over them {} found written, {} not written), {} absent or remapped and not guarded since",
                 OWN_WRITES[1].load(Ordering::Relaxed) >> 20,
                 OWN_WRITES[2].load(Ordering::Relaxed),
                 OWN_WRITES[3].load(Ordering::Relaxed),
                 OWN_WRITES[4].load(Ordering::Relaxed),
                 OWN_WRITES[5].load(Ordering::Relaxed),
-                OWN_WRITES[6].load(Ordering::Relaxed)
+                OWN_WRITES[6].load(Ordering::Relaxed),
+                OWN_WRITES[7].load(Ordering::Relaxed),
+                OWN_WRITES[8].load(Ordering::Relaxed),
+                crate::watch::BACK_UNGUARDED[0].load(Ordering::Relaxed),
+                crate::watch::BACK_UNGUARDED[1].load(Ordering::Relaxed),
+                OWN_WRITES[9].load(Ordering::Relaxed)
             );
         }
         true

@@ -73,6 +73,10 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// The texture canary's hash of the title memory its last detiling
+    /// read, while the canary follows the texture ([`canary`]).
+    #[cfg(feature = "diagnostics")]
+    canary: Mutex<Option<blake3::Hash>>,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -464,6 +468,10 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if self.canary.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
+            canary::FOLLOWED.fetch_sub(1, Relaxed);
+        }
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
@@ -996,6 +1004,8 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                #[cfg(feature = "diagnostics")]
+                canary::look(self, canary::Why::Watched);
                 return 0;
             }
             last.asked = now;
@@ -1034,6 +1044,8 @@ impl Staging {
             let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(hash_every())
                 && last.ahead.is_none_or(|at| frame > at + 1);
             if unwritten && !turn {
+                #[cfg(feature = "diagnostics")]
+                canary::look(self, canary::Why::Guarded);
                 return 0;
             }
         }
@@ -1064,6 +1076,8 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
+                #[cfg(feature = "diagnostics")]
+                canary::look(self, canary::Why::Partial);
                 return 0;
             }
             last.partial = Some(frame);
@@ -1181,6 +1195,10 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        // The texture canary: what this detiling reads, and on its way out
+        // whether title memory still holds it (a torn read).
+        #[cfg(feature = "diagnostics")]
+        let _canary = canary::Detiling::new(self, tiled);
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1536,9 +1554,185 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        #[cfg(feature = "diagnostics")]
+        canary: Mutex::new(None),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// The texture canary (diagnostics; `VICTORY_TEXTURE_CANARY=0` turns it
+/// off): whether textures the refresh takes as current still are.
+///
+/// A texture is followed from one of its detilings (at most [`MOST`] at a
+/// time, picked by address in turns of [`EVERY`] frames): the detiling's
+/// bytes are hashed, and on its way out title memory is read and hashed
+/// again (r4: a torn read, the title wrote it under the detiling). Every
+/// [`EVERY`]th frame up to [`LOOKS`] followed textures that the refresh
+/// passes over as unchanged are read and hashed again against the
+/// detiling's hash, by why they were passed over: r1 guarded and no write
+/// seen (with its turn of `VICTORY_TEXTURE_HASH_EVERY` not come), r2
+/// write-watched and no write seen, r3 partly mapped and inside its 30
+/// frames. A texture looked at is let go of. Title memory is read through
+/// the kernel's copy, with zeros for pages not there, as the detilings
+/// that read it so do.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod canary {
+    use super::Staging;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// Frames between looks.
+    const EVERY: u64 = 32;
+    /// Looks in such a frame.
+    const LOOKS: u64 = 8;
+    /// Textures followed at a time.
+    const MOST: u64 = 64;
+    /// The largest texture followed.
+    const BYTES: usize = 16 << 20;
+
+    /// Why the refresh passed a texture over as unchanged.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Why {
+        /// r1: guarded, no write seen, not its turn to be hashed.
+        Guarded = 0,
+        /// r2: write-watched, no write seen.
+        Watched = 1,
+        /// r3: partly mapped, inside its 30 frames.
+        Partial = 2,
+    }
+
+    /// Textures followed now.
+    pub(crate) static FOLLOWED: AtomicU64 = AtomicU64::new(0);
+
+    /// Since the start: textures found changed for r1, r2, r3, r4; looks
+    /// made; detilings checked for r4; nanoseconds of the canary; and its
+    /// nanoseconds since the last frame line.
+    pub(crate) static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// For r1 to r4: the largest texture found changed (address, bytes).
+    pub(crate) static WORST: Mutex<[(usize, usize); 4]> = Mutex::new([(0, 0); 4]);
+
+    /// The frame of the last looks and how many were made in it.
+    static LOOKED: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
+
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CANARY").is_none_or(|v| v != "0"))
+    }
+
+    /// The hash of `size` bytes of title memory at `memory`, read as the
+    /// detilings read it.
+    fn title_hash(memory: *const u8, size: usize) -> blake3::Hash {
+        READ.with(|read| {
+            let mut read = read.borrow_mut();
+            if read.len() < size {
+                read.resize(size, 0);
+            }
+            crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+            blake3::hash(&read[..size])
+        })
+    }
+
+    fn spent(started: std::time::Instant) {
+        let ns = started.elapsed().as_nanos() as u64;
+        COUNTS[6].fetch_add(ns, Relaxed);
+        COUNTS[7].fetch_add(ns, Relaxed);
+    }
+
+    fn changed(why: usize, memory: *const u8, size: usize) {
+        COUNTS[why].fetch_add(1, Relaxed);
+        let mut worst = WORST.lock().unwrap_or_else(|e| e.into_inner());
+        if size > worst[why].1 {
+            worst[why] = (memory as usize, size);
+        }
+    }
+
+    /// One detiling of a staging buffer, as the canary sees it.
+    pub(crate) struct Detiling<'a> {
+        staging: &'a Staging,
+        hash: Option<blake3::Hash>,
+    }
+
+    impl<'a> Detiling<'a> {
+        pub(crate) fn new(staging: &'a Staging, tiled: &[u8]) -> Self {
+            let mut hash = None;
+            if on() && tiled.len() <= BYTES {
+                let mut held = staging.canary.lock().unwrap_or_else(|e| e.into_inner());
+                let followed = held.is_some() || {
+                    let turn = crate::frame::current() / EVERY;
+                    let picked = ((staging.memory as u64 >> 16).wrapping_add(turn)).is_multiple_of(16)
+                        && FOLLOWED.load(Relaxed) < MOST;
+                    if picked {
+                        FOLLOWED.fetch_add(1, Relaxed);
+                    }
+                    picked
+                };
+                if followed {
+                    let started = std::time::Instant::now();
+                    let h = blake3::hash(tiled);
+                    *held = Some(h);
+                    hash = Some(h);
+                    spent(started);
+                }
+            }
+            Self { staging, hash }
+        }
+    }
+
+    impl Drop for Detiling<'_> {
+        fn drop(&mut self) {
+            let Some(hash) = self.hash else {
+                return;
+            };
+            let started = std::time::Instant::now();
+            let (memory, size) = (self.staging.memory, self.staging.layout.size as usize);
+            COUNTS[5].fetch_add(1, Relaxed);
+            if title_hash(memory, size) != hash {
+                changed(3, memory, size);
+            }
+            spent(started);
+        }
+    }
+
+    /// The refresh passed `staging` over as unchanged, for `why`.
+    pub(crate) fn look(staging: &Staging, why: Why) {
+        if !on() {
+            return;
+        }
+        let frame = crate::frame::current();
+        if !frame.is_multiple_of(EVERY) {
+            return;
+        }
+        let mut held = staging.canary.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(hash) = *held else {
+            return;
+        };
+        {
+            let mut looked = LOOKED.lock().unwrap_or_else(|e| e.into_inner());
+            if looked.0 != frame {
+                *looked = (frame, 0);
+            }
+            if looked.1 >= LOOKS {
+                return;
+            }
+            looked.1 += 1;
+        }
+        let started = std::time::Instant::now();
+        let (memory, size) = (staging.memory, staging.layout.size as usize);
+        COUNTS[4].fetch_add(1, Relaxed);
+        if title_hash(memory, size) != hash {
+            changed(why as usize, memory, size);
+        }
+        *held = None;
+        FOLLOWED.fetch_sub(1, Relaxed);
+        spent(started);
+    }
 }
 
 #[cfg(test)]
