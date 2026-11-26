@@ -1086,6 +1086,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // The meter of copies under flights' writes: what this draw's views
+        // declare is a table's view's, by this pipeline, unless said else.
+        let _declaring = crate::shadow::declaring(2, Some((self.pipeline, &p.name)));
         // Compute work, or shaders that store to buffers, may write records
         // a hoisted clamp read before the list ran: the list's first part
         // ends (`crate::indirect::hoist_on`).
@@ -1360,6 +1363,8 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
+                // The meter of copies under flights' writes: a root view.
+                let _declaring = crate::shadow::declaring(1, None);
                 s.gpu_writes(list, a, len);
             }
         };

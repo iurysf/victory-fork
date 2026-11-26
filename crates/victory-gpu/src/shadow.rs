@@ -2256,25 +2256,119 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Bounds of [`UnderCopy::hist`]: runs put in on one page under flights'
+/// writes, below 16, 256, 1,024, 4,096, 8,192, and 8,192 or more.
+const UNDER_HIST: [u64; 5] = [16, 256, 1024, 4096, 8192];
+
+/// One copy's notes in [`UNDER_BY_COPY`].
+#[derive(Default)]
+struct UnderCopy {
+    /// The copy's bytes; pages compared under flights' writes; changed runs
+    /// put in there; runs sent up as patches.
+    len: u64,
+    pages: u64,
+    runs: u64,
+    patches: u64,
+    /// Pages by the runs put in on them ([`UNDER_HIST`]).
+    hist: [u64; 6],
+    /// Shader writes declared on the copy ([`Shadow::gpu_writes`]): through
+    /// a root view, a view in a table, outside a draw's binding (the heap's
+    /// pass, the layer's own); the lowest and highest offset declared.
+    declared: [u64; 3],
+    lo: u64,
+    hi: u64,
+    /// The draws' pipelines that declared (their title object, how many
+    /// times, the name; the first 8 seen).
+    pipelines: Vec<(usize, u64, String)>,
+    /// Pages (title page numbers) the title rewrote under flights' writes,
+    /// and pieces the card's shaders wrote that came back (its merges):
+    /// all of them, and those on a page of `rewritten`.
+    rewritten: std::collections::HashSet<usize>,
+    landed: u64,
+    landed_rewritten: u64,
+}
+
 /// With `VICTORY_GUARDS_METER` (`crate::lockmeter::on`) only, since the last
-/// frame line: by copy (its title address), its bytes, the pages compared
-/// under flights' writes, the changed runs put in there, and the runs sent
-/// up as patches ([`Shadow::card_patches_shorter`]). Read by
-/// [`under_by_copy_line`]; nothing else reads it, and nothing is noted
+/// frame line: by copy (its title address), its notes ([`UnderCopy`]). Read
+/// by [`under_by_copy_line`]; nothing else reads it, and nothing is noted
 /// without the meter.
-static UNDER_BY_COPY: Mutex<Option<std::collections::HashMap<usize, [u64; 4]>>> = Mutex::new(None);
+static UNDER_BY_COPY: Mutex<Option<std::collections::HashMap<usize, UnderCopy>>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' meter of [`UNDER_BY_COPY`] on this thread.
+    static UNDER_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Copy `at`'s notes (`len` bytes), with the meter on.
+fn under_with(at: usize, len: u64, f: impl FnOnce(&mut UnderCopy)) {
+    #[cfg(test)]
+    let on = crate::lockmeter::on() || UNDER_IN_TEST.get();
+    #[cfg(not(test))]
+    let on = crate::lockmeter::on();
+    if !on {
+        return;
+    }
+    let mut map = UNDER_BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_or_insert_with(Default::default).entry(at).or_insert_with(|| UnderCopy { len, lo: u64::MAX, ..Default::default() });
+    f(entry);
+}
 
 /// Notes `pages`, `runs` and `patches` of copy `at` (`len` bytes) in
 /// [`UNDER_BY_COPY`], with the meter on.
 fn under_note(at: usize, len: u64, pages: u64, runs: u64, patches: u64) {
-    if !crate::lockmeter::on() {
-        return;
+    under_with(at, len, |c| {
+        c.pages += pages;
+        c.runs += runs;
+        c.patches += patches;
+    });
+}
+
+/// Title page `page` of copy `at` was rewritten under flights' writes, with
+/// `runs` changed runs put in.
+fn under_page(at: usize, len: u64, page: usize, runs: u64) {
+    under_with(at, len, |c| {
+        c.hist[UNDER_HIST.iter().take_while(|&&b| runs >= b).count()] += 1;
+        c.rewritten.insert(page);
+    });
+}
+
+/// What shaders wrote in title page `page` of copy `at` came back (a merge).
+fn under_landed(at: usize, len: u64, page: usize) {
+    under_with(at, len, |c| {
+        c.landed += 1;
+        c.landed_rewritten += u64::from(c.rewritten.contains(&page));
+    });
+}
+
+thread_local! {
+    /// While a draw binds its views (`crate::draw`): how a shader write
+    /// declared now is bound (1 a root view, 2 a view in a table; 0 outside
+    /// a draw's binding), the draw's pipeline (title object) and its name,
+    /// which lives as long as the binding. Read by the meter alone.
+    static DECLARING: std::cell::Cell<(u8, usize, *const String)> = const { std::cell::Cell::new((0, 0, std::ptr::null())) };
+}
+
+/// Until dropped: shader writes declared on this thread are bound as
+/// `kind` (see [`DECLARING`]), by pipeline `pipeline` named `name`
+/// (`None`: the one set before). The setting before comes back.
+pub(crate) struct Declaring((u8, usize, *const String));
+
+impl Drop for Declaring {
+    fn drop(&mut self) {
+        DECLARING.set(self.0);
     }
-    let mut map = UNDER_BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = map.get_or_insert_with(Default::default).entry(at).or_insert([len, 0, 0, 0]);
-    entry[1] += pages;
-    entry[2] += runs;
-    entry[3] += patches;
+}
+
+/// [`Declaring`], with the meter on; nothing otherwise.
+pub(crate) fn declaring(kind: u8, pipeline: Option<(usize, &String)>) -> Option<Declaring> {
+    if !crate::lockmeter::on() {
+        return None;
+    }
+    let before = DECLARING.get();
+    let (pipeline, name) = pipeline.map_or((before.1, before.2), |(p, n)| (p, std::ptr::from_ref(n)));
+    DECLARING.set((kind, pipeline, name));
+    Some(Declaring(before))
 }
 
 /// For the frame log's reading of `frames` frames, with the meter on: the
@@ -2286,23 +2380,40 @@ pub(crate) fn under_by_copy_line(frames: f64) -> Option<String> {
     }
     let f = frames.max(1.0);
     let map = UNDER_BY_COPY.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-    let mut copies: Vec<(usize, [u64; 4])> = map.into_iter().collect();
-    let all: u64 = copies.iter().map(|(_, c)| c[2] + c[3]).sum();
-    copies.sort_unstable_by_key(|(at, c)| (std::cmp::Reverse(c[2] + c[3]), *at));
+    // The copies with something under flights' writes (the others are in
+    // the map for their declarations alone).
+    let mut copies: Vec<(usize, UnderCopy)> = map.into_iter().filter(|(_, c)| c.pages + c.runs + c.patches > 0).collect();
+    let all: u64 = copies.iter().map(|(_, c)| c.runs + c.patches).sum();
+    copies.sort_unstable_by_key(|(at, c)| (std::cmp::Reverse(c.runs + c.patches), *at));
     let top: Vec<String> = copies
         .iter()
         .take(5)
-        .map(|&(at, [len, pages, runs, patches])| {
+        .map(|(at, c)| {
+            let mut pipelines = c.pipelines.clone();
+            pipelines.sort_unstable_by_key(|p| std::cmp::Reverse(p.1));
+            let named: Vec<String> = pipelines.iter().take(2).map(|(_, n, name)| format!("{name} x{:.1}", *n as f64 / f)).collect();
             format!(
-                "{at:#x} ({:.1} MB): {:.0} runs put in over {:.1} pages, {:.0} patch runs",
-                len as f64 / (1 << 20) as f64,
-                runs as f64 / f,
-                pages as f64 / f,
-                patches as f64 / f
+                "{at:#x} ({:.1} MB): {:.0} runs put in over {:.1} pages, {:.0} patch runs; pages by runs put in \
+                 (<16, <256, <1024, <4096, <8192, more) {:?}; declared a frame through a root view {:.1}, a table's \
+                 view {:.1}, outside a draw {:.1}, offsets {}; by {}; pages rewritten {}, of the {} pieces shaders \
+                 wrote that came back {} on a rewritten page",
+                c.len as f64 / (1 << 20) as f64,
+                c.runs as f64 / f,
+                c.pages as f64 / f,
+                c.patches as f64 / f,
+                c.hist,
+                c.declared[1] as f64 / f,
+                c.declared[2] as f64 / f,
+                c.declared[0] as f64 / f,
+                if c.lo <= c.hi { format!("{:#x}..{:#x}", c.lo, c.hi) } else { "none".to_owned() },
+                if named.is_empty() { "no draw".to_owned() } else { named.join(", ") },
+                c.rewritten.len(),
+                c.landed,
+                c.landed_rewritten,
             )
         })
         .collect();
-    let held: u64 = copies.iter().take(5).map(|(_, c)| c[2] + c[3]).sum();
+    let held: u64 = copies.iter().take(5).map(|(_, c)| c.runs + c.patches).sum();
     Some(format!(
         "under flights' writes by copy, a frame (VICTORY_GUARDS_METER): {} copies, {:.0} runs and patch runs in all; \
          the 5 with most ({:.1}% of them): {}",
@@ -2311,6 +2422,33 @@ pub(crate) fn under_by_copy_line(frames: f64) -> Option<String> {
         if all == 0 { 0.0 } else { 100.0 * held as f64 / all as f64 },
         if top.is_empty() { "none".to_owned() } else { top.join("; ") },
     ))
+}
+
+#[cfg(test)]
+mod under_meter_tests {
+    use super::*;
+
+    /// The notes of one copy: pages by runs in their bucket, the pages
+    /// rewritten, and the pieces that came back counted on a rewritten page
+    /// or not; nothing without the meter.
+    #[test]
+    fn rewritten_pages_and_landings_are_noted_by_copy() {
+        const AT: usize = 0x7ff0_1234_0000;
+        let page = AT / PAGE;
+        under_page(AT, 4 * PAGE as u64, page, 5);
+        assert!(UNDER_BY_COPY.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&AT)), "nothing without the meter");
+        UNDER_IN_TEST.set(true);
+        under_page(AT, 4 * PAGE as u64, page, 5);
+        under_page(AT, 4 * PAGE as u64, page + 1, 9000);
+        under_page(AT, 4 * PAGE as u64, page + 2, 1024);
+        under_landed(AT, 4 * PAGE as u64, page + 1);
+        under_landed(AT, 4 * PAGE as u64, page + 3);
+        UNDER_IN_TEST.set(false);
+        let c = UNDER_BY_COPY.lock().unwrap().as_mut().unwrap().remove(&AT).unwrap();
+        assert_eq!(c.hist, [1, 0, 0, 1, 0, 1]);
+        assert_eq!(c.rewritten.len(), 3);
+        assert_eq!((c.landed, c.landed_rewritten), (2, 1));
+    }
 }
 
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
@@ -2993,6 +3131,26 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        if crate::lockmeter::on() {
+            let (kind, pipeline, name) = DECLARING.get();
+            let from = address.saturating_sub(self.start);
+            under_with(self.start as usize, self.len, |c| {
+                c.declared[usize::from(kind.min(2))] += 1;
+                c.lo = c.lo.min(from);
+                c.hi = c.hi.max(from + len);
+                if pipeline != 0 {
+                    match c.pipelines.iter().position(|p| p.0 == pipeline) {
+                        Some(i) => c.pipelines[i].1 += 1,
+                        None if c.pipelines.len() < 8 && !name.is_null() => {
+                            // SAFETY: the binding that set it is running on
+                            // this thread ([`declaring`]).
+                            c.pipelines.push((pipeline, 1, unsafe { (*name).clone() }));
+                        }
+                        None => {}
+                    }
+                }
+            });
+        }
         // Shaders may change the copy: nothing of it is held current.
         if crate::watch::skip_unchanged() {
             self.unchanged.clear();
@@ -3277,6 +3435,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        under_landed(start, self.len, (start + at) / PAGE);
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
@@ -3675,6 +3834,7 @@ impl Shadow {
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     MERGED[2].fetch_add(bytes, Ordering::Relaxed);
                     under_note(self.start as usize, self.len, 0, runs.len() as u64, 0);
+                    under_page(self.start as usize, self.len, (start + at) / PAGE, runs.len() as u64);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         return true;
@@ -3695,6 +3855,7 @@ impl Shadow {
                         put += 1;
                     }
                     under_note(self.start as usize, self.len, 0, put, 0);
+                    under_page(self.start as usize, self.len, (start + at) / PAGE, put);
                 }
                 drop(before);
                 // Taken, if the range holds all of the page that is in the
@@ -3808,6 +3969,7 @@ impl Shadow {
             MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
             MERGED[2].fetch_add(taken as u64, Ordering::Relaxed);
             under_note(self.start as usize, self.len, 0, runs.len() as u64, 0);
+            under_page(self.start as usize, self.len, lo / PAGE, runs.len() as u64);
             if whole {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(at) = copied.get_mut(page - base) {
@@ -4391,6 +4553,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
+                under_landed(start, self.len, (start + at) / PAGE);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
@@ -4472,6 +4635,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        under_landed(start, self.len, (start + at) / PAGE);
         if self.put_back_own(start + at, &title[..]) {
             return n;
         }
