@@ -531,6 +531,38 @@ pub(crate) fn batch_cited() -> bool {
     *CITED.get_or_init(|| batch_set() || crate::ab::named(crate::ab::Key::IndirectBatch))
 }
 
+/// Whether compute work and draws whose shaders store to no buffer (only to
+/// textures: `crate::pipeline::Translated::stores` false, decoded from the
+/// console code) leave the open batch and the list's hoisted first part
+/// open (`VICTORY_INDIRECT_BATCH_TEXTURES=1`; off by default; the A/B may
+/// turn it). Off: every compute work ends them, as before.
+///
+/// Indirect arguments are buffers: a pass that stores to none cannot
+/// change a record a batch clamped before it. The rule of fxceless fork
+/// #995's `VICTORY_INDIRECT_BATCH=3` (a run is closed only where a stage
+/// stores), not its `=2` (a dispatch that stores does not close it), which
+/// showed wrong pictures in its run n38. In the yard the batches are about
+/// 1,000 a frame, nearly one per stretch between the title's 967
+/// dispatches (run …-0229).
+///
+/// shortcut: a texture placed in the memory of a buffer that holds
+/// arguments would be written without ending the batch; no such placement
+/// is known in the title.
+pub(crate) fn batch_textures_on() -> bool {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CITED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_BATCH_TEXTURES").is_some_and(|v| v == "1"));
+    *CITED.get_or_init(|| set || crate::ab::named(crate::ab::Key::IndirectBatchTextures))
+        && crate::ab::flag(crate::ab::Key::IndirectBatchTextures, set)
+}
+
+/// Whether recorded work with these shaders ends the open batch and the
+/// hoisted first part: compute work or shaders that store to buffers; with
+/// [`batch_textures_on`], only shaders that store to buffers.
+pub(crate) fn ends_argument_runs(compute: bool, stores: bool, textures_on: bool) -> bool {
+    stores || (compute && !textures_on)
+}
+
 fn batch_clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
@@ -1905,6 +1937,24 @@ void main() {
             assert_eq!(std::slice::from_raw_parts(a_ptr, BYTES), &a_before[..], "buffer A untouched");
             assert_eq!(std::slice::from_raw_parts(b_ptr, BYTES), &b_before[..], "buffer B untouched");
         }
+    }
+
+    /// Where a batch and a hoisted first part end: at compute work and at
+    /// shaders that store to buffers; with `VICTORY_INDIRECT_BATCH_TEXTURES`
+    /// only at shaders that store to buffers (compute that writes textures
+    /// alone leaves them open).
+    #[test]
+    fn texture_only_compute_leaves_argument_runs_open_only_when_asked() {
+        // As before.
+        assert!(ends_argument_runs(true, false, false), "compute work");
+        assert!(ends_argument_runs(true, true, false), "compute that stores to buffers");
+        assert!(ends_argument_runs(false, true, false), "a draw that stores to buffers");
+        assert!(!ends_argument_runs(false, false, false), "a draw that stores nothing");
+        // With the switch.
+        assert!(!ends_argument_runs(true, false, true), "compute that writes textures alone");
+        assert!(ends_argument_runs(true, true, true), "compute that stores to buffers still ends them");
+        assert!(ends_argument_runs(false, true, true), "a draw that stores to buffers still ends them");
+        assert!(!ends_argument_runs(false, false, true));
     }
 
     /// Which executions are hoisted: not a dispatch, not with a count

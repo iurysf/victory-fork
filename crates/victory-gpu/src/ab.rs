@@ -87,11 +87,12 @@ pub(crate) enum Key {
     IndirectHoist,
     IndirectBatch,
     CardSyncBatch,
+    IndirectBatchTextures,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 33] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 34] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -138,6 +139,9 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 33] = [
     (Key::IndirectBatch, "INDIRECT_BATCH", None),
     // Taken once per send-and-hash list (`crate::host::sync_batched`).
     (Key::CardSyncBatch, "CARD_SYNC_BATCH", None),
+    // A turn changes where the next batch or first part ends
+    // (`crate::indirect::batch_textures_on`).
+    (Key::IndirectBatchTextures, "INDIRECT_BATCH_TEXTURES", None),
     (Key::None, "NONE", None),
 ];
 

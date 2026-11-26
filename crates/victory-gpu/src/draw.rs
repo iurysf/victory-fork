@@ -264,7 +264,7 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 /// batches opened, and executions a batch could not take (clamped as
 /// before), since the last line.
 #[cfg(feature = "diagnostics")]
-static BATCHED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static BATCHED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The line of [`BATCHED`], per frame over `frames` frames, if batches are
 /// named in the run.
@@ -275,10 +275,13 @@ pub(crate) fn batch_line(frames: f64) {
     }
     let n: Vec<f64> = BATCHED.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     tracing::info!(
-        "indirect executions per frame clamped in batches (VICTORY_INDIRECT_BATCH): {:.0} read from a batch, {:.0} batches opened, {:.0} a batch could not take",
+        "indirect executions per frame clamped in batches (VICTORY_INDIRECT_BATCH): {:.0} read from a batch, {:.0} batches opened, {:.0} a batch could not take; \
+         compute work bound: {:.0} storing to textures alone (VICTORY_INDIRECT_BATCH_TEXTURES leaves batches open over them), {:.0} storing to buffers",
         n[0],
         n[1],
-        n[2]
+        n[2],
+        n[3],
+        n[4]
     );
 }
 
@@ -1092,7 +1095,16 @@ impl State {
         // Compute work, or shaders that store to buffers, may write records
         // a hoisted clamp read before the list ran: the list's first part
         // ends (`crate::indirect::hoist_on`).
-        if compute || p.stages.iter().any(|stage| stage.translated().stores) {
+        // With `VICTORY_INDIRECT_BATCH_TEXTURES`, compute that stores to no
+        // buffer leaves them open (`crate::indirect::batch_textures_on`).
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        // Diagnostics: compute work by what it stores, with batches named.
+        #[cfg(feature = "diagnostics")]
+        if compute && crate::indirect::batch_cited() {
+            BATCHED[if stores { 4 } else { 3 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let textures_on = (compute && !stores) && crate::indirect::batch_textures_on();
+        if crate::indirect::ends_argument_runs(compute, stores, textures_on) {
             list.end_hoisted_indirect();
             // And the open batch of clamped records ([`Batch`]).
             self.batch = None;
