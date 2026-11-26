@@ -269,7 +269,11 @@ fn apply_page(
     // (`HostHeap::mirror_copied_page`); one by one below with
     // `VICTORY_HEAP_SYNC_PAGE=0`.
     if page_at_once() {
-        return host.mirror_copied_page_with(slots, (start, step), from, page_bytes, prints);
+        return match prints {
+            // The serial pass: as before.
+            None => host.mirror_copied_page(slots, (start, step), from, page_bytes),
+            Some(_) => host.mirror_copied_page_with(slots, (start, step), from, page_bytes, prints),
+        };
     }
     let (mut looked, mut mirrored) = (0u64, 0u64);
     for index in slots {
