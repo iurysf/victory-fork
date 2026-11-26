@@ -465,6 +465,8 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // Diagnostics: the pass timed on the card (`VICTORY_CARD_METER_CLAMPS=1`).
+    let timed = crate::cardmeter::clamp_begin(l);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -498,6 +500,7 @@ fn record_clamp_as(
         }
         l.ResourceBarrier(&second[skip..]);
     }
+    crate::cardmeter::end(l, timed);
     true
 }
 
@@ -524,9 +527,28 @@ fn record_clamp_as(
 /// to its words 4 and 8 as the clamp's do. Bench (RTX 4070, 5,000 draws,
 /// 52 % not windowed): 16.6 -> 0.38 ms of the card and 6.1 -> 0.69 ms of
 /// recording.
+///
+/// The A/B within the run may turn it (`VICTORY_AB=INDIRECT_HOIST,...`):
+/// a list takes the switch once, at its first indirect execution after its
+/// reset ([`Hoisted::on`]), and the commands that end a first part end it
+/// whenever the switch is named at all ([`hoist_cited`]), so a list that
+/// takes it on mid-run has its first part where it would have been.
 pub(crate) fn hoist_on() -> bool {
+    hoist_cited() && crate::ab::flag(crate::ab::Key::IndirectHoist, hoist_set())
+}
+
+/// `VICTORY_INDIRECT_HOIST=1`: the run's own value of [`hoist_on`].
+fn hoist_set() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_HOIST").is_some_and(|v| v == "1"))
+}
+
+/// Whether the hoist is named in this run at all: set to 1, or turned by
+/// the A/B. Only then do the commands that end a list's first part note it
+/// (`crate::list`); never named, nothing of it runs.
+pub(crate) fn hoist_cited() -> bool {
+    static CITED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CITED.get_or_init(|| hoist_set() || crate::ab::named(crate::ab::Key::IndirectHoist))
 }
 
 /// The pass over a list's hoisted executions: `jobs` (uint4 each: the
@@ -732,6 +754,9 @@ const HOIST_JOBS: usize = 8192;
 pub(crate) struct Hoisted {
     /// Whether the first part is still open (from the list's reset).
     closed: bool,
+    /// [`hoist_on`] as this recording took it, at its first indirect
+    /// execution ([`Hoisted::on`]); `None` until then.
+    taken: Option<bool>,
     /// Per job: the buffer its records are read from, and the job.
     jobs: Vec<(ID3D12Resource, [u32; 4])>,
     /// Bytes of `dst` taken.
@@ -753,9 +778,17 @@ impl Hoisted {
     /// At the list's reset: a new first part.
     pub(crate) fn reset(&mut self) {
         self.closed = false;
+        self.taken = None;
         self.jobs.clear();
         self.used = 0;
         self.budget = None;
+    }
+
+    /// Whether this recording hoists: [`hoist_on`] when it is first asked
+    /// after the reset, the same answer until the next one (an A/B turn
+    /// changes the lists recorded after it, never half a list).
+    pub(crate) fn on(&mut self) -> bool {
+        *self.taken.get_or_insert_with(hoist_on)
     }
 
     /// The first part ends: what follows is clamped as before.
@@ -835,6 +868,9 @@ impl Hoisted {
 /// # Safety
 /// An open list; live buffers; the jobs at `jobs` in mapped memory.
 unsafe fn record_hoisted(c: &Clamp, l: &ID3D12GraphicsCommandList, jobs: u64, dst: &ID3D12Resource, budget: u64, runs: &[(u64, u32, u32)]) {
+    // Diagnostics: the prelude's pass timed as a clamp pass
+    // (`VICTORY_CARD_METER_CLAMPS=1`).
+    let timed = crate::cardmeter::clamp_begin(l);
     // SAFETY: as the caller says.
     unsafe {
         l.ResourceBarrier(&[uav_barrier(), transition(dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
@@ -855,6 +891,7 @@ unsafe fn record_hoisted(c: &Clamp, l: &ID3D12GraphicsCommandList, jobs: u64, ds
         }
         l.ResourceBarrier(&[uav_barrier(), transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]);
     }
+    crate::cardmeter::end(l, timed);
 }
 
 /// Whether an execution can have its clamp hoisted ([`hoist_on`]): not a
@@ -1643,6 +1680,14 @@ void main() {
         assert!(h.closed(), "a compute or a copy ends the part");
         h.reset();
         assert!(!h.closed() && h.is_empty(), "a reset opens it again");
+        // The switch is taken once a recording: an A/B turn reaches the
+        // next list, not the rest of this one.
+        h.taken = Some(true);
+        assert!(h.on(), "taken on");
+        h.taken = Some(false);
+        assert!(!h.on(), "taken off stays off until the reset");
+        h.reset();
+        assert_eq!(h.taken, None, "a reset takes it again");
     }
 
     /// The compare's groups (a thread per 16-byte line of a piece, their

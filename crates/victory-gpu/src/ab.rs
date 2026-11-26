@@ -124,14 +124,11 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 30] = [
              (`Shadow::gpu_writes`); turned on again, it would trust ranges from before",
         ),
     ),
-    (
-        Key::IndirectHoist,
-        "INDIRECT_HOIST",
-        Some(
-            "read at each indirect execution recorded and again when the list ends (`list::end_hoist`); a turn \
-             between them leaves a list half hoisted",
-        ),
-    ),
+    // Each host list takes the switch once, at its first indirect execution
+    // after a reset, and the commands that end a list's first part end it
+    // whenever the switch is named at all (`crate::indirect::hoist_cited`):
+    // a turn changes the lists recorded after it, never half a list.
+    (Key::IndirectHoist, "INDIRECT_HOIST", None),
     (Key::None, "NONE", None),
 ];
 
@@ -311,7 +308,7 @@ fn plan() -> Option<&'static Plan> {
 static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The bits of `plan`'s switches ([`MASK`]).
-fn mask(plan: &Plan) -> u32 {
+fn mask(plan: &Plan) -> u64 {
     plan.keys.iter().fold(0, |m, k| m | 1 << k.0 as u32)
 }
 
@@ -350,8 +347,9 @@ fn early() -> Option<f64> {
     *EARLY.get_or_init(|| amount(std::env::var("VICTORY_AB_EARLY").ok().as_deref()).filter(|&ms| ms > 0.0))
 }
 
-/// The switches the A/B turns, a bit each ([`Key`] as a number).
-static MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The switches the A/B turns, a bit each ([`Key`] as a number): 64 of
+/// them at most (there were 32 bits, and the table had come to 30 entries).
+static MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Whether the plan was read.
 static READ: AtomicBool = AtomicBool::new(false);
 /// Whether arm B is on.
@@ -364,6 +362,12 @@ fn turning(key: Key) -> bool {
         READ.store(true, Relaxed);
     }
     MASK.load(Relaxed) & 1 << key as u32 != 0 && B.load(Relaxed)
+}
+
+/// Whether a plan of `VICTORY_AB` that was not refused names `key`: for a
+/// switch whose bookkeeping must run in both arms, and only when it may turn.
+pub(crate) fn named(key: Key) -> bool {
+    plans().iter().any(|p| p.keys.iter().any(|k| k.0 == key))
 }
 
 /// A switch that is on or off: `run` as the run sets it (A), its opposite
@@ -767,7 +771,8 @@ mod tests {
         assert_eq!(parse("NONE").unwrap().readings, 4);
         let refused = parse("SKIP_UNCHANGED,4").unwrap_err();
         assert!(refused.contains("cannot turn within a run"), "{refused}");
-        assert!(parse("INDIRECT_HOIST").unwrap_err().contains("half hoisted"));
+        assert_eq!(parse("INDIRECT_HOIST,4,16").unwrap().keys, vec![(Key::IndirectHoist, None)]);
+        assert!(parse("INDIRECT_HOIST=1,4").is_err(), "an on/off switch takes no value");
         assert!(parse("RELAY,4").unwrap_err().contains("not a switch"));
         assert!(parse("CARD_QUEUE=3,4").is_err(), "an on/off switch takes no value");
         assert!(parse("CARD_QUEUE,1").is_err(), "a block needs a reading left out and one kept");

@@ -41,6 +41,9 @@ pub(crate) enum Kind {
     /// Inside one of those: from where a pipeline is bound to where the
     /// next one is, or the list ends ([`begin_named`]).
     Pipeline,
+    /// Inside one of those: a pass of ours that bounds indirect arguments,
+    /// from before its first wait to after its last ([`clamp_begin`]).
+    Clamp,
 }
 
 /// Pairs of timestamps in the ring.
@@ -81,6 +84,9 @@ struct Meter {
     /// The same by pipeline ([`begin_named`]): the times it was bound and
     /// the microseconds until the next one was.
     by_pipeline: std::collections::HashMap<String, (u64, u64)>,
+    /// Since the last table: passes of [`Kind::Clamp`] read, their
+    /// microseconds, and the longest.
+    clamps: (u64, u64, u64),
     /// Frames since the last table.
     frames: u64,
     /// What each place held when it was last read: a place the card has
@@ -150,10 +156,33 @@ fn make() -> Option<Meter> {
             names: Default::default(),
             by_name: Default::default(),
             by_pipeline: Default::default(),
+            clamps: (0, 0, 0),
             frames: 0,
             seen: vec![(0, 0); PAIRS as usize],
         })
     }
+}
+
+/// Whether each pass of ours that bounds indirect arguments is timed on its
+/// own (`VICTORY_CARD_METER_CLAMPS=1`; off by default: two more queries and
+/// a resolve a pass, some 2,500 passes a frame in the yard). What the card
+/// spends in those passes, from before the wait that opens each to after the
+/// one that closes it, is logged with the table of lists every 256 frames:
+/// the clamps' own share of "all other lists". Not what they cost the
+/// title's work around them (the card going from drawing to compute and
+/// back); that is the difference an A/B without them shows.
+pub(crate) fn clamps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_CLAMPS").is_some_and(|v| v == "1"))
+}
+
+/// A clamp pass begins here on `list` ([`clamps`]): [`Span::NONE`] when
+/// clamps are not timed.
+pub(crate) fn clamp_begin(list: &ID3D12GraphicsCommandList) -> Span {
+    if !clamps() {
+        return Span::NONE;
+    }
+    begin(list, Kind::Clamp)
 }
 
 /// A list of `kind` begins here: the first timestamp of a pair.
@@ -305,6 +334,11 @@ pub(crate) fn collect() {
                     e.1 += us;
                 }
             }
+            Kind::Clamp => {
+                m.clamps.0 += 1;
+                m.clamps.1 += us;
+                m.clamps.2 = m.clamps.2.max(us);
+            }
             Kind::Pipeline => {
                 if let Some(name) = m.names.remove(&pair) {
                     let e = m.by_pipeline.entry(name).or_insert((0, 0));
@@ -329,6 +363,17 @@ pub(crate) fn collect() {
         );
         for (name, (n, us)) in table.into_iter().take(24) {
             tracing::info!("  card {:6.2} ms a frame in {:5.1} lists: {name}", us as f64 / 1e3 / frames, n as f64 / frames);
+        }
+        if clamps() {
+            let (n, us, longest) = std::mem::take(&mut m.clamps);
+            tracing::info!(
+                "card time of our passes that bound indirect arguments (VICTORY_CARD_METER_CLAMPS=1), per frame over {} frames: {:.2} ms in {:.0} passes ({:.2} us each, the longest {} us); inside \"all other lists\"",
+                m.frames,
+                us as f64 / 1e3 / frames,
+                n as f64 / frames,
+                us as f64 / n.max(1) as f64,
+                longest
+            );
         }
         if !m.by_pipeline.is_empty() {
             let mut table: Vec<(String, (u64, u64))> = m.by_pipeline.drain().collect();

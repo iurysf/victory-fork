@@ -3184,7 +3184,9 @@ impl State {
         // (`crate::indirect::hoist_on`): it reads them from the list's
         // buffer, with no clamp, barrier or pipeline of ours here. A count
         // buffer, a dispatch, a shader that stores, or no room end the part.
-        if crate::indirect::hoist_on() {
+        // Taken once per recording (`crate::indirect::Hoisted::on`): the
+        // A/B may turn it between lists, never inside one.
+        if crate::indirect::hoist_cited() && list.hoisted().on() {
             let stores = p.stages.iter().any(|stage| stage.translated().stores);
             let closed = list.hoisted().closed();
             let hoistable = crate::indirect::hoistable(kind, count.is_some(), max, stores, closed);

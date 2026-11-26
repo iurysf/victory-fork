@@ -141,10 +141,12 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// A command of the title's that may write buffers (a copy, a resolve, a
 /// clear) ends its list's first part: no indirect clamp after it is
-/// hoisted into the prelude (`crate::indirect::hoist_on`).
+/// hoisted into the prelude (`crate::indirect::hoist_on`). Noted whenever
+/// the hoist is named in the run, on or off, so a list that takes it on
+/// after an A/B turn has its first part where it would have been.
 #[cfg(windows)]
 fn end_hoist(this: This) {
-    if crate::indirect::hoist_on()
+    if crate::indirect::hoist_cited()
         && let Some(list) = host_list(this)
     {
         list.end_hoisted_indirect();
