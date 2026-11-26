@@ -229,18 +229,13 @@ impl Table {
         }
         Some(u64::from(self.base + i * SLOT))
     }
-
-    /// The jobs so far.
-    pub(crate) fn len(&self) -> usize {
-        self.jobs as usize
-    }
 }
 
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
-pub(crate) fn record(
+pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
