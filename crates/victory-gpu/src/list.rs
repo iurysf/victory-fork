@@ -151,6 +151,11 @@ fn end_hoist(this: This) {
     {
         list.end_hoisted_indirect();
     }
+    // The same command ends the open batch of clamped records: a record it
+    // writes must be clamped after it (`crate::indirect::batch`).
+    if crate::indirect::batch_cited() {
+        with_state(this, |_, state| state.end_batch());
+    }
 }
 
 /// Runs `f` with the host list and draw state of a title list, if there

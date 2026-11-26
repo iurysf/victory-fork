@@ -84,11 +84,12 @@ pub(crate) enum Key {
     HeapSyncWide,
     SkipUnchanged,
     IndirectHoist,
+    IndirectBatch,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 30] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 31] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -129,6 +130,9 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 30] = [
     // whenever the switch is named at all (`crate::indirect::hoist_cited`):
     // a turn changes the lists recorded after it, never half a list.
     (Key::IndirectHoist, "INDIRECT_HOIST", None),
+    // A turn ends the open batch or opens one at the next execution: each
+    // batch is whole where it is (`crate::indirect::batch`).
+    (Key::IndirectBatch, "INDIRECT_BATCH", None),
     (Key::None, "NONE", None),
 ];
 

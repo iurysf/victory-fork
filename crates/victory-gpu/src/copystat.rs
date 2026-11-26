@@ -1451,6 +1451,7 @@ pub(crate) fn log(frames: f64) {
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
     crate::draw::window_line(frames);
+    crate::draw::batch_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
