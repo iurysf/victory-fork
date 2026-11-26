@@ -798,6 +798,9 @@ pub fn frame() {
         tracing::info!("{line}");
     }
     tracing::info!("{}", under_line(&mean(&frames.iter().collect::<Vec<_>>())));
+    if let Some(line) = crate::shadow::under_by_copy_line(frames.len() as f64) {
+        tracing::info!("{line}");
+    }
     tracing::info!("{}", crate::watch::askings_line(frames.len() as f64));
     if let Some(line) = crate::shadow::echo_line(frames.len() as f64) {
         tracing::info!("{line}");

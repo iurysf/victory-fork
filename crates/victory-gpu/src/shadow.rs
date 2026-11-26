@@ -2244,6 +2244,63 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// With `VICTORY_GUARDS_METER` (`crate::lockmeter::on`) only, since the last
+/// frame line: by copy (its title address), its bytes, the pages compared
+/// under flights' writes, the changed runs put in there, and the runs sent
+/// up as patches ([`Shadow::card_patches_shorter`]). Read by
+/// [`under_by_copy_line`]; nothing else reads it, and nothing is noted
+/// without the meter.
+static UNDER_BY_COPY: Mutex<Option<std::collections::HashMap<usize, [u64; 4]>>> = Mutex::new(None);
+
+/// Notes `pages`, `runs` and `patches` of copy `at` (`len` bytes) in
+/// [`UNDER_BY_COPY`], with the meter on.
+fn under_note(at: usize, len: u64, pages: u64, runs: u64, patches: u64) {
+    if !crate::lockmeter::on() {
+        return;
+    }
+    let mut map = UNDER_BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.get_or_insert_with(Default::default).entry(at).or_insert([len, 0, 0, 0]);
+    entry[1] += pages;
+    entry[2] += runs;
+    entry[3] += patches;
+}
+
+/// For the frame log's reading of `frames` frames, with the meter on: the
+/// five copies with the most runs under flights' writes and patches, and
+/// the share of all of them they hold. `None` without the meter.
+pub(crate) fn under_by_copy_line(frames: f64) -> Option<String> {
+    if !crate::lockmeter::on() {
+        return None;
+    }
+    let f = frames.max(1.0);
+    let map = UNDER_BY_COPY.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut copies: Vec<(usize, [u64; 4])> = map.into_iter().collect();
+    let all: u64 = copies.iter().map(|(_, c)| c[2] + c[3]).sum();
+    copies.sort_unstable_by_key(|(at, c)| (std::cmp::Reverse(c[2] + c[3]), *at));
+    let top: Vec<String> = copies
+        .iter()
+        .take(5)
+        .map(|&(at, [len, pages, runs, patches])| {
+            format!(
+                "{at:#x} ({:.1} MB): {:.0} runs put in over {:.1} pages, {:.0} patch runs",
+                len as f64 / (1 << 20) as f64,
+                runs as f64 / f,
+                pages as f64 / f,
+                patches as f64 / f
+            )
+        })
+        .collect();
+    let held: u64 = copies.iter().take(5).map(|(_, c)| c[2] + c[3]).sum();
+    Some(format!(
+        "under flights' writes by copy, a frame (VICTORY_GUARDS_METER): {} copies, {:.0} runs and patch runs in all; \
+         the 5 with most ({:.1}% of them): {}",
+        copies.len(),
+        all as f64 / f,
+        if all == 0 { 0.0 } else { 100.0 * held as f64 / all as f64 },
+        if top.is_empty() { "none".to_owned() } else { top.join("; ") },
+    ))
+}
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -3583,6 +3640,7 @@ impl Shadow {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
+                under_note(self.start as usize, self.len, 1, 0, 0);
                 let at = lo - start;
                 if self.card.is_some() {
                     // SAFETY: inside the mapping of the copy's CPU side,
@@ -3604,6 +3662,7 @@ impl Shadow {
                     self.card_changed_runs(at, &runs);
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     MERGED[2].fetch_add(bytes, Ordering::Relaxed);
+                    under_note(self.start as usize, self.len, 0, runs.len() as u64, 0);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         return true;
@@ -3612,6 +3671,7 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                    let mut put = 0u64;
                     for (r, m) in changed_runs(title, held) {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
@@ -3620,7 +3680,9 @@ impl Shadow {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        put += 1;
                     }
+                    under_note(self.start as usize, self.len, 0, put, 0);
                 }
                 drop(before);
                 // Taken, if the range holds all of the page that is in the
@@ -3717,6 +3779,7 @@ impl Shadow {
                 continue;
             };
             MERGED[0].fetch_add(1, Ordering::Relaxed);
+            under_note(self.start as usize, self.len, 1, 0, 0);
             if !room.take(&runs, patchable) {
                 over = true;
                 break;
@@ -3732,6 +3795,7 @@ impl Shadow {
             self.card_changed_runs(at, &runs);
             MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
             MERGED[2].fetch_add(taken as u64, Ordering::Relaxed);
+            under_note(self.start as usize, self.len, 0, runs.len() as u64, 0);
             if whole {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(at) = copied.get_mut(page - base) {
@@ -4166,6 +4230,7 @@ impl Shadow {
         let patching = std::time::Instant::now();
         crate::framelog::add(crate::framelog::T::PatchCopies, 1);
         crate::framelog::add(crate::framelog::T::PatchRuns, ranges.len() as u64);
+        under_note(self.start as usize, self.len, 0, 0, ranges.len() as u64);
         if ranges.len() >= crate::underwide::RUNS_A_PIECE {
             crate::framelog::add(crate::framelog::T::PatchCopiesBig, 1);
         }
