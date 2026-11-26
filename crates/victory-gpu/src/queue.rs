@@ -1918,7 +1918,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         // plane's description is 0x48 bytes and starts as the first does.
         const READABLE: u32 = 0x80;
         // SAFETY: the title passes `planes` plane descriptions.
-        let second = unsafe { second_plane(planes, plane_parameters, resource) }
+        // Only when a run asks for the second plane: never asked, a present
+        // shows its first plane alone, as before.
+        let second = (compose_planes().then(|| unsafe { second_plane(planes, plane_parameters, resource) }).flatten())
             .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
         let over = second.map(|(r, t)| {
             let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
@@ -1940,6 +1942,16 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
 }
 /// The bytes from one plane's description to the next in a present.
 const PLANE_STRIDE: usize = 0x48;
+/// Whether a present's second plane (a Series S title's interface over
+/// its game picture) is drawn over the first (`VICTORY_SECOND_PLANE=1`, or
+/// with `VICTORY_UPSCALER`, the FidelityFX path's switch; off otherwise:
+/// the first plane alone is shown, as before).
+fn compose_planes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_SECOND_PLANE").is_some_and(|v| v == "1") || std::env::var_os("VICTORY_UPSCALER").is_some()
+    })
+}
 
 /// The first resource of a present's second plane, if it has one that is not
 /// the first plane's (`first`): what is drawn over the first.

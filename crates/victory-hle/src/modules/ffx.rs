@@ -17,6 +17,18 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 
+/// Whether the title's FidelityFX calls are taken here at all: only when a
+/// run asks for the FidelityFX path on purpose (`VICTORY_UPSCALER`, which
+/// makes the title pick it on Series X, or `VICTORY_FFX_CAP_OUTPUT=1`).
+/// Otherwise nothing of this module is bound: the title's imports of
+/// `ffxDispatch` and `ffxCreateContext` are its own DLL's, as before.
+pub fn active() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_UPSCALER").is_some() || std::env::var_os("VICTORY_FFX_CAP_OUTPUT").is_some_and(|v| v == "1")
+    })
+}
+
 /// The DLL whose `ffxDispatch` is taken.
 pub const LOADER: &str = "amd_fidelityfx_loader_xbox.dll";
 

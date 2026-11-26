@@ -143,13 +143,18 @@ pub fn run(
     });
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    // The FidelityFX calls are taken only when a run asks for that path
+    // (`victory_hle::modules::ffx::active`).
+    let ffx = victory_hle::modules::ffx::active();
     for (name, dll) in &dlls {
-        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+        if ffx
+            && name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
             && let Some(real) = dll.export("ffxDispatch")
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
         }
-        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+        if ffx
+            && name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
             && let Some(real) = dll.export("ffxCreateContext")
         {
             victory_hle::modules::ffx::set_real_create(real);
@@ -210,7 +215,11 @@ pub fn run(
             self.0.resolve(dll, symbol)
         }
     }
-    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls), policy)?);
+    if ffx {
+        show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls), policy)?);
+    } else {
+        show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
