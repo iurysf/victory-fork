@@ -805,6 +805,9 @@ pub fn frame() {
     if let Some(line) = crate::shadow::echo_line(frames.len() as f64) {
         tracing::info!("{line}");
     }
+    if let Some(line) = crate::shadow::submit_asks_line(frames.len() as f64) {
+        tracing::info!("{line}");
+    }
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
         if i == 0 {
             tracing::info!("{line}{ab}");

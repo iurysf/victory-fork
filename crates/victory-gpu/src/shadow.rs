@@ -4691,7 +4691,74 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// The submission's thread times one ask in this many ([`SUBMIT_ASKS`]).
+const SUBMIT_ASKS_TIMED: u32 = 8;
+
+/// Since the last frame line, of the asks for a host copy made by the
+/// submission's thread (`victory-submit`; the heaps' pass, `sync_heaps`,
+/// asks once for each slot it mirrors): asks, asks timed (one in
+/// [`SUBMIT_ASKS_TIMED`]), and the nanoseconds of those, waits for the
+/// tables' locks and the making of a copy included. A meter with
+/// `VICTORY_GUARDS_METER` (`crate::lockmeter::on`): without it, a look at
+/// a setting read once and nothing else. With it, on that thread: a look
+/// at a thread-local and a counter at each ask, and two readings of the
+/// clock at one ask in eight; other threads, the look at the thread-local.
+pub(crate) static SUBMIT_ASKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+thread_local! {
+    /// Whether this is the submission's thread (`None`: not looked at yet),
+    /// and its asks so far.
+    static SUBMIT_ASKER: std::cell::Cell<(Option<bool>, u32)> = const { std::cell::Cell::new((None, 0)) };
+}
+
+/// Frame-log line for [`SUBMIT_ASKS`], when the submission's thread asked.
+pub(crate) fn submit_asks_line(frames: f64) -> Option<String> {
+    let [asks, timed, ns] = [0, 1, 2].map(|i| SUBMIT_ASKS[i].swap(0, Ordering::Relaxed));
+    if asks == 0 {
+        return None;
+    }
+    let f = frames.max(1.0);
+    // The time of all asks, from the timed ones.
+    let ms = if timed == 0 { 0.0 } else { ns as f64 * asks as f64 / timed as f64 / 1e6 / f };
+    Some(format!(
+        "asks for a buffer's host copy by the submission's thread, a frame: {:.0}, {ms:.2} ms (from {:.0} timed, one in {SUBMIT_ASKS_TIMED}; {:.2} us an ask; the tables' locks and the making of copies included)",
+        asks as f64 / f,
+        timed as f64 / f,
+        if timed == 0 { 0.0 } else { ns as f64 / timed as f64 / 1e3 },
+    ))
+}
+
+#[cfg(test)]
+static SUBMIT_ASKS_IN_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    #[cfg(test)]
+    let metered = crate::lockmeter::on() || SUBMIT_ASKS_IN_TEST.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let metered = crate::lockmeter::on();
+    if !metered {
+        return lookup_tables(address, len, any);
+    }
+    let (submit, n) = SUBMIT_ASKER.get();
+    let submit = submit.unwrap_or_else(|| std::thread::current().name() == Some("victory-submit"));
+    if !submit {
+        SUBMIT_ASKER.set((Some(false), 0));
+        return lookup_tables(address, len, any);
+    }
+    SUBMIT_ASKER.set((Some(true), n.wrapping_add(1)));
+    SUBMIT_ASKS[0].fetch_add(1, Ordering::Relaxed);
+    if !n.is_multiple_of(SUBMIT_ASKS_TIMED) {
+        return lookup_tables(address, len, any);
+    }
+    let asking = std::time::Instant::now();
+    let found = lookup_tables(address, len, any);
+    SUBMIT_ASKS[1].fetch_add(1, Ordering::Relaxed);
+    SUBMIT_ASKS[2].fetch_add(asking.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    found
+}
+
+/// [`lookup`] in the tables themselves.
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if shadow_shared() {
         // Nearly every ask finds its copy made: under the shared lock.
@@ -5579,6 +5646,31 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod shared_tests {
     use super::*;
+
+    /// The meter of the submission's asks counts the asks of a thread named
+    /// `victory-submit`, all of them, and times one in
+    /// [`SUBMIT_ASKS_TIMED`]; another thread's asks are not counted. (An
+    /// ask whose range runs past the end of the address space is answered
+    /// at once, with nothing: no copy is made.)
+    #[test]
+    fn the_submission_threads_asks_are_counted_and_one_in_eight_timed() {
+        // As with `VICTORY_GUARDS_METER`.
+        SUBMIT_ASKS_IN_TEST.store(true, Ordering::Relaxed);
+        let ask = || {
+            for _ in 0..2 * SUBMIT_ASKS_TIMED {
+                assert!(find(u64::MAX - 8, 64).is_none());
+            }
+        };
+        let before: [u64; 2] = [0, 1].map(|i| SUBMIT_ASKS[i].load(Ordering::Relaxed));
+        std::thread::Builder::new().name("victory-render".into()).spawn(ask).unwrap().join().unwrap();
+        let after_other: [u64; 2] = [0, 1].map(|i| SUBMIT_ASKS[i].load(Ordering::Relaxed));
+        assert_eq!(after_other, before, "another thread's asks are not counted");
+        std::thread::Builder::new().name("victory-submit".into()).spawn(ask).unwrap().join().unwrap();
+        let after: [u64; 2] = [0, 1].map(|i| SUBMIT_ASKS[i].load(Ordering::Relaxed));
+        SUBMIT_ASKS_IN_TEST.store(false, Ordering::Relaxed);
+        assert_eq!(after[0] - before[0], u64::from(2 * SUBMIT_ASKS_TIMED));
+        assert_eq!(after[1] - before[1], 2);
+    }
 
     /// With [`shadow_shared`] off and on, six askers of the same eight
     /// title buffers and of a window outside them each get the one copy
