@@ -795,6 +795,9 @@ pub fn frame() {
     tracing::info!("{}", crate::lockmeter::line(frames.len() as f64));
     tracing::info!("{}", under_line(&mean(&frames.iter().collect::<Vec<_>>())));
     tracing::info!("{}", crate::watch::askings_line(frames.len() as f64));
+    if let Some(line) = crate::shadow::echo_line(frames.len() as f64) {
+        tracing::info!("{line}");
+    }
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
         if i == 0 {
             tracing::info!("{line}{ab}");
