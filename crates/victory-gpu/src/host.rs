@@ -6377,6 +6377,9 @@ impl Host {
         drop(step);
         let steps = std::time::Instant::now();
         let step = crate::lockmeter::within(crate::lockmeter::Ctx::Steps);
+        if refresh_ahead_on() {
+            batch.refresh_ahead(runs);
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -8041,6 +8044,67 @@ fn refresh_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the copies a submission's shaders write are brought up to date
+/// together on worker threads ahead of its steps (`VICTORY_REFRESH_AHEAD=1`;
+/// off by default). After avatarmanz dc2a3ad.
+fn refresh_ahead_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::RefreshAhead, run)
+}
+
+/// What a step is to the copies' refreshes, for [`written_spans_ranges`].
+enum Touch {
+    /// A refresh of a copy (by address), from, to.
+    Refresh(usize, usize, usize),
+    /// The copy is given to shaders.
+    Write(usize),
+    /// Title memory is written.
+    Title,
+    Nothing,
+}
+
+/// Of `steps`, up to the first that writes title memory: the copies given to
+/// shaders, each with the disjoint ranges (merged within `gap`) its refreshes
+/// before that cover.
+fn written_spans_ranges(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usize, Vec<(usize, usize)>)> {
+    // (Disjoint ranges, given to shaders.)
+    let mut spans: std::collections::HashMap<usize, (Vec<(usize, usize)>, bool)> = std::collections::HashMap::new();
+    for step in steps {
+        match step {
+            Touch::Refresh(copy, from, to) => {
+                if from < to {
+                    let span = spans.entry(copy).or_insert_with(|| (Vec::new(), false));
+                    if !span.1 {
+                        push_range(&mut span.0, gap, from, to);
+                    }
+                }
+            }
+            // (Not refreshed before: nothing of it is due.)
+            Touch::Write(copy) => {
+                if let Some(span) = spans.get_mut(&copy) {
+                    span.1 = true;
+                }
+            }
+            Touch::Title => break,
+            Touch::Nothing => {}
+        }
+    }
+    spans
+        .into_iter()
+        .filter(|(_, s)| s.1 && !s.0.is_empty())
+        .map(|(copy, (ranges, _))| (copy, ranges))
+        .collect()
+}
+
+#[cfg(test)]
+fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
+    written_spans_ranges(steps, usize::MAX)
+        .into_iter()
+        .filter_map(|(copy, ranges)| Some((copy, ranges.first()?.0, ranges.last()?.1)))
+        .collect()
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -8067,6 +8131,9 @@ struct Batch {
     /// written since, disjoint, joined only where they touch (no gap: a
     /// byte between two copied ranges was not copied).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
+    /// Copies (by address) brought up to date ahead of the steps
+    /// ([`Batch::refresh_ahead`]), and their disjoint ranges.
+    ahead: std::collections::HashMap<usize, Vec<(usize, usize)>>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -8085,6 +8152,9 @@ impl Batch {
         }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.ahead.get(&key).is_some_and(|ranges| covered(ranges, address, end)) {
+            return;
+        }
         // Brought up to date in this submission already ([`refresh_once`];
         // nothing is in `current` without the switch).
         if self.current.get(&key).is_some_and(|(_, ranges)| covered(ranges, address, end)) {
@@ -8107,6 +8177,8 @@ impl Batch {
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        // From here on it is refreshed around what the shaders write.
+        self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
@@ -8162,6 +8234,7 @@ impl Batch {
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
         self.current.clear();
+        self.ahead.clear();
     }
 
     /// [`Batch::title_written`] for a write of ours whose place is known
@@ -8176,6 +8249,73 @@ impl Batch {
             cut_range(&mut entry.1, at, end);
             !entry.1.is_empty()
         });
+        self.ahead.retain(|_, ranges| {
+            cut_range(ranges, at, end);
+            !ranges.is_empty()
+        });
+    }
+
+    /// Before the steps of `runs` ([`refresh_ahead_on`]): refreshes of copies
+    /// shaders write, up to the first step that writes title memory, run in
+    /// parallel on `crate::shadow::wide_run`.
+    fn refresh_ahead(&mut self, runs: &[&HostList]) {
+        let skip_unchanged = crate::watch::skip_unchanged();
+        let mut copies: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>> =
+            std::collections::HashMap::new();
+        let mut touches = Vec::new();
+        'steps: for list in runs {
+            for step in &list.deferred().copies {
+                touches.push(match step {
+                    Step::Refresh(shadow, at, len) => {
+                        if skip_unchanged && shadow.unchanged_at(*at, *len) {
+                            Touch::Nothing
+                        } else {
+                            let key = std::sync::Arc::as_ptr(shadow) as usize;
+                            copies.entry(key).or_insert_with(|| shadow.clone());
+                            Touch::Refresh(key, *at, *at + *len)
+                        }
+                    }
+                    Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
+                    Step::Copy(..) | Step::Run(_) => {
+                        touches.push(Touch::Title);
+                        break 'steps;
+                    }
+                    _ => Touch::Nothing,
+                });
+            }
+        }
+        let due: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            written_spans_ranges(touches.into_iter(), COALESCE)
+                .into_iter()
+                .filter_map(|(key, ranges)| Some((copies.get(&key)?.clone(), ranges)))
+                .collect();
+        if due.is_empty() {
+            return;
+        }
+        for (shadow, ranges) in &due {
+            let entry = self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default();
+            for &(from, to) in ranges {
+                push_range(entry, 0, from, to);
+                Self::brought(&mut self.current, shadow, from, to);
+            }
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|(shadow, ranges)| {
+                Box::new(move || {
+                    for (from, to) in ranges {
+                        Self::update(&shadow, from, to);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
+        PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+        crate::framelog::sub(crate::framelog::T::CopyUs, over);
     }
 
     fn flush(&mut self) {
@@ -9745,6 +9885,52 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    /// `VICTORY_REFRESH_AHEAD=1`: copies given to shaders are spanned up to
+    /// their write and stopped at the first title-memory write. From avatarmanz
+    /// dc2a3ad.
+    #[test]
+    fn what_is_written_is_refreshed_ahead_up_to_its_write_and_to_title_writes() {
+        use super::{Touch::{Nothing, Refresh, Title, Write}, written_spans};
+        let mut found = written_spans(
+            [
+                Refresh(1, 10, 20),
+                Refresh(2, 0, 5),
+                Nothing,
+                Refresh(1, 30, 40),
+                Write(1),
+                Refresh(1, 0, 100),
+                Write(3),
+                Refresh(3, 1, 2),
+                Refresh(4, 7, 9),
+                Write(4),
+                Title,
+                Write(2),
+            ]
+            .into_iter(),
+        );
+        found.sort_unstable();
+        assert_eq!(found, [(1, 10, 40), (4, 7, 9)]);
+    }
+
+    /// `Batch::title_wrote` cuts overlapping `[at, at + len)` spans out of
+    /// `Batch::ahead` so a later `Step::Refresh` re-sees what `Step::Copy`
+    /// wrote, and `Batch::title_written` clears `Batch::ahead` whole.
+    #[test]
+    fn title_wrote_invalidates_refreshed_ahead_span() {
+        let mut batch = Batch::default();
+        let key = 0x1234_5000usize;
+        batch.ahead.insert(key, vec![(0x1000, 0x5000)]);
+        assert!(covered(batch.ahead.get(&key).unwrap(), 0x2000, 0x2400));
+        batch.title_wrote(0x2000, 0x1000);
+        let kept = batch.ahead.get(&key).expect("non-overlapping halves remain covered");
+        assert_eq!(kept, &[(0x1000, 0x2000), (0x3000, 0x5000)]);
+        assert!(!covered(kept, 0x2000, 0x2400));
+        assert!(covered(kept, 0x1000, 0x2000));
+        assert!(covered(kept, 0x3000, 0x5000));
+        batch.title_written();
+        assert!(batch.ahead.is_empty());
     }
 }
 

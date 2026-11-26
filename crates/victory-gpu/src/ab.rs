@@ -79,13 +79,14 @@ pub(crate) enum Key {
     GuardRest,
     OpenOneView,
     LandEcho,
+    RefreshAhead,
     SkipUnchanged,
     IndirectHoist,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 27] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 28] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -110,6 +111,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 27] = [
     (Key::GuardRest, "GUARD_REST", None),
     (Key::OpenOneView, "OPEN_ONE_VIEW", None),
     (Key::LandEcho, "LAND_ECHO", None),
+    (Key::RefreshAhead, "REFRESH_AHEAD", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",
