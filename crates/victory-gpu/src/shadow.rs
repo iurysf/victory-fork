@@ -1856,6 +1856,7 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
+    let given = jobs.len() as u64;
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1872,16 +1873,27 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
+    let mut ran = 0u64;
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
-            Some(job) => job(),
+            Some(job) => {
+                job();
+                ran += 1;
+            }
             None => break,
         }
     }
+    // The submission's thread's wait for the helpers, by its step
+    // (`crate::lockmeter::wide_waited`, with `VICTORY_GUARDS_METER`).
+    let waiting = crate::lockmeter::wide_metered().then(std::time::Instant::now);
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(n);
+    if let Some(waiting) = waiting {
+        crate::lockmeter::wide_waited(given, ran, waiting.elapsed().as_nanos() as u64);
     }
 }
 

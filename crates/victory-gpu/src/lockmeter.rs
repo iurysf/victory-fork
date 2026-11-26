@@ -51,6 +51,141 @@ pub(crate) fn within(ctx: Ctx) -> Within {
     Within(CTX.with(|c| c.replace(ctx as u8)))
 }
 
+/// Places of [`wide_waited`]: the five steps of preparing ([`Ctx`] 1 to 5)
+/// and outside them.
+const WIDE_PLACES: usize = 6;
+const WIDE_PLACE_NAMES: [&str; WIDE_PLACES] = ["asking", "steps", "last flush", "snapshots", "card's plan", "outside the steps"];
+
+/// Since the last frame line, with the meter on (`VICTORY_GUARDS_METER`):
+/// the submission's thread waiting for the `victory-wide` helpers to end
+/// the jobs it gave them (`crate::shadow`'s `wide`, its loop on the count
+/// of jobs left), by the step it is in ([`WIDE_PLACES`]): calls,
+/// nanoseconds in the loop (wall clock), jobs given, and jobs it ran itself
+/// before it waited (its own or another caller's, the relay's among them).
+/// The Profiler's first suspect for the thread's time stopped within its
+/// work (`MEDIDORES-L1.md`): the last flush and the snapshots waiting for
+/// four helpers that also run the relay's jobs.
+static WIDE_WAIT: [[AtomicU64; 4]; WIDE_PLACES] = [const { [const { AtomicU64::new(0) }; 4] }; WIDE_PLACES];
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' meter on this thread, whatever the setting.
+    static WIDE_IN_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// Whether this is the submission's thread (`None`: not looked at yet).
+    static SUBMIT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Whether `wide`'s wait is measured on this thread ([`wide_waited`]): the
+/// meter is on and this is the submission's thread (`victory-submit`).
+/// Without the meter: a setting read once, nothing else.
+pub(crate) fn wide_metered() -> bool {
+    #[cfg(test)]
+    let on = on() || WIDE_IN_TEST.get();
+    #[cfg(not(test))]
+    let on = on();
+    on && SUBMIT.with(|s| match s.get() {
+        Some(submit) => submit,
+        None => {
+            let submit = std::thread::current().name() == Some("victory-submit");
+            s.set(Some(submit));
+            submit
+        }
+    })
+}
+
+/// `wide` on the submission's thread gave `given` jobs, ran `ran` before it
+/// waited, and waited `ns` for the rest.
+pub(crate) fn wide_waited(given: u64, ran: u64, ns: u64) {
+    let place = match CTX.with(Cell::get) {
+        c @ 1..=5 => usize::from(c) - 1,
+        _ => WIDE_PLACES - 1,
+    };
+    for (i, n) in [1, ns, given, ran].into_iter().enumerate() {
+        WIDE_WAIT[place][i].fetch_add(n, Relaxed);
+    }
+}
+
+/// Frame-log line of [`wide_waited`]; `None` without the meter or when
+/// nothing was measured.
+pub(crate) fn wide_line(frames: f64) -> Option<String> {
+    if !on() {
+        return None;
+    }
+    let wide: [[u64; 4]; WIDE_PLACES] = std::array::from_fn(|s| std::array::from_fn(|i| WIDE_WAIT[s][i].swap(0, Relaxed)));
+    let f = frames.max(1.0);
+    let mut waits = Vec::new();
+    let mut all = 0u64;
+    for (s, &[calls, ns, given, ran]) in wide.iter().enumerate() {
+        if calls > 0 {
+            all += ns;
+            waits.push(format!(
+                "{} {:.2} ms in {:.1} calls ({:.0} jobs given, {:.0} run by the submission's thread)",
+                WIDE_PLACE_NAMES[s],
+                ns as f64 / 1e6 / f,
+                calls as f64 / f,
+                given as f64 / f,
+                ran as f64 / f
+            ));
+        }
+    }
+    (!waits.is_empty()).then(|| {
+        format!(
+            "the submission's thread waiting for the wide helpers' jobs to end, a frame (VICTORY_GUARDS_METER; wall clock): \
+             {:.2} ms; by step: {}",
+            all as f64 / 1e6 / f,
+            waits.join("; ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod wide_wait_tests {
+    use super::*;
+
+    /// On a thread named `victory-submit`, with the meter on: `wide`'s wait
+    /// is counted in the step the thread is in, with the jobs it gave; on
+    /// another thread, nothing is counted.
+    #[test]
+    fn the_submissions_wait_for_the_helpers_is_counted_by_step() {
+        let jobs = || -> Vec<Box<dyn FnOnce() + Send>> {
+            (0..4).map(|_| Box::new(|| std::thread::sleep(std::time::Duration::from_millis(5))) as Box<dyn FnOnce() + Send>).collect()
+        };
+        let flush = |i: usize| WIDE_WAIT[2][i].load(Relaxed);
+        let (calls, given) = (flush(0), flush(2));
+        std::thread::Builder::new()
+            .name("victory-submit".into())
+            .spawn(move || {
+                WIDE_IN_TEST.set(true);
+                let _step = within(Ctx::Flush);
+                assert!(wide_metered());
+                crate::shadow::wide_run(jobs());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(flush(0) - calls, 1, "one call, in the last flush");
+        assert_eq!(flush(2) - given, 4, "four jobs given");
+        let before = flush(0);
+        let other = std::thread::Builder::new()
+            .name("victory-render".into())
+            .spawn(move || {
+                WIDE_IN_TEST.set(true);
+                let _step = within(Ctx::Flush);
+                let metered = wide_metered();
+                crate::shadow::wide_run(jobs());
+                metered
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!other, "another thread is not measured");
+        assert_eq!(flush(0), before);
+    }
+}
+
 /// Who takes the lock: the call site.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

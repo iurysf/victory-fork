@@ -797,6 +797,9 @@ pub fn frame() {
     if let Some(line) = crate::lockmeter::journal_line(frames.len() as f64) {
         tracing::info!("{line}");
     }
+    if let Some(line) = crate::lockmeter::wide_line(frames.len() as f64) {
+        tracing::info!("{line}");
+    }
     tracing::info!("{}", under_line(&mean(&frames.iter().collect::<Vec<_>>())));
     if let Some(line) = crate::shadow::under_by_copy_line(frames.len() as f64) {
         tracing::info!("{line}");
