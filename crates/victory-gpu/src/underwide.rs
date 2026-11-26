@@ -208,17 +208,55 @@ pub(crate) fn dword_patches(ranges: &[(usize, usize)], data: &[u8], out: &mut Ve
         }
         lo = hi;
     }
-    out.resize(first + total, [0; 3]);
-    let to = out[first..].as_mut_ptr() as usize;
+    // Room, not zeros: every patch of it is written below (the game's
+    // first A/B paid a fill and a second copy of some 7 MB a frame here).
+    out.reserve(total);
+    let to = out.spare_capacity_mut().as_mut_ptr() as usize;
     each(n, pieces.len(), &|i: usize| {
         let (lo, hi, at) = pieces[i];
-        let mut piece = Vec::with_capacity(patches_in(&ranges[lo..hi]));
-        crate::shadow::dword_patches_of(ranges[lo..hi].iter().copied(), data, &mut piece);
-        // SAFETY: the piece's place in `out` is `at..at + its count`, which
-        // no other piece writes; `out` outlives the call.
-        unsafe { std::ptr::copy_nonoverlapping(piece.as_ptr(), (to as *mut [u32; 3]).add(at), piece.len()) };
+        // SAFETY: the piece's place in `out`'s room is `at..at + its count`,
+        // which no other piece writes; `out` outlives the call.
+        let written = unsafe { patches_into(&ranges[lo..hi], data, (to as *mut [u32; 3]).add(at)) };
+        debug_assert_eq!(written, patches_in(&ranges[lo..hi]));
     });
+    // SAFETY: every one of the `total` patches after `first` was written.
+    unsafe { out.set_len(first + total) };
     crate::framelog::add(crate::framelog::T::UnderWideUs, started.elapsed().as_micros() as u64);
+}
+
+/// `crate::shadow::dword_patches_of` of `ranges` (in order, apart) written
+/// at `to` one after the other; how many.
+///
+/// # Safety
+/// `to` has room for [`patches_in`] of `ranges` patches.
+unsafe fn patches_into(ranges: &[(usize, usize)], data: &[u8], to: *mut [u32; 3]) -> usize {
+    let mut count = 0usize;
+    let mut open: Option<[u32; 3]> = None;
+    for &(a, b) in ranges {
+        for (at, &byte) in data[a..b].iter().enumerate().map(|(i, v)| (a + i, v)) {
+            let (dword, shift) = ((at / 4) as u32, (at % 4) * 8);
+            let (byte, mask) = (u32::from(byte) << shift, 0xFFu32 << shift);
+            match &mut open {
+                Some(p) if p[0] == dword => {
+                    p[1] |= byte;
+                    p[2] |= mask;
+                }
+                _ => {
+                    if let Some(p) = open.replace([dword, byte, mask]) {
+                        // SAFETY: within the room the caller gave.
+                        unsafe { to.add(count).write(p) };
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(p) = open {
+        // SAFETY: as above.
+        unsafe { to.add(count).write(p) };
+        count += 1;
+    }
+    count
 }
 
 /// Runs `f(0..count)` on this thread and `n - 1` threads of the pool, each
@@ -257,14 +295,14 @@ fn pool(n: usize) -> Arc<Pool> {
 struct Job {
     count: usize,
     next: AtomicUsize,
-    /// `&(dyn Fn(usize) + Sync)` of the caller, alive until every worker
-    /// says done.
+    /// `&(dyn Fn(usize) + Sync)` of the caller, alive until the caller and
+    /// every worker that joined are done.
     f: *const (dyn Fn(usize) + Sync),
     panicked: AtomicBool,
 }
 
 // SAFETY: `f` is `Sync` and outlives the job's use on every thread
-// (`Pool::each` waits for every worker before returning).
+// (`Pool::each` waits for every worker that joined before returning).
 unsafe impl Send for Job {}
 // SAFETY: as above; the rest is atomics.
 unsafe impl Sync for Job {}
@@ -287,10 +325,12 @@ impl Job {
 }
 
 struct State {
-    /// The job of this round, its number, and the workers done with it.
+    /// The job of this round (`None` once its caller is done with its own
+    /// share: no worker joins it after that), its number, and the workers
+    /// at work on it.
     job: Option<Arc<Job>>,
     round: u64,
-    done: usize,
+    running: usize,
     stop: bool,
 }
 
@@ -308,7 +348,7 @@ struct Pool {
 impl Pool {
     fn new(workers: usize) -> Arc<Pool> {
         let pool = Arc::new(Pool {
-            state: Mutex::new(State { job: None, round: 0, done: 0, stop: false }),
+            state: Mutex::new(State { job: None, round: 0, running: 0, stop: false }),
             work: Condvar::new(),
             done: Condvar::new(),
             workers,
@@ -318,7 +358,7 @@ impl Pool {
         for id in 0..workers {
             let p = pool.clone();
             // A thread that cannot be made leaves its share to the others
-            // and the caller: [`Pool::each`] waits for those made.
+            // and the caller.
             if std::thread::Builder::new().name(format!("victory-under-{id}")).spawn(move || p.worker()).is_ok() {
                 pool.alive.fetch_add(1, Relaxed);
             }
@@ -332,12 +372,15 @@ impl Pool {
         let _one = self.caller.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.stop = true;
-        // A caller that took this pool before it was stopped does the work
-        // alone: no thread is waited for.
         self.alive.store(0, Relaxed);
         self.work.notify_all();
     }
 
+    /// A worker joins a job only while its caller is still at it, and says
+    /// when it is done; one that wakes late finds the job closed and sleeps
+    /// again. (Every worker was waited for at every job in the first game
+    /// A/B: with the title's threads on 5 of 8 cores a worker not yet woken
+    /// held the submitting thread for nothing, many jobs a frame.)
     fn worker(self: Arc<Self>) {
         let mut seen = 0u64;
         loop {
@@ -350,17 +393,16 @@ impl Pool {
                     return;
                 }
                 seen = s.round;
+                s.running += 1;
                 s.job.clone()
             };
             if let Some(job) = job {
                 job.work();
             }
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if s.round == seen {
-                s.done += 1;
-                if s.done >= self.alive.load(Relaxed) {
-                    self.done.notify_one();
-                }
+            s.running -= 1;
+            if s.running == 0 {
+                self.done.notify_all();
             }
         }
     }
@@ -368,23 +410,27 @@ impl Pool {
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
         let _one = self.caller.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY (of the lifetime's erasure): the job's pointer is used only
-        // until every worker says done, below.
+        // by the caller and by workers that joined it, all done before this
+        // returns.
         let f: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
         let job = Arc::new(Job { count, next: AtomicUsize::new(0), f, panicked: AtomicBool::new(false) });
-        {
+        crate::framelog::add(crate::framelog::T::UnderJobs, 1);
+        if self.alive.load(Relaxed) > 0 {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             s.round += 1;
             s.job = Some(job.clone());
-            s.done = 0;
             self.work.notify_all();
         }
         job.work();
+        let waiting = std::time::Instant::now();
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        while s.done < self.alive.load(Relaxed) {
+        // Closed: who has not joined does not.
+        s.job = None;
+        while s.running > 0 {
             s = self.done.wait(s).unwrap_or_else(|e| e.into_inner());
         }
-        s.job = None;
         drop(s);
+        crate::framelog::add(crate::framelog::T::UnderWaitUs, waiting.elapsed().as_micros() as u64);
         assert!(!job.panicked.load(Relaxed), "a job of VICTORY_UNDER_WIDE's pool panicked");
     }
 }

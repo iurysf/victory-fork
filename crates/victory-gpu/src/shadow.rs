@@ -507,6 +507,11 @@ fn card_queue_canary(queued: &[usize]) {
 /// of its own.
 pub(crate) const CARD_PATCH_RUN: usize = 256;
 
+/// Pages a merge of a copy in the card's memory takes to the pool's threads
+/// at least (`crate::underwide`): fewer are compared on the submitting
+/// thread.
+const WIDE_PAGES: usize = 4;
+
 /// Patches a submission's merges may put in (16 MiB of them, 12 bytes
 /// each; upstream a638f4e).
 const PATCH_ROOM: usize = (16 << 20) / 12;
@@ -3451,6 +3456,18 @@ impl Shadow {
         if wide >= 2 && self.card.is_some() {
             return self.merge_under_writes_wide(busy, room, wide);
         }
+        let card_started = self.card.is_some().then(std::time::Instant::now);
+        let merged = self.merge_under_writes_one(busy, room, wide);
+        if let Some(started) = card_started {
+            crate::framelog::add(crate::framelog::T::MergeCardUs, started.elapsed().as_micros() as u64);
+        }
+        merged
+    }
+
+    /// [`Shadow::merge_under_writes`] on this thread (`busy` in order and
+    /// joined); `wide` 1 or more: the compare by masks.
+    fn merge_under_writes_one(&self, busy: Vec<(usize, usize)>, room: &mut Room, wide: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         // The page buffer, kept on the thread between merges (a fresh
         // 64 KiB each time faulted its pages in, 376 times a frame).
@@ -3586,8 +3603,11 @@ impl Shadow {
             }
         }
         if pages.is_empty() {
+            crate::framelog::add(crate::framelog::T::MergeCardUs, started.elapsed().as_micros() as u64);
             return false;
         }
+        // A few pages are not worth the pool's threads.
+        let n = if pages.len() < WIDE_PAGES { 1 } else { n };
         let patchable = self.card_sides().is_some_and(|(_, _, size)| crate::host::card_patchable(size));
         // The lock of the CPU side, as each page takes it there: from before
         // title memory is read until the title's bytes are in.
@@ -3597,6 +3617,7 @@ impl Shadow {
         type Found = Option<(Vec<(usize, usize)>, Vec<u8>)>;
         let found: Vec<Mutex<Found>> = pages.iter().map(|_| Mutex::new(None)).collect();
         let data = self.data as usize;
+        let comparing = std::time::Instant::now();
         crate::underwide::each(n, pages.len(), &|i: usize| {
             let (lo, hi, ..) = pages[i];
             let len = hi - lo;
@@ -3617,6 +3638,8 @@ impl Shadow {
             }
             *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((runs, bytes));
         });
+        crate::framelog::add(crate::framelog::T::MergeCompareUs, comparing.elapsed().as_micros() as u64);
+        let putting = std::time::Instant::now();
         let mut over = false;
         for (i, &(lo, hi, page, whole, now)) in pages.iter().enumerate() {
             let Some((runs, bytes)) = found[i].lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -3647,7 +3670,9 @@ impl Shadow {
             }
         }
         drop(before);
+        crate::framelog::add(crate::framelog::T::MergePutUs, putting.elapsed().as_micros() as u64);
         crate::framelog::add(crate::framelog::T::UnderWideUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::MergeCardUs, started.elapsed().as_micros() as u64);
         over
     }
 
@@ -3951,6 +3976,12 @@ impl Shadow {
         if ranges.is_empty() || self.card.is_none() {
             return;
         }
+        let patching = std::time::Instant::now();
+        crate::framelog::add(crate::framelog::T::PatchCopies, 1);
+        crate::framelog::add(crate::framelog::T::PatchRuns, ranges.len() as u64);
+        if ranges.len() >= crate::underwide::RUNS_A_PIECE {
+            crate::framelog::add(crate::framelog::T::PatchCopiesBig, 1);
+        }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let len = self.len as usize;
         // SAFETY: the CPU side's mapping holds the copy's bytes; the ranges
@@ -3963,12 +3994,13 @@ impl Shadow {
             .filter(|r| r.0 < r.1);
         // In pieces on threads of their own (`crate::underwide`): the same
         // patches.
-        if crate::underwide::threads() >= 2 && ranges.len() >= crate::underwide::RUNS_A_PIECE {
+        if crate::underwide::threads() >= 2 && ranges.len() >= 2 * crate::underwide::RUNS_A_PIECE {
             let cut: Vec<(usize, usize)> = cut.collect();
             crate::underwide::dword_patches(&cut, data, out);
-            return;
+        } else {
+            dword_patches_of(cut, data, out);
         }
-        dword_patches_of(cut, data, out);
+        crate::framelog::add(crate::framelog::T::PatchesUs, patching.elapsed().as_micros() as u64);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the

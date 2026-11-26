@@ -136,6 +136,21 @@ pub enum T {
     /// The submitting thread in `VICTORY_UNDER_WIDE`'s paths (merges and
     /// patches on threads of their own).
     UnderWideUs,
+    /// Title bytes under flights' writes, in both arms of an A/B on
+    /// `VICTORY_UNDER_WIDE`: the merges of copies in the card's memory;
+    /// of the wide ones, the compare on the pool (wall time) and the put-in
+    /// in order; the patches; the pool's jobs and the caller's wait for its
+    /// threads after its own share; copies given patches, those of 4,096
+    /// runs or more, and their runs.
+    MergeCardUs,
+    MergeCompareUs,
+    MergePutUs,
+    PatchesUs,
+    UnderJobs,
+    UnderWaitUs,
+    PatchCopies,
+    PatchCopiesBig,
+    PatchRuns,
     Count,
 }
 
@@ -641,6 +656,28 @@ fn preparing_line(f: &Frame) -> String {
     )
 }
 
+/// The line of title bytes under flights' writes for the mean frame `f`
+/// (`crate::underwide`), the same in both arms of an A/B on it.
+fn under_line(f: &Frame) -> String {
+    let ms = |t: T| f.t[t as usize] / 1e3;
+    let n = |t: T| f.t[t as usize];
+    format!(
+        "under flights' writes, the mean frame: merges of copies in the card's memory {:.2} ms (on the pool: compare {:.2} \
+         wall, put in in order {:.2}), patches {:.2} ms; the pool: {:.0} jobs, {:.2} ms waiting for its threads after the \
+         caller's share; patches for {:.0} copies, {:.0} of them with 4,096 runs or more, {:.0} runs (UNDER_WIDE={})",
+        ms(T::MergeCardUs),
+        ms(T::MergeCompareUs),
+        ms(T::MergePutUs),
+        ms(T::PatchesUs),
+        n(T::UnderJobs),
+        ms(T::UnderWaitUs),
+        n(T::PatchCopies),
+        n(T::PatchCopiesBig),
+        n(T::PatchRuns),
+        crate::underwide::threads(),
+    )
+}
+
 /// Frames whose lengths give the usual one, and the long frames listed in
 /// a reading at most.
 const RECENT: usize = 64;
@@ -756,6 +793,7 @@ pub fn frame() {
     tracing::info!("{}", crate::background::line(elapsed.as_secs_f64()));
     tracing::info!("{}", preparing_line(&mean(&frames.iter().collect::<Vec<_>>())));
     tracing::info!("{}", crate::lockmeter::line(frames.len() as f64));
+    tracing::info!("{}", under_line(&mean(&frames.iter().collect::<Vec<_>>())));
     tracing::info!("{}", crate::watch::askings_line(frames.len() as f64));
     for (i, line) in lines(&frames, usual, elapsed.as_secs_f64()).into_iter().enumerate() {
         if i == 0 {
