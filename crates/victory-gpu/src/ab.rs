@@ -62,13 +62,14 @@ pub(crate) enum Key {
     WaitGuarded,
     PresentQueued,
     UnderWide,
+    StepIndex,
     SkipUnchanged,
     IndirectHoist,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 21] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 22] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -87,6 +88,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 21] = [
     (Key::WaitGuarded, "WAIT_GUARDED", None),
     (Key::PresentQueued, "PRESENT_QUEUED", None),
     (Key::UnderWide, "UNDER_WIDE", None),
+    (Key::StepIndex, "STEP_INDEX", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",
