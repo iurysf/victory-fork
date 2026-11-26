@@ -31,6 +31,17 @@
 //! After the old fx-main's `crate::ab` (067f795), which named the readings
 //! only.
 //!
+//! Plans in a queue, one opening for several: `VICTORY_AB=<plan>;<plan>;...`
+//! (each as above). When a plan's blocks are done (A from there on), the next
+//! starts at the next reading, the world being steady already; its first
+//! block leaves its first reading out as every block does. A plan that is
+//! refused is said by name and left out, the others run; a plan with no
+//! number of blocks runs to the end of the run, so the plans after it never
+//! start (said when the queue is read). `VICTORY_AB_EARLY=<ms>` (off by
+//! default): a plan ends at the close of its fourth quartet or a later one
+//! when every quartet's frame B - A has one sign and their median is that
+//! many ms or more from 0, its last line saying so.
+//!
 //! A switch takes part only if it may turn between two submissions with
 //! nothing to rebuild; the others are refused by name with the reason
 //! ([`KEYS`]). A switch that takes part reads [`flag`] or [`number`] over
@@ -133,6 +144,12 @@ pub(crate) struct Plan {
     frames: Option<u32>,
 }
 
+/// `VICTORY_AB`'s plans (`;` between them), each the plan or why it is
+/// refused, in order.
+pub(crate) fn parse_queue(spec: &str) -> Vec<Result<Plan, String>> {
+    spec.split(';').map(str::trim).filter(|p| !p.is_empty()).map(parse).collect()
+}
+
 /// `VICTORY_AB`'s plan, or why it is refused.
 pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
     let mut parts = spec.split(',').map(str::trim);
@@ -200,44 +217,116 @@ fn after_s(value: Option<&str>) -> f64 {
     amount(value).unwrap_or(0.0)
 }
 
-fn plan() -> Option<&'static Plan> {
-    static PLAN: OnceLock<Option<Plan>> = OnceLock::new();
-    PLAN.get_or_init(|| {
-        let spec = std::env::var("VICTORY_AB").ok()?;
-        match parse(&spec) {
-            Ok(mut plan) => {
-                let env = |name: &str| std::env::var(name).ok();
-                plan.after_s = after_s(env("VICTORY_AB_AFTER_S").as_deref());
-                plan.start_s = amount(env("VICTORY_AB_START_S").as_deref());
-                plan.min_draws = amount(env("VICTORY_AB_MIN_DRAWS").as_deref()).unwrap_or(3000.0);
-                plan.frames = amount(env("VICTORY_AB_FRAMES").as_deref()).map(|n| n as u32).filter(|&n| n >= 4);
-                MASK.store(plan.keys.iter().fold(0, |m, k| m | 1 << k.0 as u32), Relaxed);
-                let from = match plan.start_s {
-                    Some(at) => format!("from the reading ending {at} s after the first frame (VICTORY_AB_START_S)"),
-                    None => format!(
-                        "from {} s after the world is steady (3 readings in a row of {} draws or more, a median frame under 300 ms, \
-                         no host pipeline being made)",
-                        plan.after_s, plan.min_draws
-                    ),
-                };
-                tracing::info!(
-                    "A/B within the run (VICTORY_AB={spec}): {} turned in quartets of blocks A B B A, {} a block{}, {from}",
-                    plan.name,
-                    match plan.frames {
-                        Some(n) => format!("{n} frames (VICTORY_AB_FRAMES; the first 2 left out)"),
-                        None => format!("{} readings", plan.readings),
-                    },
-                    plan.blocks.map_or(String::new(), |n| format!(", {n} blocks"))
-                );
-                Some(plan)
-            }
-            Err(why) => {
-                tracing::warn!("VICTORY_AB={spec} refused, nothing turns: {why}");
-                None
+/// The plans of `VICTORY_AB` that were not refused, in order.
+fn plans() -> &'static [Plan] {
+    static PLANS: OnceLock<Vec<Plan>> = OnceLock::new();
+    PLANS.get_or_init(|| {
+        let Ok(spec) = std::env::var("VICTORY_AB") else {
+            return Vec::new();
+        };
+        let queue = parse_queue(&spec);
+        let mut plans = Vec::new();
+        let count = queue.len();
+        for (i, plan) in queue.into_iter().enumerate() {
+            match plan {
+                Ok(mut plan) => {
+                    let env = |name: &str| std::env::var(name).ok();
+                    plan.after_s = after_s(env("VICTORY_AB_AFTER_S").as_deref());
+                    plan.start_s = amount(env("VICTORY_AB_START_S").as_deref());
+                    plan.min_draws = amount(env("VICTORY_AB_MIN_DRAWS").as_deref()).unwrap_or(3000.0);
+                    plan.frames = amount(env("VICTORY_AB_FRAMES").as_deref()).map(|n| n as u32).filter(|&n| n >= 4);
+                    plans.push(plan);
+                }
+                Err(why) => tracing::warn!("VICTORY_AB: plan {} of {count} refused, the others run: {why}", i + 1),
             }
         }
+        if plans.len() > 1 {
+            let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
+            tracing::info!("A/B queue (VICTORY_AB): {} plans, one after the other: {}", plans.len(), names.join("; "));
+            if let Some(i) = plans[..plans.len() - 1].iter().position(|p| p.blocks.is_none()) {
+                tracing::warn!(
+                    "A/B queue: plan {} ({}) has no number of blocks and runs to the end: the plans after it never start",
+                    i + 1,
+                    plans[i].name
+                );
+            }
+        }
+        if let Some(first) = plans.first() {
+            MASK.store(mask(first), Relaxed);
+        }
+        plans
     })
-    .as_ref()
+}
+
+/// The plan in progress: [`plans`]' [`AT`]th, `None` with none or past the last.
+fn plan() -> Option<&'static Plan> {
+    let plans = plans();
+    let plan = plans.get(AT.load(Relaxed))?;
+    static SAID: OnceLock<()> = OnceLock::new();
+    SAID.get_or_init(|| {
+        let spec = std::env::var("VICTORY_AB").unwrap_or_default();
+        let from = match plan.start_s {
+            Some(at) => format!("from the reading ending {at} s after the first frame (VICTORY_AB_START_S)"),
+            None => format!(
+                "from {} s after the world is steady (3 readings in a row of {} draws or more, a median frame under 300 ms, \
+                 no host pipeline being made)",
+                plan.after_s, plan.min_draws
+            ),
+        };
+        tracing::info!(
+            "A/B within the run (VICTORY_AB={spec}): {} turned in quartets of blocks A B B A, {} a block{}, {from}",
+            plan.name,
+            match plan.frames {
+                Some(n) => format!("{n} frames (VICTORY_AB_FRAMES; the first 2 left out)"),
+                None => format!("{} readings", plan.readings),
+            },
+            plan.blocks.map_or(String::new(), |n| format!(", {n} blocks"))
+        );
+    });
+    Some(plan)
+}
+
+/// The plan of [`plans`] in progress.
+static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The bits of `plan`'s switches ([`MASK`]).
+fn mask(plan: &Plan) -> u32 {
+    plan.keys.iter().fold(0, |m, k| m | 1 << k.0 as u32)
+}
+
+/// After a step that ended the plan in progress: the next one, if any,
+/// starts (its switches in [`MASK`], arm A, a new [`State`] that takes the
+/// world as steady).
+fn next_plan(state: &mut State) {
+    let plans = plans();
+    let at = AT.load(Relaxed) + 1;
+    B.store(false, Relaxed);
+    let Some(next) = plans.get(at) else {
+        AT.store(at, Relaxed);
+        MASK.store(0, Relaxed);
+        return;
+    };
+    MASK.store(mask(next), Relaxed);
+    AT.store(at, Relaxed);
+    *state = State::following();
+    tracing::info!(
+        "A/B queue: plan {} of {} starts at the next {}: {}, {} a block{}",
+        at + 1,
+        plans.len(),
+        if next.frames.is_some() { "frame" } else { "reading" },
+        next.name,
+        match next.frames {
+            Some(n) => format!("{n} frames"),
+            None => format!("{} readings", next.readings),
+        },
+        next.blocks.map_or(String::new(), |n| format!(", {n} blocks"))
+    );
+}
+
+/// `VICTORY_AB_EARLY`: ms (off if unset).
+fn early() -> Option<f64> {
+    static EARLY: OnceLock<Option<f64>> = OnceLock::new();
+    *EARLY.get_or_init(|| amount(std::env::var("VICTORY_AB_EARLY").ok().as_deref()).filter(|&ms| ms > 0.0))
 }
 
 /// The switches the A/B turns, a bit each ([`Key`] as a number).
@@ -329,6 +418,9 @@ pub(crate) struct Settings {
     pub steady_need: u32,
     /// What a reading is: "readings" or "frames".
     pub unit: &'static str,
+    /// `VICTORY_AB_EARLY`: the plan ends at a quartet from the fourth on when
+    /// all agree in the frame's sign and their median is this far from 0.
+    pub early: Option<f64>,
 }
 
 /// Where the A/B is.
@@ -407,6 +499,22 @@ fn quartet_diff(q: &[Reading; 4], f: &dyn Fn(&Reading) -> f64) -> f64 {
 }
 
 impl State {
+    /// For a plan after another in the queue: the world is steady.
+    fn following() -> State {
+        State { started: true, ..State::default() }
+    }
+
+    /// Whether the quartets so far end the plan early: four or more, every
+    /// frame B - A of one sign, their median `ms` or more from 0.
+    fn settled(&self, ms: f64) -> bool {
+        if self.quartets.len() < 4 {
+            return false;
+        }
+        let d: Vec<f64> = self.quartets.iter().map(|q| quartet_diff(q, &|r| r.frame)).collect();
+        let one_sign = d.iter().all(|&x| x > 0.0) || d.iter().all(|&x| x < 0.0);
+        one_sign && median(d).abs() >= ms
+    }
+
     /// One reading.
     pub(crate) fn step(&mut self, s: &Settings, r: Reading, name: &str) -> Step {
         if self.done {
@@ -464,7 +572,7 @@ impl State {
         self.quartet.push((!block.is_empty()).then(|| medians(&block)));
         self.into = 0;
         self.blocks += 1;
-        let last = s.blocks.is_some_and(|n| self.blocks >= n);
+        let mut last = s.blocks.is_some_and(|n| self.blocks >= n);
         let mut line = None;
         if self.quartet.len() == 4 {
             match (self.quartet[0], self.quartet[1], self.quartet[2], self.quartet[3]) {
@@ -472,7 +580,16 @@ impl State {
                 _ => self.left_out += 1,
             }
             self.quartet.clear();
-            line = Some(self.line(name, last, s.min_draws, s.unit));
+            let early = !last && s.early.is_some_and(|ms| self.settled(ms));
+            last |= early;
+            let mut text = self.line(name, last, s.min_draws, s.unit);
+            if early {
+                text.push_str(&format!(
+                    "; ended early (VICTORY_AB_EARLY={}): every quartet's frame B - A of one sign, their median that far from 0 or more",
+                    s.early.unwrap_or(0.0)
+                ));
+            }
+            line = Some(text);
         }
         if last {
             self.done = true;
@@ -561,6 +678,7 @@ fn settings(plan: &Plan) -> Settings {
         skip,
         steady_need,
         unit,
+        early: early(),
     }
 }
 
@@ -584,6 +702,9 @@ pub(crate) fn frame(r: Reading) {
         tracing::info!("{line}");
     }
     B.store(step.b_next, Relaxed);
+    if state.done {
+        next_plan(state);
+    }
 }
 
 /// At each frame-log reading: moves the A/B along; the reading's tag for
@@ -604,6 +725,9 @@ pub(crate) fn reading(r: Reading) -> String {
         tracing::info!("{line}");
     }
     B.store(step.b_next, Relaxed);
+    if state.done {
+        next_plan(state);
+    }
     format!("; A/B {} {}", plan.name, step.tag)
 }
 
@@ -675,6 +799,50 @@ mod tests {
         );
     }
 
+    /// Plans in a queue: each parsed on its own, a refused one by name
+    /// without the others.
+    #[test]
+    fn a_queue_of_plans_leaves_out_only_the_refused() {
+        let q = parse_queue("GUARD_COALESCE,4,16; SKIP_UNCHANGED,4,16 ;COPY_READ_ONLY,4,16;");
+        assert_eq!(q.len(), 3);
+        assert_eq!(q[0].as_ref().unwrap().name, "GUARD_COALESCE");
+        assert!(q[1].as_ref().unwrap_err().contains("SKIP_UNCHANGED"));
+        assert_eq!(q[2].as_ref().unwrap().blocks, Some(16));
+        assert_eq!(parse_queue("NONE").len(), 1);
+    }
+
+    /// A plan after another starts at once, the world being steady: its
+    /// first reading is the first of a block, left out as the switch turned.
+    #[test]
+    fn a_following_plan_starts_at_the_next_reading() {
+        let s = settings(2, Some(4));
+        let mut state = State::following();
+        let first = state.step(&s, reading(40, 100.0), "NEXT");
+        assert_eq!(first.tag, "A-");
+    }
+
+    /// With VICTORY_AB_EARLY a plan ends at its fourth quartet when all four
+    /// agree in sign and their median is past the limit; not when one
+    /// quartet disagrees, nor before the fourth.
+    #[test]
+    fn a_plan_ends_early_when_four_quartets_agree_past_the_limit() {
+        let mut s = settings(2, Some(32));
+        s.early = Some(5.0);
+        // B is 10 ms slower every time: the fourth quartet ends it.
+        let (tags, lines, state) = run(&s, 5 + 64, |b, _| if b { 110.0 } else { 100.0 });
+        assert!(state.done);
+        assert_eq!(state.quartets.len(), 4);
+        assert!(lines.last().unwrap().contains("ended early"), "{}", lines.last().unwrap());
+        // 5 waiting, 32 in the blocks, the rest done.
+        assert_eq!(tags.iter().filter(|t| **t == "done").count(), 64 + 5 - 5 - 32);
+        // Below the limit: it goes on.
+        let (_, _, state) = run(&s, 5 + 32, |b, _| if b { 102.0 } else { 100.0 });
+        assert!(!state.done);
+        // One quartet the other way (the second, readings 13 to 20): it goes on.
+        let (_, _, state) = run(&s, 5 + 32, |b, i| if b == (13..21).contains(&i) { 100.0 } else { 110.0 });
+        assert!(!state.done);
+    }
+
     #[test]
     fn the_other_value_of_a_number() {
         assert_eq!(other(Key::TextureHashEvery, 64), 8);
@@ -702,7 +870,7 @@ mod tests {
     /// frames and frames with 2 ms of remapping left out too, counted.
     #[test]
     fn by_frames_two_frames_turn_and_hitches_are_left_out() {
-        let s = Settings { readings: 4, blocks: Some(4), after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 2, steady_need: 3, unit: "frames" };
+        let s = Settings { readings: 4, blocks: Some(4), after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 2, steady_need: 3, unit: "frames", early: None };
         let mut state = State::default();
         let mut lines = Vec::new();
         for i in 0..5 + 16 {
@@ -736,13 +904,13 @@ mod tests {
     }
 
     fn settings(readings: u32, blocks: Option<u32>) -> Settings {
-        Settings { readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" }
+        Settings { readings, blocks, after_s: 0.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings", early: None }
     }
 
     #[test]
     fn the_blocks_may_start_at_a_time_or_at_fewer_draws() {
         // At a time: readings end every 5 s; from 20 s on, steady or not.
-        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: Some(20.0), min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" };
+        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: Some(20.0), min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings", early: None };
         let mut state = State::default();
         let tags: Vec<&str> = (0..7)
             .map(|i| {
@@ -754,7 +922,7 @@ mod tests {
         // Reading 4 ends at 20 s: the next one opens the first block.
         assert_eq!(tags, ["wait", "wait", "wait", "wait", "wait", "A-", "A"]);
         // At fewer draws: 1,000 a frame count as steady with a floor of 900.
-        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: None, min_draws: 900.0, skip: 1, steady_need: 3, unit: "readings" };
+        let s = Settings { readings: 2, blocks: None, after_s: 0.0, start_s: None, min_draws: 900.0, skip: 1, steady_need: 3, unit: "readings", early: None };
         let mut state = State::default();
         let tags: Vec<&str> = (0..5)
             .map(|i| {
@@ -785,7 +953,7 @@ mod tests {
         // Readings of 400 ms (still loading) do not count, nor ones with
         // pipelines being made; then three steady ones, then 10 s more.
         let mut state = State::default();
-        let s = Settings { readings: 2, blocks: None, after_s: 10.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings" };
+        let s = Settings { readings: 2, blocks: None, after_s: 10.0, start_s: None, min_draws: 3000.0, skip: 1, steady_need: 3, unit: "readings", early: None };
         let mut tags = Vec::new();
         for i in 0..10 {
             let mut r = reading(i, if i < 3 { 400.0 } else { 150.0 });
