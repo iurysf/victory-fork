@@ -250,12 +250,26 @@ fn sync_page(
     if !crate::host::read_into(from as *const u8, page_bytes) {
         return None;
     }
-    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+    Some(apply_page(host, (start, step, mirrored_count), from, page_bytes, None))
+}
+
+/// The records of a changed stretch read from `from` on (`page_bytes`),
+/// handed to `host` ([`sync_page`]); `prints`, their fingerprints made
+/// beforehand ([`sync_wide`]). The records looked at and those mirrored.
+#[cfg(windows)]
+fn apply_page(
+    host: &host::HostHeap,
+    (start, step, mirrored_count): (u64, u64, u32),
+    from: usize,
+    page_bytes: &[u8],
+    prints: Option<&[u64]>,
+) -> (u64, u64) {
+    let slots = changed_slots(from, from + page_bytes.len(), start as usize, step, mirrored_count);
     // The page's records in one go, under one lock
     // (`HostHeap::mirror_copied_page`); one by one below with
     // `VICTORY_HEAP_SYNC_PAGE=0`.
     if page_at_once() {
-        return Some(host.mirror_copied_page(slots, (start, step), from, page_bytes));
+        return host.mirror_copied_page_with(slots, (start, step), from, page_bytes, prints);
     }
     let (mut looked, mut mirrored) = (0u64, 0u64);
     for index in slots {
@@ -275,7 +289,7 @@ fn sync_page(
             mirrored += 1;
         }
     }
-    Some((looked, mirrored))
+    (looked, mirrored)
 }
 
 /// Whether [`sync_heaps`] reads and mirrors the changed pages of the title's
@@ -290,15 +304,18 @@ fn sync_page(
 /// slots made for those that changed. The pages are each other's strangers:
 /// a record lies in the page that holds its first byte, and is looked at
 /// there only. With the switch the pages of a pass, taken from every heap's
-/// write watch first, are cut into up to `N` runs of pages on
-/// `crate::shadow`'s kept threads and this one. The same records are
-/// mirrored, into the same slots; only the order between pages changes,
-/// as it does between the title's own recording threads, which mirror into
-/// the same host heaps at any time.
+/// write watch first, are read and their records fingerprinted in up to `N`
+/// runs of pages on `crate::shadow`'s kept threads and this one; then they
+/// are handed to the host heaps on this thread, heap by heap and page by
+/// page, in the serial pass's order. The order matters: making a slot may
+/// unmake another (two views of one texture from the same start, of
+/// different sizes, on different pages: the last made wins), so the
+/// threads never make slots.
 ///
 /// After avatarmanz/VIctory-7900XTX 53c5256, 6c17ce9, c3e643e and 44629de
-/// (the records' pass on threads of its own), on our pass as it is: the
-/// per-record pieces of those commits are left out.
+/// (the records' pass on threads of its own) and fxceless/victory-fork
+/// PR #1202 (nicolasveilleux; the reads and fingerprints on threads, the
+/// slots made in page order), on our pass as it is.
 #[cfg(windows)]
 fn heap_sync_wide() -> usize {
     #[cfg(test)]
@@ -324,13 +341,14 @@ thread_local! {
 static SYNC_WIDE_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// [`sync_heaps`] with [`heap_sync_wide`] `wide` (2 or more): every heap's
-/// changed stretches taken first, then read and mirrored by page in up to
-/// `wide` runs on `crate::shadow::wide_run`. `heaps`: [`SHADER_HEAPS`],
+/// changed stretches taken first; read and fingerprinted by page in up to
+/// `wide` runs on `crate::shadow::wide_run`; then handed to the host heaps
+/// on this thread in the serial pass's order. `heaps`: [`SHADER_HEAPS`],
 /// held by the caller until this returns (the heaps stay alive). The pages
 /// read, the records looked at, those mirrored.
 #[cfg(windows)]
 fn sync_wide(heaps: &[(u64, u64, usize)], wide: usize) -> [u64; 3] {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     // (Heap, its start, record bytes, records with host slots, from, to.)
     let mut stretches: Vec<(usize, u64, u64, u32, usize, usize)> = Vec::new();
     for &(start, end, at) in heaps {
@@ -355,18 +373,18 @@ fn sync_wide(heaps: &[(u64, u64, usize)], wide: usize) -> [u64; 3] {
     if stretches.is_empty() {
         return [0; 3];
     }
-    // Pages read, records looked at, records mirrored; 1 if a run panicked.
-    let counts = std::sync::Arc::new([const { AtomicU64::new(0) }; 4]);
+    // Each stretch's bytes and its records' fingerprints (by slot from the
+    // stretch's first), `None` inside if the read failed.
+    type Read = Option<(Vec<u8>, Vec<u64>)>;
     let stretches = std::sync::Arc::new(stretches);
+    let found: std::sync::Arc<Vec<std::sync::Mutex<Option<Read>>>> =
+        std::sync::Arc::new(stretches.iter().map(|_| std::sync::Mutex::new(None)).collect());
+    let panicked = std::sync::Arc::new(AtomicBool::new(false));
     let runs = wide.min(stretches.len());
     let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..runs)
         .map(|run| {
-            let (counts, stretches) = (counts.clone(), stretches.clone());
+            let (stretches, found, panicked) = (stretches.clone(), found.clone(), panicked.clone());
             Box::new(move || {
-                thread_local! {
-                    // Kept on the thread from pass to pass, as `PAGE_BYTES`.
-                    static PAGE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-                }
                 // Run `run` of `runs`, pages next to each other together.
                 let (lo, hi) = (stretches.len() * run / runs, stretches.len() * (run + 1) / runs);
                 // A panic on a kept thread would leave the caller waiting
@@ -374,33 +392,51 @@ fn sync_wide(heaps: &[(u64, u64, usize)], wide: usize) -> [u64; 3] {
                 // noted, and the caller panics as the pass on its own
                 // thread would have.
                 let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    PAGE_BYTES.with_borrow_mut(|page_bytes| {
-                        for &(at, start, step, mirrored_count, from, to) in &stretches[lo..hi] {
-                            // SAFETY: the caller holds `SHADER_HEAPS` until
-                            // every run is done: the heap is still
-                            // registered, so live.
-                            let heap = unsafe { &*(at as *const Heap) };
-                            let Some(Some(host)) = heap.host.get() else {
-                                continue;
-                            };
-                            if let Some((seen, made)) = sync_page(host, (start, step, mirrored_count), (from, to), page_bytes) {
-                                counts[0].fetch_add(1, Relaxed);
-                                counts[1].fetch_add(seen, Relaxed);
-                                counts[2].fetch_add(made, Relaxed);
-                            }
-                        }
-                    });
+                    for (i, &(_, start, step, mirrored_count, from, to)) in stretches.iter().enumerate().take(hi).skip(lo) {
+                        let mut bytes = vec![0u8; to - from];
+                        let read = crate::host::read_into(from as *const u8, &mut bytes).then(|| {
+                            let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                            let prints = slots
+                                .map(|index| {
+                                    // As `HostHeap::mirror_copied_page` takes
+                                    // a record (0: none taken there).
+                                    let at = (start + index * step) as usize;
+                                    at.checked_sub(from)
+                                        .and_then(|at| bytes.get(at..at + step as usize))
+                                        .map_or(0, |record| host::record_print(record) | 1)
+                                })
+                                .collect();
+                            (bytes, prints)
+                        });
+                        *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(read);
+                    }
                 }));
                 if pass.is_err() {
-                    counts[3].store(1, Relaxed);
+                    panicked.store(true, Relaxed);
                 }
             }) as Box<dyn FnOnce() + Send>
         })
         .collect();
     SYNC_WIDE_JOBS.fetch_add(jobs.len() as u64, Relaxed);
     crate::shadow::wide_run(jobs);
-    assert!(counts[3].load(Relaxed) == 0, "a run of VICTORY_HEAP_SYNC_WIDE's pass panicked");
-    [0, 1, 2].map(|i| counts[i].load(Relaxed))
+    assert!(!panicked.load(Relaxed), "a run of VICTORY_HEAP_SYNC_WIDE's pass panicked");
+    // The slots made here, in the serial pass's order.
+    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    for (i, &(at, start, step, mirrored_count, from, _)) in stretches.iter().enumerate() {
+        let Some(Some((bytes, prints))) = found[i].lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            continue;
+        };
+        // SAFETY: the caller holds `SHADER_HEAPS`: the heap is live.
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        let (seen, made) = apply_page(host, (start, step, mirrored_count), from, &bytes, Some(&prints));
+        pages += 1;
+        looked += seen;
+        mirrored += made;
+    }
+    [pages, looked, mirrored]
 }
 
 /// Whether a submission's [`sync_heaps`] runs on a thread of its own

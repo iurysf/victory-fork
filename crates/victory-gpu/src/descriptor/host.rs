@@ -2167,6 +2167,22 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
+        self.mirror_copied_page_with(slots, (start, step), from, page, None)
+    }
+
+    /// [`HostHeap::mirror_copied_page`], with the records' fingerprints
+    /// made beforehand on another thread (`prints`: slot `i`'s at
+    /// `i - slots.start`, as [`record_print`] `| 1` gives it; the pass on
+    /// several threads, `super::sync_heaps`). The same records are taken.
+    pub(crate) fn mirror_copied_page_with(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+        prints: Option<&[u64]>,
+    ) -> (u64, u64) {
+        let first = slots.start;
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
@@ -2202,7 +2218,10 @@ impl HostHeap {
                     continue;
                 }
                 // Never 0, which is "never looked at".
-                let print = record_print(record) | 1;
+                let print = match prints.and_then(|p| p.get((index - first) as usize)) {
+                    Some(&print) => print,
+                    None => record_print(record) | 1,
+                };
                 // The record last seen: as it was.
                 if *last == print {
                     continue;
@@ -2753,7 +2772,7 @@ pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// equal records give equal prints, and two different records the same
 /// print about once in 2^64. Not a hash anyone can attack: the records
 /// are our own.
-fn record_print(record: &[u8]) -> u64 {
+pub(crate) fn record_print(record: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut h = K ^ record.len() as u64;
     let mut words = record.chunks_exact(8);
