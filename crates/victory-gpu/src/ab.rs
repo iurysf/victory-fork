@@ -76,13 +76,15 @@ pub(crate) enum Key {
     StepIndex,
     AbsentOnce,
     LightRefresh,
+    GuardRest,
+    OpenOneView,
     SkipUnchanged,
     IndirectHoist,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 24] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 26] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -104,6 +106,8 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 24] = [
     (Key::StepIndex, "STEP_INDEX", None),
     (Key::AbsentOnce, "ABSENT_ONCE", None),
     (Key::LightRefresh, "LIGHT_REFRESH", None),
+    (Key::GuardRest, "GUARD_REST", None),
+    (Key::OpenOneView, "OPEN_ONE_VIEW", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",
@@ -178,7 +182,12 @@ pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
         if let Some(why) = refused {
             return Err(format!("{name} cannot turn within a run: {why}{whole}"));
         }
-        if b.is_some() && !matches!(key, Key::TextureHashEvery | Key::CopyPlainLeast | Key::PresentQueued | Key::UnderWide) {
+        if b.is_some()
+            && !matches!(
+                key,
+                Key::TextureHashEvery | Key::CopyPlainLeast | Key::PresentQueued | Key::UnderWide | Key::GuardRest
+            )
+        {
             return Err(format!("{name} is on or off: B is the other one, no value{whole}"));
         }
         if keys.iter().any(|k| k.0 == key) {
@@ -380,6 +389,7 @@ fn other(key: Key, run: u64) -> u64 {
         Key::CopyPlainLeast => if run == 256 { 16 } else { 256 },
         Key::PresentQueued => if run == 0 { 1 } else { 0 },
         Key::UnderWide => if run == 0 { 4 } else { 0 },
+        Key::GuardRest => if run == 0 { 3000 } else { 0 },
         _ => run,
     }
 }
