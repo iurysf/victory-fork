@@ -17,14 +17,15 @@
 //! The executions that come after the first are not known yet when the
 //! pass is recorded, so it reads what to clamp from a table of jobs in
 //! upload memory, which the CPU goes on filling while the list is recorded
-//! (the list runs after it is closed). An execution that asks for a record
-//! already in the table reads the same clamped one, and the job charges the
-//! budget once for each execution that reads it.
+//! (the list runs after it is closed).
 //!
-//! Where it differs from the clamp at each execution: only when a list's
-//! budget runs out. There, a record read by several executions fits for
-//! all of them or for none, and its charges come at the job's place (the
-//! first execution that read it), not at each later one.
+//! Every execution has a job and a slot of its own, also when it reads a
+//! record an earlier one of the batch read (the fork shared one clamped
+//! record among them, charged once per execution at its first one: two
+//! executions of one record then both ran empty where the clamp at each
+//! execution lets the first run; the Revisor's reading of 26/11, after fork
+//! #1171's slots). So each record comes out as the clamp at each execution
+//! leaves it, the budget charged in the same order, also when it runs out.
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -39,9 +40,6 @@ pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 pub(crate) const SLOT: u32 = 32;
 /// The source buffers a pass can read.
 pub(crate) const SOURCES: usize = 4;
-/// The most executions charged by one job: the most a record costs (2^26)
-/// as often still fits 32 bits.
-pub(crate) const TIMES: u32 = 31;
 
 pub(crate) const SOURCE: &str = r#"
 #define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
@@ -49,9 +47,9 @@ ByteAddressBuffer src0 : register(t0);
 ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
-// The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
-// (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// The count, 12 bytes of nothing, then per job (one per execution):
+// source (bits 0-1), kind (4-7), words (8-11); the record's offset in the
+// source; its place in the scratch buffer; nothing.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
@@ -90,7 +88,6 @@ void main(uint lane : SV_GroupIndex) {
             for (uint w = 0; w < words; w++) {
                 record[w] = load(job.x & 3, job.y + w * 4);
             }
-            uint times = job.x >> 16;
             if (kind <= 1) {
                 uint vertices = min(record[0], 1u << 24);
                 uint instances = min(record[1], (1u << 26) / max(vertices, 1u));
@@ -113,16 +110,15 @@ void main(uint lane : SV_GroupIndex) {
                 record[2] = g.z;
             } else {
                 uint asked = record[0];
-                // The clamp's notes on mesh records, once per execution.
+                // The clamp's notes on mesh records.
                 uint was;
                 budget.InterlockedMax(4, asked, was);
-                budget.InterlockedAdd(8, min(asked, 1u << 24) * times, was);
+                budget.InterlockedAdd(8, min(asked, 1u << 24), was);
                 record[0] = min(record[0], 65535u);
                 record[1] = min(record[1], 1u);
                 record[2] = min(record[2], 1u);
                 cost = record[0] * record[1] * record[2] * 128u;
             }
-            cost *= times;
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -173,8 +169,8 @@ pub(crate) fn words(kind: u32) -> Option<u32> {
 }
 
 /// A job's first word.
-pub(crate) fn job(source: u32, kind: u32, times: u32) -> u32 {
-    source | (kind << 4) | (words(kind).unwrap_or(0) << 8) | (times << 16)
+pub(crate) fn job(source: u32, kind: u32) -> u32 {
+    source | (kind << 4) | (words(kind).unwrap_or(0) << 8)
 }
 
 /// The jobs of a pass as the CPU fills them ([`SOURCE`]), and where it
@@ -188,10 +184,8 @@ pub(crate) struct Table {
     /// The host copies it can read, by number ([`crate::shadow::Shadow::id`];
     /// 0: none).
     sources: [u64; SOURCES],
-    /// How many executions each job is charged for so far.
-    times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// The jobs so far: one per execution.
+    jobs: u32,
 }
 
 // SAFETY: the table's upload memory is the list's, used under its state.
@@ -210,46 +204,35 @@ impl Table {
         Table { at: at as usize, base, sources, ..Table::default() }
     }
 
-    /// The place in the scratch buffer of the record of `kind` at `offset`
-    /// of the host copy `id`, once the pass has run: a job of it is added if
-    /// there is none. `None` if the pass cannot read that copy or has no
+    /// The place in the scratch buffer of this execution's clamped record
+    /// of `kind` at `offset` of the host copy `id`, once the pass has run: a
+    /// job of its own. `None` if the pass cannot read that copy or has no
     /// room for another job.
     pub(crate) fn place(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id && s != 0)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
-        let table = self.at as *mut u32;
-        let place = |i: u32| u64::from(self.base + i * SLOT);
-        if let Some(&i) = self.known.get(&key)
-            && self.times[i as usize] < TIMES
-        {
-            self.times[i as usize] += 1;
-            // SAFETY: the job's own word of the table ([`Table::new`]).
-            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
-            return Some(place(i));
-        }
-        let i = self.times.len() as u32;
+        let i = self.jobs;
         if i == JOBS {
             return None;
         }
-        self.times.push(1);
-        self.known.insert(key, i);
+        self.jobs += 1;
+        let table = self.at as *mut u32;
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
             let to = table.add(4 + 4 * i as usize);
-            to.write_volatile(job(source, kind, 1));
+            to.write_volatile(job(source, kind));
             to.add(1).write_volatile(offset);
             to.add(2).write_volatile(self.base + i * SLOT);
             to.add(3).write_volatile(0);
             table.write_volatile(i + 1);
         }
-        Some(place(i))
+        Some(u64::from(self.base + i * SLOT))
     }
 
     /// The jobs so far.
     pub(crate) fn len(&self) -> usize {
-        self.times.len()
+        self.jobs as usize
     }
 }
 

@@ -1751,8 +1751,9 @@ void main() {
     /// dispatches and mesh records of two buffers, a record at MOST_DRAW,
     /// dispatches past the most groups, a mesh record of all ones, and a
     /// budget that runs out midway; the budget word and the mesh notes end
-    /// as the clamps leave them. With no budget running out, a record read
-    /// by several executions is charged once for each.
+    /// as the clamps leave them. A record read by several executions is
+    /// charged once for each, in order, also when the budget runs out
+    /// among them (run 3: only the first readings fit).
     #[test]
     fn warp_batched_clamps_match_the_clamp_at_each_execution() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -1825,6 +1826,13 @@ void main() {
             }
         }
         runs.push(ex);
+        // 3: the records of 2^20 x 4 each read five times in turn, the
+        // budget running out among the repeats.
+        let mut ex = Vec::new();
+        for k in 0..50u32 {
+            ex.push((true, (20 + k % 10) * 20, 1));
+        }
+        runs.push(ex);
         // SAFETY: the mappings hold BYTES bytes.
         let (a_before, b_before) =
             unsafe { (std::slice::from_raw_parts(a_ptr, BYTES).to_vec(), std::slice::from_raw_parts(b_ptr, BYTES).to_vec()) };
@@ -1888,8 +1896,8 @@ void main() {
             // SAFETY (each): inside the mapping.
             let budget = |ptr: *mut u8| unsafe { [0, 4, 8].map(|at| ptr.add(at).cast::<u32>().read_unaligned()) };
             assert_eq!(budget(budget_all_ptr), budget(budget_one_ptr), "run {n}: budget and mesh notes");
-            if n == 0 {
-                assert_eq!(budget(budget_all_ptr)[0], 1 << 27, "the budget ran out");
+            if n != 1 {
+                assert_eq!(budget(budget_all_ptr)[0], 1 << 27, "run {n}: the budget ran out");
             }
         }
         // SAFETY: the mappings hold BYTES bytes.
