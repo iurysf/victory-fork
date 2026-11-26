@@ -243,15 +243,82 @@ fn sync_page(
     (from, to): (usize, usize),
     page_bytes: &mut Vec<u8>,
 ) -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    // With `VICTORY_GUARDS_METER`: one page in [`SYNC_PARTS_TIMED`] of this
+    // thread's (the submission's) is timed by part ([`SYNC_PARTS`]), its
+    // first among them. Without it, nothing is counted.
+    #[cfg(test)]
+    let metered = crate::lockmeter::on() || SYNC_PARTS_IN_TEST.load(Relaxed);
+    #[cfg(not(test))]
+    let metered = crate::lockmeter::on();
+    let timed = metered && {
+        SYNC_PAGES_SEEN.fetch_add(1, Relaxed);
+        SYNC_PAGES_HERE.replace(SYNC_PAGES_HERE.get().wrapping_add(1)).is_multiple_of(SYNC_PARTS_TIMED)
+    };
+    let reading = timed.then(std::time::Instant::now);
     // The page's records are read through the kernel, into a copy: a page
     // the title unmaps meanwhile fails the read where 2,048 reads in place
     // would fault.
     page_bytes.resize(to - from, 0);
     if !crate::host::read_into(from as *const u8, page_bytes) {
+        if let Some(reading) = reading {
+            SYNC_PARTS[0].fetch_add(1, Relaxed);
+            SYNC_PARTS[1].fetch_add(reading.elapsed().as_nanos() as u64, Relaxed);
+        }
         return None;
     }
-    Some(apply_page(host, (start, step, mirrored_count), from, page_bytes, None))
+    let Some(reading) = reading else {
+        return Some(apply_page(host, (start, step, mirrored_count), from, page_bytes, None));
+    };
+    let applying = std::time::Instant::now();
+    host::WALKED.set((true, None));
+    let found = apply_page(host, (start, step, mirrored_count), from, page_bytes, None);
+    let (_, walked) = host::WALKED.replace((false, None));
+    let done = std::time::Instant::now();
+    let ns = |a: std::time::Instant, b: std::time::Instant| b.saturating_duration_since(a).as_nanos() as u64;
+    SYNC_PARTS[0].fetch_add(1, Relaxed);
+    SYNC_PARTS[1].fetch_add(ns(reading, applying), Relaxed);
+    match walked {
+        Some(walked) => {
+            SYNC_PARTS[2].fetch_add(ns(applying, walked), Relaxed);
+            SYNC_PARTS[3].fetch_add(ns(walked, done), Relaxed);
+        }
+        // The page's records one by one (`VICTORY_HEAP_SYNC_PAGE=0`): walk
+        // and mirroring not told apart.
+        None => {
+            SYNC_PARTS[4].fetch_add(ns(applying, done), Relaxed);
+        }
+    }
+    Some(found)
 }
+
+/// [`sync_page`] times one page in this many by part ([`SYNC_PARTS`]).
+const SYNC_PARTS_TIMED: u64 = 8;
+
+#[cfg(test)]
+static SYNC_PARTS_IN_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// The pages [`sync_page`] was given on this thread: which of them it times.
+    static SYNC_PAGES_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The pages [`sync_page`] was given since the start, and at the last frame
+/// line.
+static SYNC_PAGES_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SYNC_PAGES_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line, of the pages [`sync_page`] timed (one in
+/// [`SYNC_PARTS_TIMED`]; the serial pass only, not `sync_wide`): pages
+/// timed; nanoseconds reading the page's bytes; walking its records (their
+/// fingerprints against the last seen, under the fingerprints' lock);
+/// mirroring the records that changed (views made, host copies found, the
+/// records' lock); and walk and mirroring together where the page's records
+/// go one by one. A meter with `VICTORY_GUARDS_METER`
+/// (`crate::lockmeter::on`): without it, a look at a setting read once and
+/// nothing else. With it: a counter at each page and, at one page in eight,
+/// four readings of the clock and a look at a thread-local.
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The records of a changed stretch read from `from` on (`page_bytes`),
 /// handed to `host` ([`sync_page`]); `prints`, their fingerprints made
@@ -454,8 +521,27 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let parts = [0, 1, 2, 3, 4].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let seen_now = SYNC_PAGES_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+    let given = seen_now - SYNC_PAGES_SINCE.swap(seen_now, std::sync::atomic::Ordering::Relaxed).min(seen_now);
     if pages == 0 {
         return;
+    }
+    let f = frames.max(1.0);
+    if parts[0] > 0 {
+        // Each part's time over all pages given, from the pages timed.
+        let all = |ns: u64| ns as f64 * given as f64 / parts[0] as f64 / 1e6 / f;
+        let (read, walk, mirror, unsplit) = (all(parts[1]), all(parts[2]), all(parts[3]), all(parts[4]));
+        let total = micros as f64 / 1000.0 / f;
+        tracing::info!(
+            "sync_heaps by part, a frame (one page in {SYNC_PARTS_TIMED} timed, {:.1} of {:.1} pages; the serial pass):              {total:.2} ms in all; reading the pages {read:.2}, walking their records (fingerprints) {walk:.2}, mirroring              the records that changed {mirror:.2}, walk and mirroring one by one {unsplit:.2}, outside the pages (the              written ranges taken, locks) {:.2}; {:.1} pages, {:.0} slots looked at, {:.1} records mirrored",
+            parts[0] as f64 / f,
+            given as f64 / f,
+            total - read - walk - mirror - unsplit,
+            pages as f64 / f,
+            looked as f64 / f,
+            mirrored as f64 / f,
+        );
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
@@ -1522,8 +1608,24 @@ mod tests {
                 )
             };
             assert!(!host.made(5));
-            sync_heaps();
+            // On a thread of its own, whose first page `sync_page`'s meter
+            // times by part: the same record is made, and the meter saw the
+            // walk end and the mirroring after it.
+            let parts = |i: usize| SYNC_PARTS[i].load(std::sync::atomic::Ordering::Relaxed);
+            let (timed, mirrors) = (parts(0), parts(3));
+            // As with `VICTORY_GUARDS_METER`.
+            SYNC_PARTS_IN_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mark = std::thread::spawn(|| {
+                sync_heaps();
+                host::WALKED.get()
+            })
+            .join()
+            .unwrap();
+            SYNC_PARTS_IN_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
             assert!(host.made(5));
+            assert!(parts(0) > timed, "the thread's first page timed");
+            assert!(parts(3) > mirrors, "its mirroring timed apart from its walk");
+            assert_eq!(mark, (false, None), "the walk's mark taken back");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.

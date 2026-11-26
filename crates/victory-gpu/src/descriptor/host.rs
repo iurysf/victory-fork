@@ -642,6 +642,12 @@ struct Waiting {
 }
 
 thread_local! {
+    /// `super::sync_page`'s meter: whether it times the page now, and when
+    /// [`HostHeap::mirror_copied_page_with`] ended its walk of the records.
+    pub(crate) static WALKED: std::cell::Cell<(bool, Option<std::time::Instant>)> = const { std::cell::Cell::new((false, None)) };
+}
+
+thread_local! {
     /// This thread is inside [`HostHeap::publish`].
     static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -2233,6 +2239,10 @@ impl HostHeap {
                 *last = print;
                 due.push((index as u32, handle));
             }
+        }
+        // The walk is done ([`WALKED`]: `super::sync_page`'s meter).
+        if WALKED.get().0 {
+            WALKED.set((true, Some(std::time::Instant::now())));
         }
         if !zeroed.is_empty() {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
