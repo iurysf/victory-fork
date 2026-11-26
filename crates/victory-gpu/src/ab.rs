@@ -777,6 +777,12 @@ mod tests {
         assert!(parse("CARD_QUEUE=3,4").is_err(), "an on/off switch takes no value");
         assert!(parse("CARD_QUEUE,1").is_err(), "a block needs a reading left out and one kept");
         assert!(parse("CARD_QUEUE,4,6").unwrap_err().contains("multiple of 4"));
+        // Each switch is a bit of `MASK`, and a bit of its own.
+        assert!(KEYS.iter().all(|k| (k.0 as u32) < 64));
+        let all = KEYS.iter().fold(0u64, |m, k| m | 1 << k.0 as u32);
+        assert_eq!(all.count_ones() as usize, KEYS.len());
+        let last = parse("WIDE_FILLS+HEAP_SYNC_WIDE,4,16").unwrap();
+        assert_eq!(mask(&last), 1 << Key::WideFills as u32 | 1 << Key::HeapSyncWide as u32);
         assert_eq!(after_s(Some(" 60 ")), 60.0);
         assert_eq!(after_s(Some("x")), 0.0);
         assert_eq!(after_s(None), 0.0);
