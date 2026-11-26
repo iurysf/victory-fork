@@ -403,6 +403,150 @@ fn sync_wide(heaps: &[(u64, u64, usize)], wide: usize) -> [u64; 3] {
     [0, 1, 2].map(|i| counts[i].load(Relaxed))
 }
 
+/// Whether a submission's [`sync_heaps`] runs on a thread of its own
+/// (`victory-heap-sync`) while the submission is prepared, and is waited for
+/// just before its lists go to the card (`VICTORY_HEAP_SYNC_ASIDE=1`; off by
+/// default; the A/B may turn it, `HEAP_SYNC_ASIDE`).
+///
+/// The pass is on the submitting thread before the preparing, and nothing
+/// of the preparing reads what it makes: host slots, read by the card when
+/// the lists run. What the title writes into its heaps meanwhile (its own
+/// recording threads, a list's copies) is caught by the write watch, at
+/// this pass or the next, as it is now. The slots that waited for a
+/// texture's host copy ([`make_waiting`]) are made after the pass, as
+/// before, so that it does not undo them: with the switch, after the wait.
+/// The wait is part of the preparing on the frame line; `sync_heaps` there
+/// is the pass's own time, on its thread.
+///
+/// After avatarmanz/VIctory-7900XTX 44629de (`begin_sync_heaps`, the pass
+/// overlapped with the preparing).
+#[cfg(windows)]
+fn heap_sync_aside() -> bool {
+    #[cfg(test)]
+    if let Some(on) = HEAP_SYNC_ASIDE_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::HeapSyncAside, run)
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// [`heap_sync_aside`] for the tests on this thread.
+    static HEAP_SYNC_ASIDE_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The thread of [`heap_sync_aside`]: passes asked for, passes done, and
+/// whether one panicked.
+#[cfg(windows)]
+struct Aside {
+    state: std::sync::Mutex<(u64, u64, bool)>,
+    turn: std::sync::Condvar,
+}
+
+/// [`Aside`], its thread started at the first call; `None` if it could not
+/// be made.
+#[cfg(windows)]
+fn aside() -> Option<&'static Aside> {
+    static ASIDE: std::sync::OnceLock<Option<Aside>> = std::sync::OnceLock::new();
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let aside = ASIDE.get_or_init(|| Some(Aside { state: std::sync::Mutex::new((0, 0, false)), turn: std::sync::Condvar::new() }));
+    let started = *STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-heap-sync".into())
+            .spawn(|| {
+                let Some(Some(a)) = ASIDE.get() else {
+                    return;
+                };
+                let mut done = 0u64;
+                loop {
+                    let asked = {
+                        let mut s = a.state.lock().unwrap_or_else(|e| e.into_inner());
+                        while s.0 == done {
+                            s = a.turn.wait(s).unwrap_or_else(|e| e.into_inner());
+                        }
+                        s.0
+                    };
+                    let pass = std::panic::catch_unwind(sync_heaps);
+                    done = asked;
+                    let mut s = a.state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.1 = done;
+                    s.2 |= pass.is_err();
+                    a.turn.notify_all();
+                }
+            })
+            .is_ok()
+    });
+    if started { aside.as_ref() } else { None }
+}
+
+/// A submission's [`sync_heaps`]: done here, or under way on its own thread
+/// ([`heap_sync_aside`]) until [`SyncAside::finish`] (or the value's drop).
+#[cfg(windows)]
+pub(crate) struct SyncAside(Option<(&'static Aside, u64)>);
+
+/// The submission's [`sync_heaps`]: on this thread, now (then the caller
+/// makes the slots that waited, [`make_waiting`], as before), or started on
+/// its own thread with [`heap_sync_aside`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps() -> SyncAside {
+    if heap_sync_aside()
+        && let Some(a) = aside()
+    {
+        let mut s = a.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 += 1;
+        let ticket = s.0;
+        a.turn.notify_all();
+        return SyncAside(Some((a, ticket)));
+    }
+    sync_heaps();
+    SyncAside(None)
+}
+
+#[cfg(windows)]
+impl SyncAside {
+    /// Whether the pass runs on its own thread (then [`make_waiting`] waits
+    /// for [`SyncAside::finish`]).
+    pub(crate) fn aside(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Waits for the pass, if it runs on its own thread; then makes the slots
+    /// that waited ([`make_waiting`]), which the caller left for now.
+    pub(crate) fn finish(mut self) {
+        if self.wait() {
+            make_waiting();
+        }
+    }
+
+    /// Waits for the pass on its own thread; whether there was one.
+    fn wait(&mut self) -> bool {
+        let Some((a, ticket)) = self.0.take() else {
+            return false;
+        };
+        let mut s = a.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.1 < ticket {
+            s = a.turn.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        let panicked = std::mem::take(&mut s.2);
+        drop(s);
+        assert!(!panicked, "VICTORY_HEAP_SYNC_ASIDE's pass panicked on its thread");
+        true
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SyncAside {
+    /// A submission that ends early still waits for its pass, inside its
+    /// lock, as the pass on the submitting thread was.
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.wait();
+        }
+    }
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.
@@ -1709,6 +1853,56 @@ mod tests {
             SYNC_WIDE_JOBS.load(std::sync::atomic::Ordering::Relaxed) >= jobs_before + 2,
             "the wide pass ran in pieces"
         );
+    }
+
+    /// `VICTORY_HEAP_SYNC_ASIDE`: the pass started on its own thread has made
+    /// what was copied in once `finish` returns, and a pass left by an early
+    /// end (the value dropped) is waited for too; passes asked one after
+    /// another each run.
+    #[cfg(windows)]
+    #[test]
+    fn heap_sync_aside_is_done_when_finished_or_dropped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HEAP_SYNC_ASIDE_IN_TEST.set(None);
+            }
+        }
+        let _reset = Reset;
+        HEAP_SYNC_ASIDE_IN_TEST.set(Some(true));
+        // SAFETY: a fresh allocation of the test's.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut record = [0u8; 16];
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], record.as_mut_ptr() as u64);
+            for (round, slot) in [3u32, 4, 5, 6].into_iter().enumerate() {
+                // SAFETY: a slot of the test's heap.
+                unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), memory.cast::<u8>().add(slot as usize * 16), 16) };
+                assert!(!host.made(slot));
+                let pass = begin_sync_heaps();
+                assert!(pass.aside(), "the pass runs on its own thread");
+                if round % 2 == 0 {
+                    pass.finish();
+                } else {
+                    drop(pass);
+                }
+                assert!(host.made(slot), "round {round}: done when finished or dropped");
+            }
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
     #[test]

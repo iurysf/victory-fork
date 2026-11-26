@@ -6300,8 +6300,9 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted (on a thread of
+        // its own until just before they go, `VICTORY_HEAP_SYNC_ASIDE`).
+        let heaps_synced = crate::descriptor::begin_sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6321,7 +6322,10 @@ impl Host {
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // (After the pass: with it on its own thread, when it is done.)
+        if !heaps_synced.aside() {
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6429,6 +6433,9 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // The heaps' pass, if it ran beside the preparing, is done before the
+        // lists go (the wait counts in the preparing).
+        heaps_synced.finish();
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
