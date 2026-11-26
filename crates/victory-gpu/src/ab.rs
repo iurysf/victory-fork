@@ -81,13 +81,14 @@ pub(crate) enum Key {
     LandEcho,
     RefreshAhead,
     WideFills,
+    HeapSyncWide,
     SkipUnchanged,
     IndirectHoist,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 29] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 30] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -114,6 +115,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 29] = [
     (Key::LandEcho, "LAND_ECHO", None),
     (Key::RefreshAhead, "REFRESH_AHEAD", None),
     (Key::WideFills, "WIDE_FILLS", None),
+    (Key::HeapSyncWide, "HEAP_SYNC_WIDE", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",
@@ -396,6 +398,7 @@ fn other(key: Key, run: u64) -> u64 {
         Key::PresentQueued => if run == 0 { 1 } else { 0 },
         Key::UnderWide => if run == 0 { 4 } else { 0 },
         Key::GuardRest => if run == 0 { 3000 } else { 0 },
+        Key::HeapSyncWide => if run < 2 { 4 } else { 0 },
         _ => run,
     }
 }
