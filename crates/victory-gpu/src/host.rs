@@ -6388,6 +6388,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        batch.fill();
         drop(step);
         prep(crate::framelog::T::PrepStepsUs, steps.elapsed());
         let flushing = std::time::Instant::now();
@@ -7938,6 +7939,11 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    if wide_fills() {
+                        batch.fills.push((dst, src, len));
+                        preparing(1, len as u64);
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -7953,6 +7959,8 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else {
+                        batch.fill();
                     }
                     let working = std::time::Instant::now();
                     work();
@@ -7975,6 +7983,7 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    batch.fill();
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
@@ -8042,6 +8051,14 @@ fn wide_refresh() -> bool {
 fn refresh_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Whether upload-memory fills of a submission run together on worker threads
+/// (`VICTORY_WIDE_FILLS=1`; off by default). After avatarmanz aff4def.
+fn wide_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_FILLS").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::WideFills, run)
 }
 
 /// Whether the copies a submission's shaders write are brought up to date
@@ -8134,6 +8151,9 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps
     /// ([`Batch::refresh_ahead`]), and their disjoint ranges.
     ahead: std::collections::HashMap<usize, Vec<(usize, usize)>>,
+    /// Upload fills queued to run together (`dst`, `src`, `len`) under
+    /// [`wide_fills`].
+    fills: Vec<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -8227,9 +8247,10 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that writes title memory: pending fills and refreshes are
+    /// done first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.fill();
         self.flush();
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
@@ -8242,6 +8263,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.fill();
         self.flush();
         self.textures.clear();
         let end = at + len;
@@ -8253,6 +8275,38 @@ impl Batch {
             cut_range(ranges, at, end);
             !ranges.is_empty()
         });
+    }
+
+    /// Runs the pending upload fills queued in [`Batch::fills`] either serially
+    /// (fewer than 96) or in chunks of 64 via `crate::shadow::wide_run`.
+    fn fill(&mut self) {
+        const FEW: usize = 96;
+        const PART: usize = 64;
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        if self.fills.len() < FEW {
+            for (dst, src, len) in self.fills.drain(..) {
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        } else {
+            let fills = std::sync::Arc::new(std::mem::take(&mut self.fills));
+            let chunks = fills.len().div_ceil(PART);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..chunks)
+                .map(|i| {
+                    let fills = fills.clone();
+                    Box::new(move || {
+                        let end = ((i + 1) * PART).min(fills.len());
+                        for &(dst, src, len) in &fills[i * PART..end] {
+                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+        }
+        preparing(0, started.elapsed().as_micros() as u64);
     }
 
     /// Before the steps of `runs` ([`refresh_ahead_on`]): refreshes of copies
@@ -9931,6 +9985,55 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(covered(kept, 0x3000, 0x5000));
         batch.title_written();
         assert!(batch.ahead.is_empty());
+    }
+
+    /// `VICTORY_WIDE_FILLS=1`: `Batch::fill` matches byte-for-byte in both the
+    /// serial (`< 96`) and parallel (`>= 96` in chunks of 64) paths.
+    #[test]
+    fn wide_fills_match_serial_small_and_large() {
+        for count in [24usize, 200] {
+            let srcs: Vec<Vec<u8>> = (0..count)
+                .map(|i| (0..(i % 7 + 1) * 73).map(|j| ((i * 37 + j * 13) & 0xff) as u8).collect())
+                .collect();
+            let mut dsts: Vec<Vec<u8>> = srcs.iter().map(|s| vec![0u8; s.len()]).collect();
+            let mut batch = Batch::default();
+            for i in 0..count {
+                batch
+                    .fills
+                    .push((dsts[i].as_mut_ptr() as usize, srcs[i].as_ptr() as usize, srcs[i].len()));
+            }
+            batch.fill();
+            assert!(batch.fills.is_empty());
+            for i in 0..count {
+                assert_eq!(dsts[i], srcs[i], "count={count} index={i}");
+            }
+        }
+    }
+
+    /// Ordering barrier: `Batch::title_wrote` and `Batch::title_written` drain
+    /// pending `Batch::fills` before `src` can be overwritten by later steps.
+    #[test]
+    fn title_wrote_and_title_written_drain_pending_fills() {
+        let mut src_a = vec![0xA5u8; 512];
+        let mut dst_a = vec![0u8; 512];
+        let mut batch = Batch::default();
+        batch
+            .fills
+            .push((dst_a.as_mut_ptr() as usize, src_a.as_ptr() as usize, src_a.len()));
+        batch.title_wrote(src_a.as_ptr() as usize, src_a.len());
+        assert!(batch.fills.is_empty());
+        src_a.fill(0x11);
+        assert!(dst_a.iter().all(|&b| b == 0xA5));
+
+        let mut src_b = vec![0x5Au8; 512];
+        let mut dst_b = vec![0u8; 512];
+        batch
+            .fills
+            .push((dst_b.as_mut_ptr() as usize, src_b.as_ptr() as usize, src_b.len()));
+        batch.title_written();
+        assert!(batch.fills.is_empty());
+        src_b.fill(0x22);
+        assert!(dst_b.iter().all(|&b| b == 0x5A));
     }
 }
 
