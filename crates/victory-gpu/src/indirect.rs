@@ -1585,6 +1585,96 @@ void main() {
         assert_eq!(lost, 0, "bytes lost");
     }
 
+    /// `crate::host::CARD_DENSE` against `CARD_PATCH` on WARP: the same
+    /// title bytes (runs of single bytes, alternating dwords, dwords whole,
+    /// across dwords) put into a page at an offset of a copy, one way by a
+    /// patch per dword, the other by the page and its mask: the copy ends
+    /// the same byte for byte, the card's other bytes in place. The page's
+    /// bytes are those taken when the send was planned: the CPU's side
+    /// written after that (here, the buffer's own memory written again
+    /// before the list runs: the page was copied out of it) changes nothing
+    /// on the card.
+    #[test]
+    fn warp_card_dense_puts_in_what_the_patches_put_in() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let patch = compile_cs(&warp.device, crate::host::CARD_PATCH).expect("the card patch must compile on WARP");
+        let dense = compile_cs(&warp.device, crate::host::CARD_DENSE).expect("the dense pass must compile on WARP");
+        const PAGE: usize = 64 << 10;
+        const SIZE: usize = 3 * PAGE;
+        const AT: usize = PAGE + 4096;
+        let card0: Vec<u8> = (0..SIZE).map(|i| (i * 29 + i / 509) as u8).collect();
+        let mut cpu: Vec<u8> = (0..SIZE).map(|i| (i * 7 + 101) as u8).collect();
+        let (_a, a_ptr, a_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_b, b_ptr, b_gpu) = warp.shared_buffer(SIZE as u64);
+        // SAFETY: both mappings hold `SIZE` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(card0.as_ptr(), a_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(card0.as_ptr(), b_ptr, SIZE);
+        }
+        let mut ranges: Vec<(usize, usize)> = vec![(AT, AT + 1), (AT + 5, AT + 8), (AT + 9, AT + 10), (AT + 4093, AT + 4099)];
+        ranges.extend((0..1500).map(|k| (AT + 8192 + k * 8, AT + 8192 + k * 8 + 4)));
+        ranges.extend((0..300).map(|k| (AT + 30_000 + k * 6, AT + 30_000 + k * 6 + 3)));
+        ranges.push((AT + PAGE - 7, AT + PAGE));
+        ranges.sort_unstable();
+        // One way: a patch per dword.
+        let mut patches = Vec::new();
+        crate::shadow::dword_patches(&ranges, &cpu, &mut patches);
+        let pbytes = patches.len() * 12;
+        let (_p, p_ptr, p_gpu) = warp.shared_buffer(pbytes as u64);
+        // SAFETY: the mapping holds `pbytes`.
+        unsafe { std::ptr::copy_nonoverlapping(patches.as_ptr().cast::<u8>(), p_ptr, pbytes) };
+        // The other: the page's bytes and a bit per byte of its ranges.
+        let mut mask = vec![0u64; PAGE / 64];
+        for &(a, b) in &ranges {
+            for i in a - AT..b - AT {
+                mask[i / 64] |= 1 << (i % 64);
+            }
+        }
+        let (_d, d_ptr, d_gpu) = warp.shared_buffer((PAGE + PAGE / 8) as u64);
+        // SAFETY: the mapping holds the page and its mask.
+        unsafe {
+            std::ptr::copy_nonoverlapping(cpu.as_ptr().add(AT), d_ptr, PAGE);
+            std::ptr::copy_nonoverlapping(mask.as_ptr().cast::<u8>(), d_ptr.add(PAGE), PAGE / 8);
+        }
+        let expected = {
+            let mut e = card0.clone();
+            for &(a, b) in &ranges {
+                e[a..b].copy_from_slice(&cpu[a..b]);
+            }
+            e
+        };
+        // The CPU's side written after the send was planned.
+        for byte in &mut cpu[AT..AT + PAGE] {
+            *byte ^= 0xff;
+        }
+        // SAFETY: our open list, live buffers, each pass's own root signature.
+        unsafe {
+            warp.list.SetComputeRootSignature(&patch.root);
+            warp.list.SetPipelineState(&patch.pso);
+            warp.list.SetComputeRootUnorderedAccessView(2, a_gpu);
+            warp.list.SetComputeRoot32BitConstant(0, patches.len() as u32, 0);
+            warp.list.SetComputeRootShaderResourceView(1, p_gpu);
+            warp.list.Dispatch((patches.len() as u32).div_ceil(crate::host::CARD_PATCH_PER_GROUP), 1, 1);
+            warp.list.SetComputeRootSignature(&dense.root);
+            warp.list.SetPipelineState(&dense.pso);
+            warp.list.SetComputeRootUnorderedAccessView(3, b_gpu);
+            warp.list.SetComputeRoot32BitConstant(0, (PAGE / 4) as u32, 0);
+            warp.list.SetComputeRoot32BitConstant(0, AT as u32, 1);
+            warp.list.SetComputeRootShaderResourceView(1, d_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, d_gpu + PAGE as u64);
+            warp.list.Dispatch(((PAGE / 4) as u32).div_ceil(crate::host::CARD_DENSE_PER_GROUP), 1, 1);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mappings hold `SIZE` bytes; the card is done.
+        let (a, b) = unsafe { (std::slice::from_raw_parts(a_ptr, SIZE), std::slice::from_raw_parts(b_ptr, SIZE)) };
+        let wrong: Vec<usize> = (0..SIZE).filter(|&i| a[i] != expected[i]).take(8).collect();
+        assert!(wrong.is_empty(), "the patches put in bytes wrong at {wrong:?}");
+        let differ: Vec<usize> = (0..SIZE).filter(|&i| a[i] != b[i]).take(8).collect();
+        assert!(differ.is_empty(), "the page and the patches differ at {differ:?}");
+    }
+
     #[test]
     fn warp_card_patch_puts_in_only_the_title_bytes() {
         let Some(mut warp) = WarpHarness::new() else {

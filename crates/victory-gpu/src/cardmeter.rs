@@ -44,6 +44,9 @@ pub(crate) enum Kind {
     /// Inside one of those: a pass of ours that bounds indirect arguments,
     /// from before its first wait to after its last ([`clamp_begin`]).
     Clamp,
+    /// Inside a [`Kind::Sync`] list: the passes that put in the pages of
+    /// title bytes sent up whole (`VICTORY_UNDER_ON_CARD`).
+    Dense,
 }
 
 /// Pairs of timestamps in the ring.
@@ -87,6 +90,8 @@ struct Meter {
     /// Since the last table: passes of [`Kind::Clamp`] read, their
     /// microseconds, and the longest.
     clamps: (u64, u64, u64),
+    /// The same for [`Kind::Dense`].
+    dense: (u64, u64, u64),
     /// Frames since the last table.
     frames: u64,
     /// What each place held when it was last read: a place the card has
@@ -157,6 +162,7 @@ fn make() -> Option<Meter> {
             by_name: Default::default(),
             by_pipeline: Default::default(),
             clamps: (0, 0, 0),
+            dense: (0, 0, 0),
             frames: 0,
             seen: vec![(0, 0); PAIRS as usize],
         })
@@ -339,6 +345,11 @@ pub(crate) fn collect() {
                 m.clamps.1 += us;
                 m.clamps.2 = m.clamps.2.max(us);
             }
+            Kind::Dense => {
+                m.dense.0 += 1;
+                m.dense.1 += us;
+                m.dense.2 = m.dense.2.max(us);
+            }
             Kind::Pipeline => {
                 if let Some(name) = m.names.remove(&pair) {
                     let e = m.by_pipeline.entry(name).or_insert((0, 0));
@@ -368,6 +379,17 @@ pub(crate) fn collect() {
             let (n, us, longest) = std::mem::take(&mut m.clamps);
             tracing::info!(
                 "card time of our passes that bound indirect arguments (VICTORY_CARD_METER_CLAMPS=1), per frame over {} frames: {:.2} ms in {:.0} passes ({:.2} us each, the longest {} us); inside \"all other lists\"",
+                m.frames,
+                us as f64 / 1e3 / frames,
+                n as f64 / frames,
+                us as f64 / n.max(1) as f64,
+                longest
+            );
+        }
+        if m.dense.0 > 0 {
+            let (n, us, longest) = std::mem::take(&mut m.dense);
+            tracing::info!(
+                "card time of the passes that put in pages of title bytes sent up whole (VICTORY_UNDER_ON_CARD), per frame over {} frames: {:.3} ms in {:.1} passes ({:.2} us each, the longest {} us); inside the sends' lists",
                 m.frames,
                 us as f64 / 1e3 / frames,
                 n as f64 / frames,

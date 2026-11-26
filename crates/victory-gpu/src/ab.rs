@@ -88,11 +88,12 @@ pub(crate) enum Key {
     IndirectBatch,
     CardSyncBatch,
     IndirectBatchTextures,
+    UnderOnCard,
     None,
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 34] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 35] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -142,6 +143,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 34] = [
     // A turn changes where the next batch or first part ends
     // (`crate::indirect::batch_textures_on`).
     (Key::IndirectBatchTextures, "INDIRECT_BATCH_TEXTURES", None),
+    (Key::UnderOnCard, "UNDER_ON_CARD", None),
     (Key::None, "NONE", None),
 ];
 
@@ -203,7 +205,7 @@ pub(crate) fn parse(spec: &str) -> Result<Plan, String> {
         if b.is_some()
             && !matches!(
                 key,
-                Key::TextureHashEvery | Key::CopyPlainLeast | Key::PresentQueued | Key::UnderWide | Key::GuardRest
+                Key::TextureHashEvery | Key::CopyPlainLeast | Key::PresentQueued | Key::UnderWide | Key::GuardRest | Key::UnderOnCard
             )
         {
             return Err(format!("{name} is on or off: B is the other one, no value{whole}"));
@@ -415,6 +417,7 @@ fn other(key: Key, run: u64) -> u64 {
         Key::PresentQueued => if run == 0 { 1 } else { 0 },
         Key::UnderWide => if run == 0 { 4 } else { 0 },
         Key::GuardRest => if run == 0 { 3000 } else { 0 },
+        Key::UnderOnCard => if run == 0 { 2048 } else { 0 },
         Key::HeapSyncWide => if run < 2 { 4 } else { 0 },
         _ => run,
     }

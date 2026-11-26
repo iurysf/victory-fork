@@ -1662,6 +1662,11 @@ struct CardWork {
     /// The patches being made, kept from send to send (a frame's sends made
     /// 592,064 of them: a fresh list each time faulted its pages in).
     patch_scratch: Vec<[u32; 3]>,
+    /// [`CARD_DENSE`], if it compiled (made only when pages may go up
+    /// whole: `VICTORY_UNDER_ON_CARD` or the A/B naming it).
+    dense: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    /// Buffers for a plan's pages and masks, as `patch_buffers`.
+    dense_buffers: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1816,6 +1821,55 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Threads per group of [`CARD_PATCH`].
 pub(crate) const CARD_PATCH_PER_GROUP: u32 = 64;
+
+/// The title's bytes of one page put in under flights' writes, on the card
+/// (`VICTORY_UNDER_ON_CARD`, `crate::shadow::DensePage`): `bytes` holds the
+/// page as the CPU's side had it when the send was planned, `mask` a bit
+/// per byte to put in; a thread per dword puts in its masked bytes with the
+/// same two atomic steps as [`CARD_PATCH`], so the card's other bytes stay,
+/// in the same dwords too. `first`: the page's byte offset in the copy.
+pub(crate) const CARD_DENSE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Page : register(b0) { uint dwords; uint first; };
+ByteAddressBuffer bytes : register(t0);
+ByteAddressBuffer mask : register(t1);
+RWByteAddressBuffer copy : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= dwords) {
+        return;
+    }
+    uint nib = (mask.Load((id.x / 8u) * 4u) >> ((id.x % 8u) * 4u)) & 0xfu;
+    if (nib == 0u) {
+        return;
+    }
+    uint m = ((nib & 1u) != 0u ? 0x000000ffu : 0u) | ((nib & 2u) != 0u ? 0x0000ff00u : 0u)
+           | ((nib & 4u) != 0u ? 0x00ff0000u : 0u) | ((nib & 8u) != 0u ? 0xff000000u : 0u);
+    uint v = bytes.Load(id.x * 4u);
+    uint at = first + id.x * 4u;
+    copy.InterlockedAnd(at, ~m | v);
+    copy.InterlockedOr(at, v & m);
+}
+"#;
+
+/// Threads per group of [`CARD_DENSE`].
+pub(crate) const CARD_DENSE_PER_GROUP: u32 = 64;
+
+/// Whether a page may be put in whole (`crate::shadow`'s `dense_put`):
+/// [`CARD_DENSE`] and [`CARD_PATCH`] compiled, and changed bytes do not go
+/// up through the copy queue (`VICTORY_QUEUE2` bit 2), where the plan would
+/// only send its runs. Set when the card's work is made.
+static CARD_DENSE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`CARD_DENSE_READY`].
+pub(crate) fn card_dense_ready() -> bool {
+    CARD_DENSE_READY.load(Ordering::Relaxed)
+}
+
+/// Tests: the plan finds no memory for its pages (they go up as runs).
+#[cfg(test)]
+pub(crate) static DENSE_NO_ROOM_IN_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the copies in the card's memory take title bytes by
 /// [`CARD_PATCH`] (it compiled, and `VICTORY_CARD_PATCH=0` does not say
@@ -2126,6 +2180,35 @@ struct CardPlan {
     /// The buffer its patches of title bytes were in ([`CARD_PATCH`]),
     /// given back with its lists.
     patches: Option<(ID3D12Resource, usize, u64)>,
+    /// The buffer its pages put in whole were in ([`CARD_DENSE`]), as
+    /// `patches`.
+    dense: Option<(ID3D12Resource, usize, u64)>,
+}
+
+/// Copy `i`'s pages in the plan (`dense_at`, empty when there are none).
+fn dense_of(dense_at: &[Vec<(usize, usize, u64, u64)>], i: usize) -> &[(usize, usize, u64, u64)] {
+    dense_at.get(i).map_or(&[], Vec::as_slice)
+}
+
+/// The passes of [`CARD_DENSE`] for one copy (`card`, in unordered access,
+/// the pipeline bound): its pages in `buffer` (offset in the copy, bytes,
+/// where the bytes and the mask are).
+///
+/// # Safety
+/// An open list; live buffers; the offsets lie in them.
+unsafe fn record_dense(list: &ID3D12GraphicsCommandList, card: &ID3D12Resource, buffer: &ID3D12Resource, pages: &[(usize, usize, u64, u64)]) {
+    // SAFETY: the caller's.
+    unsafe {
+        list.SetComputeRootUnorderedAccessView(3, card.GetGPUVirtualAddress());
+        for &(at, n, bytes, mask) in pages {
+            let dwords = (n / 4) as u32;
+            list.SetComputeRoot32BitConstant(0, dwords, 0);
+            list.SetComputeRoot32BitConstant(0, at as u32, 1);
+            list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress() + bytes);
+            list.SetComputeRootShaderResourceView(2, buffer.GetGPUVirtualAddress() + mask);
+            list.Dispatch(dwords.div_ceil(CARD_DENSE_PER_GROUP), 1, 1);
+        }
+    }
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4195,6 +4278,9 @@ fn late_line(frames: f64) {
             if CARD_PATCHES.load(Ordering::Relaxed) { "" } else { ": off" }
         );
     }
+    if let Some(line) = crate::shadow::dense_line(frames) {
+        tracing::info!("{line}");
+    }
 }
 
 #[cfg(test)]
@@ -4863,6 +4949,19 @@ impl Host {
                 patch: self.make_card_patch(),
                 patch_buffers: Vec::new(),
                 patch_scratch: Vec::new(),
+                dense: if crate::shadow::dense_cited() {
+                    let made = self.make_card_shader(CARD_DENSE, "card dense");
+                    CARD_DENSE_READY.store(
+                        made.is_some()
+                            && CARD_PATCHES.load(Ordering::Relaxed)
+                            && crate::queue2::second().filter(|s| s.uploads()).is_none(),
+                        Ordering::Relaxed,
+                    );
+                    made
+                } else {
+                    None
+                },
+                dense_buffers: Vec::new(),
             })
         }
     }
@@ -4916,6 +5015,54 @@ impl Host {
             tracing::warn!("no patch of title bytes into copies in the card's memory: a copy per run, as before");
         }
         CARD_PATCHES.store(made.is_some(), Ordering::Relaxed);
+        made
+    }
+
+    /// A compute shader of ours (`source`, its root signature inside),
+    /// compiled: root signature and pipeline, or none.
+    fn make_card_shader(&self, source: &str, what: &str) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let mut code: Option<ID3DBlob> = None;
+        let name = std::ffi::CString::new(what).unwrap_or_default();
+        // SAFETY: the source and names live through the call; the out
+        // pointer is ours; the blob's own bytes, the root signature inside.
+        let made = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                windows::core::PCSTR(name.as_ptr().cast()),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .ok()
+            .and(code)
+            .and_then(|code| {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).ok()?;
+                let pso: ID3D12PipelineState = self
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()?;
+                Some((root, pso))
+            })
+        };
+        if made.is_none() {
+            tracing::warn!(what, "a compute shader of ours did not compile: the old way");
+        }
         made
     }
 
@@ -5083,6 +5230,58 @@ impl Host {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
+                }
+            }
+        }
+        // Pages put in whole (`VICTORY_UNDER_ON_CARD`): their bytes and masks
+        // into a buffer of the plan's now, and a pass of `CARD_DENSE` each
+        // below; without the pass, memory for them, or with the copy queue's
+        // uploads, their runs join the copy's ranges (the old way).
+        // (Never named: nothing of this is made.)
+        let pages: Vec<Vec<crate::shadow::DensePage>> =
+            if crate::shadow::dense_cited() { dirty.iter().map(|(s, _)| s.card_dense_up()).collect() } else { Vec::new() };
+        let mut dense_at: Vec<Vec<(usize, usize, u64, u64)>> = Vec::new();
+        let mut dense_in: Option<(ID3D12Resource, usize, u64)> = None;
+        if pages.iter().any(|p| !p.is_empty()) {
+            dense_at = vec![Vec::new(); dirty.len()];
+            let bytes = pages.iter().map(|p| crate::shadow::dense_bytes(p)).sum::<usize>() as u64;
+            #[cfg(test)]
+            let refused = DENSE_NO_ROOM_IN_TEST.load(Ordering::Relaxed);
+            #[cfg(not(test))]
+            let refused = false;
+            if work.dense.is_some() && crate::queue2::second().filter(|s| s.uploads()).is_none() && !refused {
+                dense_in = match work.dense_buffers.iter().position(|b| b.2 >= bytes && b.2 <= (bytes * 4).max(1 << 20)) {
+                    Some(i) => Some(work.dense_buffers.swap_remove(i)),
+                    None => {
+                        let size = bytes.next_power_of_two().max(1 << 20);
+                        self.shared_buffer(size).map(|(buffer, data)| {
+                            name(&buffer, || "pages of title bytes for copies in the card's memory".into());
+                            (buffer, data as usize, size)
+                        })
+                    }
+                };
+                if work.dense_buffers.len() > 8 {
+                    work.dense_buffers.sort_unstable_by_key(|b| std::cmp::Reverse(b.2));
+                    work.dense_buffers.truncate(8);
+                }
+            }
+            match &dense_in {
+                Some((_, data, _)) => {
+                    let mut offset = 0usize;
+                    for (((shadow, _), p), at) in dirty.iter().zip(&pages).zip(dense_at.iter_mut()) {
+                        if !p.is_empty() {
+                            // SAFETY: the mapping holds `bytes` or more, and
+                            // the buffer is no plan's.
+                            *at = unsafe { shadow.card_dense_into(p, *data as *mut u8, &mut offset) };
+                        }
+                    }
+                }
+                None => {
+                    for ((_, ranges), p) in dirty.iter_mut().zip(&pages) {
+                        if !p.is_empty() {
+                            *ranges = crate::shadow::with_dense_runs(std::mem::take(ranges), p);
+                        }
+                    }
                 }
             }
         }
@@ -5265,6 +5464,32 @@ impl Host {
                                 }
                             }
                         }
+                        // 2b. The pages put in whole (`CARD_DENSE`): their copies
+                        // in unordered access, the pipeline bound once.
+                        if let (Some((buffer, _, _)), Some((root, pso))) = (&dense_in, &work.dense) {
+                            let mut moves = Vec::new();
+                            for (((shadow, _), at), state) in dirty.iter().zip(&dense_at).zip(states.iter_mut()) {
+                                if !at.is_empty() && shadow.card_sides().is_some() && *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+                                    moves.push(transition(&shadow.buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                                    *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                                }
+                            }
+                            if !moves.is_empty() {
+                                list.ResourceBarrier(&moves);
+                            }
+                            if dense_at.iter().any(|a| !a.is_empty()) {
+                                let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Dense);
+                                list.SetComputeRootSignature(root);
+                                list.SetPipelineState(pso);
+                                for ((shadow, _), at) in dirty.iter().zip(&dense_at) {
+                                    if at.is_empty() || shadow.card_sides().is_none() {
+                                        continue;
+                                    }
+                                    record_dense(list, &shadow.buffer, buffer, at);
+                                }
+                                crate::cardmeter::end(list, timed);
+                            }
+                        }
                         // 3. One state change for every copy hashed.
                         let moves: Vec<_> = dirty
                             .iter()
@@ -5279,7 +5504,8 @@ impl Host {
                         }
                         // 4. Every hash pass, the pipeline bound once.
                         let mut bound = false;
-                        for (shadow, ranges) in &dirty {
+                        for (i, (shadow, ranges)) in dirty.iter().enumerate() {
+                            let here = dense_of(&dense_at, i);
                             let Some((_, Some(before), size)) = shadow.card_sides() else {
                                 continue;
                             };
@@ -5294,7 +5520,7 @@ impl Host {
                             let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                                 vec![shadow.card_run(0, usize::MAX)]
                             } else {
-                                ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                                ranges.iter().copied().chain(here.iter().map(|&(at, n, _, _)| (at, at + n))).map(|(a, b)| shadow.card_run(a, b)).collect()
                             };
                             // The same pieces in fewer passes (`rehash_runs`).
                             let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5306,7 +5532,8 @@ impl Host {
                         }
                     }
                     // Copy by copy, as before.
-                    for ((shadow, ranges), patched) in dirty.iter().zip(&split).filter(|_| !in_steps) {
+                    for (i, ((shadow, ranges), patched)) in dirty.iter().zip(&split).enumerate().filter(|_| !in_steps) {
+                        let here = dense_of(&dense_at, i);
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -5348,6 +5575,19 @@ impl Host {
                                 first += n;
                             }
                         }
+                        // The pages put in whole (`CARD_DENSE`), after the
+                        // patches.
+                        if let (false, Some((buffer, _, _)), Some((root, pso))) = (here.is_empty(), &dense_in, &work.dense) {
+                            if state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+                                list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                                state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            }
+                            let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Dense);
+                            list.SetComputeRootSignature(root);
+                            list.SetPipelineState(pso);
+                            record_dense(list, &shadow.buffer, buffer, here);
+                            crate::cardmeter::end(list, timed);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -5368,7 +5608,7 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            ranges.iter().copied().chain(here.iter().map(|&(at, n, _, _)| (at, at + n))).map(|(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -5400,6 +5640,7 @@ impl Host {
             inflight: false,
             inflight_landed: 0,
             patches: patches_in,
+            dense: dense_in,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5539,6 +5780,9 @@ impl Host {
         };
         if let Some(buffer) = plan.patches {
             work.patch_buffers.push(buffer);
+        }
+        if let Some(buffer) = plan.dense {
+            work.dense_buffers.push(buffer);
         }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
@@ -10516,6 +10760,153 @@ void main() {
             eprintln!("queue2_tests: the direct queue alone (late {}, relay {})", late(), relay());
         }
         drop(lists);
+    }
+
+    /// `VICTORY_UNDER_ON_CARD` end to end, through the host's own paths: a
+    /// flight declares a piece and is in the air; the title rewrites the
+    /// piece densely (every other dword) but for the dword the flight's
+    /// shader writes; the next submission's refresh puts the title's bytes
+    /// in under the flight's writes, and its shader reads one of them. Run
+    /// three ways in one process: as runs (the switch at 0 on this thread),
+    /// as a page put in on the card, and as a page whose plan finds no
+    /// memory for it (it goes up as runs after all). Each way, title memory
+    /// ends the same: the title's dense bytes as written, the flight's
+    /// write come back, the next shader having read the title's byte (the
+    /// card had it), nothing else moved; and the card's compare and fetch
+    /// counts are the same each way (the page's span was hashed as its runs
+    /// would be). Run with
+    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_RELAY=2
+    ///  VICTORY_UNDER_ON_CARD=64 cargo test -p victory-gpu --features
+    ///  diagnostics queue2_tests`; it does nothing otherwise.
+    #[test]
+    fn warp_dense_pages_go_up_as_their_runs_would_and_shader_writes_come_back() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        if std::env::var_os("VICTORY_UNDER_ON_CARD").is_none() || !relay() {
+            eprintln!("queue2_tests: dense pages skipped (VICTORY_UNDER_ON_CARD and VICTORY_RELAY=2)");
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 2 << 20;
+        // The piece the flight declares, the dword its shader writes there,
+        // the dword the next shader reads (the title's), where it stores.
+        let (p, flight_to, from, next_to) = (2 * PIECE, 2 * PIECE + 0x100, 2 * PIECE + 0x208, 5 * PIECE + 0x40);
+        let base = |i: usize| 0x5A00_0000 | i as u32;
+        let dense = |at: usize| 0x0D00_0000 ^ (at as u32).wrapping_mul(2_654_435_761);
+        // (title memory as it ended, the card's compare and fetch counts)
+        let run = |mode: u8| -> (Vec<u32>, [u64; 3]) {
+            crate::shadow::UNDER_ON_CARD_IN_TEST.set(Some(if mode == 0 { 0 } else { 64 }));
+            DENSE_NO_ROOM_IN_TEST.store(mode == 2, Ordering::Relaxed);
+            // SAFETY: a plain allocation of our own, write-watched as the title's is.
+            let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+            assert!(!title.is_null());
+            let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
+            for i in 0..LEN / 4 {
+                // SAFETY: inside the allocation.
+                unsafe { dword(i * 4).write_volatile(base(i)) };
+            }
+            let resource = 0x0D_E000 + usize::from(mode);
+            crate::shadow::register(resource, title as u64, LEN as u64);
+            let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+            assert!(shadow.carded(), "the copy is in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+            let stats = || [2, 3, 4].map(|i| crate::shadow::CARD_STATS[i].load(Ordering::Relaxed));
+            let dense_before = [0, 3].map(|i| crate::shadow::DENSE[i].load(Ordering::Relaxed));
+            let stats_before = stats();
+            let record = |list: &HostList, to: usize, from: usize, add: u32, spin: u32| {
+                // SAFETY: an open list; the copy's buffer, with unordered
+                // access; the shader's own root signature.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    let constants = [to as u32, from as u32, add, spin];
+                    list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                    list.list.Dispatch(1, 1, 1);
+                }
+            };
+            // The flight: piece `p` declared; its shader stores 7 + the
+            // dword at `flight_to + 4` into `flight_to`, after a long spin.
+            let a = host.new_list().expect("a host list");
+            shadow.refresh(&a, title as u64, LEN as u64);
+            shadow.gpu_writes(&a, (title as usize + p) as u64, PIECE as u64);
+            record(&a, flight_to, flight_to + 4, 7, 200_000);
+            a.close();
+            host.execute_own(&a);
+            // The title rewrites the piece densely, the flight's two dwords
+            // left as they were.
+            for at in (p..p + PIECE).step_by(8).filter(|&at| at != flight_to && at != flight_to + 4) {
+                // SAFETY: inside the allocation.
+                unsafe { dword(at).write_volatile(dense(at)) };
+            }
+            // The next submission: refreshes all (the title's bytes put in
+            // under the flight), its shader reads the title's dword.
+            let b = host.new_list().expect("a host list");
+            shadow.refresh(&b, title as u64, LEN as u64);
+            shadow.gpu_writes(&b, (title as usize + 5 * PIECE) as u64, PIECE as u64);
+            record(&b, next_to, from, 1, 0);
+            b.close();
+            host.execute_own(&b);
+            settle_now(WHY_SYNC);
+            let dense_after = [0, 3].map(|i| crate::shadow::DENSE[i].load(Ordering::Relaxed));
+            let counts = std::array::from_fn(|i| stats()[i] - stats_before[i]);
+            let ended: Vec<u32> = (0..LEN / 4).map(|i| unsafe { dword(i * 4).read_volatile() }).collect();
+            match mode {
+                0 => assert_eq!(dense_after, dense_before, "no page as runs"),
+                1 => assert!(dense_after[0] > dense_before[0], "a page put in on the card"),
+                _ => assert!(dense_after[1] > dense_before[1], "a page sent as runs after all"),
+            }
+            drop((a, b));
+            crate::shadow::unregister(resource, title as u64);
+            drop(shadow);
+            settle_now(WHY_SYNC);
+            // SAFETY: our own allocation, which no copy holds any more.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            (ended, counts)
+        };
+        let ways: Vec<(Vec<u32>, [u64; 3])> = (0..3).map(run).collect();
+        crate::shadow::UNDER_ON_CARD_IN_TEST.set(None);
+        DENSE_NO_ROOM_IN_TEST.store(false, Ordering::Relaxed);
+        let (runs, _) = &ways[0];
+        for at in (p..p + PIECE).step_by(8).filter(|&at| at != flight_to && at != flight_to + 4) {
+            assert_eq!(runs[at / 4], dense(at), "the title's dense dword at {at:#x}");
+        }
+        assert_eq!(runs[flight_to / 4], base((flight_to + 4) / 4) + 7, "the flight's write came back");
+        assert_eq!(runs[next_to / 4], dense(from) + 1, "the next shader read the title's dword");
+        for (k, (ended, counts)) in ways.iter().enumerate().skip(1) {
+            let differ: Vec<usize> = (0..LEN / 4).filter(|&i| ended[i] != runs[i]).take(8).collect();
+            assert!(differ.is_empty(), "way {k}: title memory differs from the runs' at dwords {differ:?}");
+            assert_eq!(counts, &ways[0].1, "way {k}: the card's compare and fetches");
+        }
     }
 
     /// `memory[to] = first` at once; then `spin` steps, each a store to

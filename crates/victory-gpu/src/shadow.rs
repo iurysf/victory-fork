@@ -171,8 +171,36 @@ struct Card {
     /// first range, cleared when [`card_dirty`] takes them. Written under
     /// `dirty`'s lock.
     queued: std::sync::atomic::AtomicBool,
+    /// With [`under_on_card`]: the pages of title bytes put in under
+    /// flights' writes that go up whole and are put in on the card by
+    /// their mask ([`Dense`]). Locked inside `dirty`'s lock (and `sent`'s).
+    dense: Mutex<Dense>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// A page of title bytes put in under flights' writes ([`under_on_card`]):
+/// at offset `at` of the copy, `n` bytes (both multiples of 4), a bit per
+/// byte set where the title's byte was put into the CPU's side (what the
+/// runs of the old way are), and how many runs that is.
+#[derive(Clone)]
+pub(crate) struct DensePage {
+    at: usize,
+    n: usize,
+    mask: Arc<Vec<u64>>,
+    runs: u64,
+}
+
+/// A copy's [`DensePage`]s: put in and not taken by a send yet; taken by
+/// a send and not recorded yet (`Host::card_before` takes them); and,
+/// with [`relay`], those sent, with the number of the send, kept as
+/// `Card::sent` keeps its ranges (a merge of pieces fetched before that
+/// send leaves their bytes alone: [`Shadow::card_merge_relay`]).
+#[derive(Default)]
+struct Dense {
+    pending: Vec<DensePage>,
+    up: Vec<DensePage>,
+    sent: Vec<(DensePage, u64)>,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -472,8 +500,8 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         return all
             .into_iter()
             .filter_map(|shadow| {
-                let ranges = shadow.card.as_ref().map(|c| card_take(c, sent_as, fetched)).unwrap_or_default();
-                (!ranges.is_empty()).then(|| (shadow, joined(ranges)))
+                let (ranges, dense) = shadow.card.as_ref().map(|c| card_take_all(c, sent_as, fetched)).unwrap_or_default();
+                (!ranges.is_empty() || dense).then(|| (shadow, joined(ranges)))
             })
             .collect();
     }
@@ -489,8 +517,8 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(c) = shadow.card.as_ref() else {
             continue;
         };
-        let ranges = card_take(c, sent_as, fetched);
-        if !ranges.is_empty() {
+        let (ranges, dense) = card_take_all(c, sent_as, fetched);
+        if !ranges.is_empty() || dense {
             out.push((shadow, joined(ranges)));
         }
     }
@@ -500,16 +528,36 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 /// A card copy's changed ranges, taken for send `sent_as` ([`card_dirty`]):
 /// its queue mark cleared under `dirty`'s lock, so a change after this
 /// queues it again.
+#[cfg(test)]
 fn card_take(c: &Card, sent_as: u64, fetched: u64) -> Vec<(usize, usize)> {
+    card_take_all(c, sent_as, fetched).0
+}
+
+/// [`card_take`], and whether pages put in whole ([`DensePage`]) were taken
+/// too: they wait in `Card::dense` for `Host::card_before`
+/// ([`Shadow::card_dense_up`]), and with [`relay`] are noted with the send
+/// as the ranges are.
+fn card_take_all(c: &Card, sent_as: u64, fetched: u64) -> (Vec<(usize, usize)>, bool) {
     let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
     c.queued.store(false, Ordering::Release);
     let ranges = std::mem::take(&mut *dirty);
-    if relay() {
-        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sent = relay().then(|| c.sent.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Some(sent) = sent.as_mut() {
         sent.retain(|s| s.2 > fetched);
         sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
     }
-    ranges
+    let mut taken = false;
+    if dense_kept() {
+        let mut dense = c.dense.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = std::mem::take(&mut dense.pending);
+        taken = !pages.is_empty();
+        if sent.is_some() {
+            dense.sent.retain(|s| s.1 > fetched);
+            dense.sent.extend(pages.iter().map(|p| (p.clone(), sent_as)));
+        }
+        dense.up.extend(pages);
+    }
+    (ranges, taken)
 }
 
 /// Whether [`card_dirty`] takes only the copies queued when they changed
@@ -567,6 +615,192 @@ fn card_queue_canary(queued: &[usize]) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The tests' setting of [`under_on_card`] on this thread.
+    /// The unit tests' word that the card could take a page ([`Shadow::dense_put`]).
+    static DENSE_READY_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static UNDER_ON_CARD_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_UNDER_ON_CARD=N` (0 or unset: off): a page of a copy in the
+/// card's memory on which the title's bytes put in under flights' writes
+/// make `N` runs or more goes up whole, with a bit per byte for the bytes
+/// put in, and a pass of ours on the card puts those bytes in
+/// (`crate::host::CARD_DENSE`), where the old way found the runs, took room
+/// for them, noted each for the card and made a patch of every dword
+/// (`CARD_PATCH`). The bytes the card gets are the same: the CPU's side's
+/// bytes when the send is planned, where the runs are. In the yard five
+/// copies held 95 % of some 900,000 runs and patch runs a frame, 8,000 to
+/// 14,000 runs on each page the title rewrote. May turn within a run
+/// (`crate::ab`, B 2,048): a page goes one way or the other whole.
+fn under_on_card() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = UNDER_ON_CARD_IN_TEST.get() {
+        return n;
+    }
+    static RUN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let run = *RUN.get_or_init(|| std::env::var("VICTORY_UNDER_ON_CARD").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0));
+    crate::ab::number(crate::ab::Key::UnderOnCard, run)
+}
+
+/// Whether pages may be put in whole at all in this run
+/// ([`under_on_card`] set, or named by the A/B): otherwise nothing of it is
+/// looked at, and no lock of it taken. Read once.
+fn dense_kept() -> bool {
+    #[cfg(test)]
+    if UNDER_ON_CARD_IN_TEST.get().is_some() {
+        return true;
+    }
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("VICTORY_UNDER_ON_CARD").ok().and_then(|v| v.trim().parse::<u64>().ok()).is_some_and(|n| n > 0)
+            || std::env::var("VICTORY_AB").is_ok_and(|ab| ab.to_ascii_uppercase().contains("UNDER_ON_CARD"))
+    })
+}
+
+/// [`dense_kept`], for the host (whether to make `CARD_DENSE`).
+pub(crate) fn dense_cited() -> bool {
+    dense_kept()
+}
+
+/// Since the last frame line ([`dense_line`]): pages put in whole, their
+/// bytes and masks sent up, the runs they stood for; pages that went up as
+/// runs after all (no memory for them, or the copy queue's uploads).
+pub(crate) static DENSE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Frame-log line of [`under_on_card`], when on or non-zero.
+pub(crate) fn dense_line(frames: f64) -> Option<String> {
+    if !dense_kept() {
+        return None;
+    }
+    let n: [u64; 4] = std::array::from_fn(|i| DENSE[i].swap(0, Ordering::Relaxed));
+    let on = under_on_card();
+    if on == 0 && n.iter().all(|&v| v == 0) {
+        return None;
+    }
+    let f = frames.max(1.0);
+    Some(format!(
+        "title bytes under flights' writes put in on the card by pages (VICTORY_UNDER_ON_CARD {on}), a frame: {:.1} pages, \
+         {:.2} MB sent up with their masks, standing for {:.0} runs; {:.1} pages sent as runs after all",
+        n[0] as f64 / f,
+        n[1] as f64 / (1 << 20) as f64 / f,
+        n[2] as f64 / f,
+        n[3] as f64 / f,
+    ))
+}
+
+/// A bit per byte of `now` (in 64-bit words), set where it differs from
+/// `was` (of one length); the runs of set bits; the bits set. Eight bytes
+/// at a time.
+fn byte_mask(now: &[u8], was: &[u8]) -> (Vec<u64>, u64, u64) {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let n = now.len().min(was.len());
+    let mut mask = vec![0u64; n.div_ceil(64)];
+    for (k, (a, b)) in now[..n].chunks(8).zip(was[..n].chunks(8)).enumerate() {
+        let bits = if a.len() == 8 {
+            let x = u64::from_le_bytes(a.try_into().unwrap_or([0; 8])) ^ u64::from_le_bytes(b.try_into().unwrap_or([0; 8]));
+            // The top bit of each byte set where the byte is not 0, then
+            // the eight top bits gathered into one byte.
+            let top = (((x & LOW) + LOW) | x) & !LOW;
+            (top >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56
+        } else {
+            a.iter().zip(b).enumerate().fold(0u64, |m, (i, (p, q))| m | u64::from(p != q) << i)
+        };
+        mask[k / 8] |= bits << ((k % 8) * 8);
+    }
+    let (mut runs, mut set, mut carry) = (0u64, 0u64, 0u64);
+    for &w in &mask {
+        runs += u64::from((w & !((w << 1) | carry)).count_ones());
+        set += u64::from(w.count_ones());
+        carry = w >> 63;
+    }
+    (mask, runs, set)
+}
+
+/// What [`Room::take`] would take for the runs of `mask` (a bit per byte of
+/// `n` bytes from a dword's start) with patches: a copy for each run of
+/// [`CARD_PATCH_RUN`] bytes or more, the dwords touched by the others.
+/// Found by the words of the mask, without making the runs.
+fn mask_room(mask: &[u64], n: usize) -> (usize, usize) {
+    let bit = |i: usize| mask[i / 64] >> (i % 64) & 1 != 0;
+    let (mut copies, mut patches) = (0usize, 0usize);
+    let mut i = 0;
+    while i < n {
+        let word = mask[i / 64] >> (i % 64);
+        if word == 0 {
+            i = (i / 64 + 1) * 64;
+            continue;
+        }
+        let start = i + word.trailing_zeros() as usize;
+        if start >= n {
+            break;
+        }
+        // The run's end: the next clear bit.
+        let mut end = start;
+        loop {
+            let inv = !mask[end / 64] >> (end % 64);
+            let zeros = inv.trailing_zeros() as usize;
+            if zeros < 64 - end % 64 {
+                end += zeros;
+                break;
+            }
+            end = (end / 64 + 1) * 64;
+            if end >= n || end / 64 >= mask.len() {
+                break;
+            }
+        }
+        let end = end.min(n);
+        debug_assert!(end > start && bit(start));
+        if end - start < CARD_PATCH_RUN {
+            patches += end.div_ceil(4) - start / 4;
+        } else {
+            copies += 1;
+        }
+        i = end;
+    }
+    (copies, patches)
+}
+
+/// The runs of a [`DensePage`] (offsets of the copy, in order).
+fn dense_runs(page: &DensePage) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut open: Option<usize> = None;
+    for i in 0..page.n {
+        let set = page.mask[i / 64] >> (i % 64) & 1 != 0;
+        match (set, open) {
+            (true, None) => open = Some(i),
+            (false, Some(from)) => {
+                runs.push((page.at + from, page.at + i));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = open {
+        runs.push((page.at + from, page.at + page.n));
+    }
+    runs
+}
+
+/// The bytes `pages` take in the plan's buffer ([`Shadow::card_dense_into`]):
+/// each page's bytes, then its mask's, rounded up to 4.
+pub(crate) fn dense_bytes(pages: &[DensePage]) -> usize {
+    pages.iter().map(|p| p.n + p.n.div_ceil(32) * 4).sum()
+}
+
+/// `ranges` (in order, apart) with the runs of `pages` in: pages that go up
+/// as runs after all. Counted in [`DENSE`].
+pub(crate) fn with_dense_runs(ranges: Vec<(usize, usize)>, pages: &[DensePage]) -> Vec<(usize, usize)> {
+    let mut all = ranges;
+    for page in pages {
+        all.extend(dense_runs(page));
+    }
+    DENSE[3].fetch_add(pages.len() as u64, Ordering::Relaxed);
+    all.sort_unstable();
+    joined(all)
+}
+
 /// A run of title bytes shorter than this goes to the card's side as
 /// patches of dwords (`crate::host::CARD_PATCH`), a longer one by a copy
 /// of its own.
@@ -589,6 +823,9 @@ const PATCH_ROOM: usize = (16 << 20) / 12;
 pub(crate) struct Room {
     copies: usize,
     patches: usize,
+    /// Pages that may still go up whole ([`under_on_card`]): 512 (36 MiB
+    /// with their masks); past that, the old way.
+    dense: usize,
 }
 
 impl Room {
@@ -596,6 +833,7 @@ impl Room {
         Room {
             copies,
             patches: if patching { PATCH_ROOM } else { 0 },
+            dense: 512,
         }
     }
 
@@ -2425,6 +2663,65 @@ pub(crate) fn under_by_copy_line(frames: f64) -> Option<String> {
 }
 
 #[cfg(test)]
+mod dense_mask_tests {
+    use super::*;
+
+    /// The mask of a page ([`byte_mask`]) holds exactly the bytes of the
+    /// runs the old way finds ([`changed_runs`]), and its runs are those
+    /// runs ([`dense_runs`]): bytes alone, side by side, at the ends,
+    /// alternating dwords, a page all changed, one with nothing.
+    #[test]
+    fn a_pages_mask_is_its_runs() {
+        const N: usize = 64 << 10;
+        let was: Vec<u8> = (0..N).map(|i| (i * 31 + 7) as u8).collect();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let cases: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![0],
+            vec![N - 1],
+            vec![7, 8, 9, 63, 64, 65, 127, 128],
+            (0..N).step_by(8).collect(),
+            (0..N).filter(|i| i % 8 < 4).collect(),
+            (0..N).collect(),
+            (300..300 + 3 * CARD_PATCH_RUN).chain(5000..5000 + CARD_PATCH_RUN - 1).chain(9000..9000 + 64).collect(),
+            (0..4000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as usize % N
+                })
+                .collect(),
+        ];
+        for (k, changed) in cases.into_iter().enumerate() {
+            let mut now = was.clone();
+            for &i in &changed {
+                now[i] ^= 0x5a;
+            }
+            let runs = changed_runs(&now, &was);
+            let (mask, count, bytes) = byte_mask(&now, &was);
+            assert_eq!(count, runs.len() as u64, "case {k}: runs");
+            assert_eq!(bytes, runs.iter().map(|r| r.1 as u64).sum::<u64>(), "case {k}: bytes");
+            let room = |runs: &[(usize, usize)]| {
+                let (mut c, mut p) = (0usize, 0usize);
+                for &(a, n) in runs {
+                    if n < CARD_PATCH_RUN {
+                        p += (a + n).div_ceil(4) - a / 4;
+                    } else {
+                        c += 1;
+                    }
+                }
+                (c, p)
+            };
+            assert_eq!(mask_room(&mask, N), room(&runs), "case {k}: the room its runs take");
+            let page = DensePage { at: 4096, n: N, mask: Arc::new(mask), runs: count };
+            let expected: Vec<(usize, usize)> = runs.iter().map(|&(a, n)| (4096 + a, 4096 + a + n)).collect();
+            assert_eq!(dense_runs(&page), expected, "case {k}: the page's runs");
+        }
+    }
+}
+
+#[cfg(test)]
 mod under_meter_tests {
     use super::*;
 
@@ -3817,6 +4114,14 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // A page the title rewrote densely goes up whole and is
+                    // put in on the card by its mask (`VICTORY_UNDER_ON_CARD`).
+                    if let Some((runs, bytes)) = self.dense_put(at, title, held, room) {
+                        MERGED[1].fetch_add(runs, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes, Ordering::Relaxed);
+                        under_note(self.start as usize, self.len, 0, runs, 0);
+                        under_page(self.start as usize, self.len, (start + at) / PAGE, runs);
+                    } else {
                     let compared = if wide >= 1 { crate::underwide::changed_runs(title, held) } else { changed_runs(title, held) };
                     let runs = joined_over(compared, merge_gap());
                     let patchable = self.card_sides().is_some_and(|(_, _, size)| crate::host::card_patchable(size));
@@ -3835,6 +4140,7 @@ impl Shadow {
                     MERGED[2].fetch_add(bytes, Ordering::Relaxed);
                     under_note(self.start as usize, self.len, 0, runs.len() as u64, 0);
                     under_page(self.start as usize, self.len, (start + at) / PAGE, runs.len() as u64);
+                    }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         return true;
@@ -4364,6 +4670,102 @@ impl Shadow {
         }
     }
 
+    /// With [`under_on_card`]: the title's bytes `title` of the page at
+    /// offset `at` of a copy in the card's memory, held on the CPU's side as
+    /// `held`, go in as a page ([`DensePage`]) if they make enough runs and
+    /// `room` has a page left: the CPU's side takes them (the bytes the runs
+    /// would have put in; the others are equal), the page's mask waits for
+    /// the next send, and the copy is queued. Some(runs, bytes put in), or
+    /// None with nothing done: the old way.
+    fn dense_put(&self, at: usize, title: &[u8], held: &mut [u8], room: &mut Room) -> Option<(u64, u64)> {
+        let least = under_on_card();
+        if least == 0 || room.dense == 0 || room.patches == 0 || !at.is_multiple_of(4) || !title.len().is_multiple_of(4) {
+            return None;
+        }
+        // Only where the page can go up whole: the pass compiled, patches on
+        // (byte offsets of a raw view are 32 bits), and no uploads through
+        // the copy queue (`crate::host::card_dense_ready`).
+        let ready = |c: &Card| crate::host::card_patchable(c.size) && crate::host::card_dense_ready();
+        // (The unit tests have no device: the card's readiness is said.)
+        #[cfg(test)]
+        let ready = |c: &Card| ready(c) || DENSE_READY_IN_TEST.get();
+        let card = self.card.as_ref().filter(|c| ready(c))?;
+        let (mask, runs, bytes) = byte_mask(title, held);
+        if runs < least {
+            return None;
+        }
+        // The room its runs would take the old way ([`Room::take`]): if the
+        // page goes up as runs after all (no memory for the plan's buffer:
+        // `with_dense_runs`), they are within it, and where they would not
+        // fit the old way settles, as before.
+        let (copies, patches) = mask_room(&mask, title.len());
+        if copies > room.copies || patches > room.patches {
+            return None;
+        }
+        room.copies -= copies;
+        room.patches -= patches;
+        room.dense -= 1;
+        held.copy_from_slice(title);
+        let n = title.len();
+        {
+            let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dense = card.dense.lock().unwrap_or_else(|e| e.into_inner());
+            match dense.pending.iter_mut().find(|p| p.at == at && p.n == n) {
+                // Put in again before a send: what either put in goes up.
+                Some(page) => {
+                    for (w, m) in Arc::make_mut(&mut page.mask).iter_mut().zip(&mask) {
+                        *w |= m;
+                    }
+                    page.runs += runs;
+                }
+                None => dense.pending.push(DensePage { at, n, mask: Arc::new(mask), runs }),
+            }
+            drop(dense);
+            self.queue_card(card);
+        }
+        Some((runs, bytes))
+    }
+
+    /// The pages put in whole that a send took ([`card_take_all`]), for
+    /// `Host::card_before`.
+    pub(crate) fn card_dense_up(&self) -> Vec<DensePage> {
+        match &self.card {
+            Some(card) if dense_kept() => std::mem::take(&mut card.dense.lock().unwrap_or_else(|e| e.into_inner()).up),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Of a copy in the card's memory: `pages`' bytes on the CPU's side and
+    /// their masks, into the plan's buffer at `base` from `*offset` on
+    /// ([`dense_bytes`] of them), taken now, under the CPU side's lock, as
+    /// the patches take theirs ([`Shadow::card_patches_shorter`]). Per page:
+    /// its offset in the copy, its bytes, where its bytes and its mask are
+    /// in the buffer.
+    ///
+    /// # Safety
+    /// `base` is mapped memory of ours with room from `*offset` for
+    /// [`dense_bytes`] of `pages`, which nothing reads meanwhile.
+    pub(crate) unsafe fn card_dense_into(&self, pages: &[DensePage], base: *mut u8, offset: &mut usize) -> Vec<(usize, usize, u64, u64)> {
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::with_capacity(pages.len());
+        for page in pages {
+            let (at, n) = (page.at, page.n.min((self.len as usize).saturating_sub(page.at)));
+            let mask_len = n.div_ceil(32) * 4;
+            // SAFETY: inside the CPU side's mapping (`at + n <= len`), and
+            // inside the caller's room; the mask holds `n` bits or more.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.add(at), base.add(*offset), n);
+                std::ptr::copy_nonoverlapping(page.mask.as_ptr().cast::<u8>(), base.add(*offset + n), mask_len);
+            }
+            out.push((at, n, *offset as u64, (*offset + n) as u64));
+            DENSE[0].fetch_add(1, Ordering::Relaxed);
+            DENSE[1].fetch_add((n + mask_len) as u64, Ordering::Relaxed);
+            DENSE[2].fetch_add(page.runs, Ordering::Relaxed);
+            *offset += page.n + page.n.div_ceil(32) * 4;
+        }
+        out
+    }
+
     /// Puts the copy in [`CARD_QUEUE`] if it is not there. Under `card`'s
     /// `dirty` lock, with a range in it.
     fn queue_card(&self, card: &Card) {
@@ -4618,6 +5020,20 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
+        // Pages put in whole ([`DensePage`]) not sent yet, or sent after
+        // the fetch: their bytes as their runs would have been.
+        let mut skip = skip;
+        if dense_kept() {
+            let dense = card.dense.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = dense
+                .pending
+                .iter()
+                .chain(dense.up.iter())
+                .chain(dense.sent.iter().filter(|s| s.1 > fetched_after).map(|s| &s.0));
+            for page in pages.filter(|p| p.at < at + n && p.at + p.n > at) {
+                skip.extend(dense_runs(page).into_iter().filter(|&(a, b)| a < at + n && b > at));
+            }
+        }
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_buffer_into((start + at) as *const u8, title);
@@ -4996,6 +5412,7 @@ fn buffer_copy_of(start: u64, bytes: u64) -> Option<Arc<Shadow>> {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
                 size,
             };
             (on_card, Some(card))
@@ -5061,6 +5478,7 @@ fn lookup_locked(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5316,6 +5734,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5356,6 +5775,7 @@ fn window_copy_of(start: u64, len: u64) -> Option<Arc<Shadow>> {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5628,6 +6048,7 @@ mod card_merge_tests {
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
@@ -5674,6 +6095,7 @@ mod card_merge_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
             queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
             size: 0,
         });
         let shadow = Arc::new(shadow);
@@ -5699,6 +6121,107 @@ mod card_merge_tests {
         // In the queue unless a submission of another test took it meanwhile.
         let _ = was_queued;
         drop(shadow);
+    }
+
+    /// `VICTORY_UNDER_ON_CARD`: the title rewrote half a page densely under a
+    /// flight's writes. Put in as a page (its mask) or as runs, the CPU's
+    /// side ends the same, and a merge of the flight's slot from the card
+    /// (fetched before the send, `card_merge_relay`) leaves the title's
+    /// bytes alone and lands the shader's other writes the same way, the
+    /// page not sent yet and sent after the fetch. A page sent before the
+    /// fetch is not in the way.
+    #[test]
+    fn a_dense_page_is_left_alone_by_a_relay_merge_as_its_runs_are() {
+        let _turn = crate::warp_turn();
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::UNDER_ON_CARD_IN_TEST.set(None);
+                super::DENSE_READY_IN_TEST.set(false);
+            }
+        }
+        let _reset = Reset;
+        super::DENSE_READY_IN_TEST.set(true);
+        const LEN: usize = 64 << 10;
+        let t0: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let mut t1 = t0.clone();
+        for i in (0..LEN / 2).step_by(8) {
+            t1[i] ^= 0x5a;
+            t1[i + 1] ^= 0x11;
+        }
+        // The flight's slot: the card's bytes (from before the title's
+        // writes, or with them if they were sent before the fetch), with a
+        // shader's write on a byte the title wrote, and two elsewhere.
+        let (on_title, beside, far) = (8usize, 12usize, LEN / 2 + 100);
+        let slot_for = |sent_as: u64| {
+            let mut slot = if sent_as == 5 { t1.clone() } else { t0.clone() };
+            for at in [on_title, beside, far] {
+                slot[at] ^= 0xc3;
+            }
+            slot
+        };
+        // (dense, the send: 0 none, 7 after the fetch, 5 before it)
+        let run = |dense: bool, sent_as: u64| -> (Vec<u8>, Vec<u8>) {
+            super::UNDER_ON_CARD_IN_TEST.set(Some(if dense { 1 } else { 0 }));
+            let title = t1.clone();
+            let mut side = t0.clone();
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
+                size: 0,
+            });
+            let at = std::ptr::from_ref(&shadow) as usize;
+            {
+                // SAFETY: the vector above, which the copy maps.
+                let held = unsafe { std::slice::from_raw_parts_mut(side.as_mut_ptr(), LEN) };
+                if dense {
+                    let mut room = super::Room::new(512, true);
+                    let (runs, _) = shadow.dense_put(0, &t1, held, &mut room).expect("a dense page");
+                    assert_eq!(runs, (LEN / 2 / 8) as u64);
+                } else {
+                    let runs = super::changed_runs(&t1, held);
+                    for &(r, m) in &runs {
+                        held[r..r + m].copy_from_slice(&t1[r..r + m]);
+                    }
+                    shadow.card_changed_runs(0, &runs);
+                }
+            }
+            let card = shadow.card.as_ref().unwrap();
+            if sent_as != 0 {
+                // As `card_take` with the relay: noted with the send.
+                let ranges = std::mem::take(&mut *card.dirty.lock().unwrap());
+                card.sent.lock().unwrap().extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                let mut d = card.dense.lock().unwrap();
+                let pages = std::mem::take(&mut d.pending);
+                d.sent.extend(pages.into_iter().map(|p| (p, sent_as)));
+            }
+            shadow.card_merge_relay(0, &slot_for(sent_as), 6, &mut Vec::new());
+            CARD_QUEUE.lock().unwrap().retain(|&q| q != at);
+            drop(shadow);
+            (title, side)
+        };
+        for sent_as in [0, 7, 5] {
+            let slot = slot_for(sent_as);
+            let (runs, dense) = (run(false, sent_as), run(true, sent_as));
+            assert!(runs.0 == dense.0, "title memory differs (send {sent_as})");
+            assert!(runs.1 == dense.1, "the CPU's side differs (send {sent_as})");
+            let (title, _) = dense;
+            assert_eq!(title[far], slot[far], "a shader's write elsewhere landed (send {sent_as})");
+            if sent_as == 5 {
+                // Sent before the fetch: the card had the title's bytes.
+                assert_eq!(title[on_title], slot[on_title]);
+            } else {
+                assert_eq!(title[on_title], t1[on_title], "the title's byte stays (send {sent_as})");
+            }
+        }
     }
 
     /// `VICTORY_LAND_ECHO=1`: a 4 KiB page written only by our landing is not
@@ -5733,6 +6256,7 @@ mod card_merge_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
             queued: std::sync::atomic::AtomicBool::new(false),
+                dense: Mutex::default(),
             size: 0,
         });
         let shadow = Arc::new(shadow);
