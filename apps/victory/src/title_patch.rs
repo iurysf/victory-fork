@@ -84,6 +84,11 @@ fn upscaler(image: &LoadedImage) {
         eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected <hex rva>[,<kind>]");
         return;
     };
+    let cap = std::env::var_os("VICTORY_FFX_CAP_OUTPUT").is_some_and(|v| v == "1");
+    if let Some(why) = refused_without_cap(kind, cap, display_mode()) {
+        eprintln!("VIctory: upscaler picker at title+{rva:#x} not patched: {why}");
+        return;
+    }
     let calls = calls_to(image, rva);
     if calls == 0 {
         eprintln!("VIctory: upscaler picker at title+{rva:#x} not patched: no direct call to it (wrong rva?)");
@@ -94,6 +99,34 @@ fn upscaler(image: &LoadedImage) {
     } else {
         eprintln!("VIctory: upscaler picker at title+{rva:#x} not patched: not writable");
     }
+}
+
+/// The display mode the title is told (`VICTORY_DISPLAY_MODE=WxH`, as
+/// `victory_gpu::dxgi` reads it; else 3840x2160).
+fn display_mode() -> (u32, u32) {
+    std::env::var("VICTORY_DISPLAY_MODE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        })
+        .filter(|&(w, h)| (640..=7680).contains(&w) && (360..=4320).contains(&h))
+        .unwrap_or((3840, 2160))
+}
+
+/// Why the picker must not be made to return FidelityFX (kind 7): the
+/// title's shipping FSR4 build only has its 1920x1080 tables and refuses an
+/// upscale context with a larger output ("maxUpscaleSize must be 1920x1080;
+/// received 3840x2160"), after which the title divides by zero (runs SX4 and
+/// SX5 of 25/11, 0544 and 0545). Without `VICTORY_FFX_CAP_OUTPUT=1`, which
+/// asks the context for 1920x1080, a display over 1920x1080 is refused here
+/// with this message instead.
+fn refused_without_cap(kind: u32, cap: bool, (width, height): (u32, u32)) -> Option<String> {
+    (kind == 7 && !cap && (width > 1920 || height > 1080)).then(|| {
+        format!(
+            "FidelityFX (kind 7) on a {width}x{height} display needs VICTORY_FFX_CAP_OUTPUT=1: the title's FSR4              only takes a 1920x1080 output, refuses the context and then divides by zero"
+        )
+    })
 }
 
 /// `mov eax, kind; ret`.
@@ -192,6 +225,15 @@ mod tests {
         code[10..15].copy_from_slice(&[0xE8, 0x20, 0, 0, 0]);
         assert_eq!(branches_to(&code, 0x1000, 0x1010), 2);
         assert_eq!(branches_to(&code, 0x1000, 0x2000), 0);
+    }
+
+    #[test]
+    fn fidelityfx_over_1080p_needs_the_cap() {
+        assert!(refused_without_cap(7, false, (3840, 2160)).is_some(), "4K without the cap");
+        assert!(refused_without_cap(7, false, (2560, 1440)).is_some(), "1440p without the cap");
+        assert!(refused_without_cap(7, true, (3840, 2160)).is_none(), "with the cap");
+        assert!(refused_without_cap(7, false, (1920, 1080)).is_none(), "a 1080p display");
+        assert!(refused_without_cap(6, false, (3840, 2160)).is_none(), "the title's own upscaler");
     }
 
     #[test]
