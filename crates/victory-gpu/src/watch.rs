@@ -763,25 +763,6 @@ fn guard_intervals() -> bool {
     crate::ab::flag(crate::ab::Key::GuardRunsStore, run)
 }
 
-#[derive(Default)]
-struct PageHash(u64);
-
-impl std::hash::Hasher for PageHash {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(u64::from(b));
-        }
-    }
-
-    fn write_usize(&mut self, i: usize) {
-        self.0 = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
-
 /// Whether a write fault opens only the view that was written, leaving the
 /// page's other views read-only (`PAGE_READONLY`) yet not clean, without a
 /// [`PUBLISHED`] bit, and invalidated in [`Unchanged`] watchers
@@ -859,26 +840,51 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
-    /// Blocks opened by a write fault, and when ([`rest`]).
-    opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Blocks opened by a write fault, and when ([`rest`]): a block's slot
+    /// is its number modulo [`OPENED_SLOTS`], a later block in the slot
+    /// taking it (that one then rests no longer). Made once, before the
+    /// handler is registered ([`install`]): the handler only writes slots,
+    /// it allocates nothing.
+    opened: Vec<(usize, Option<std::time::Instant>)>,
 }
+
+/// The slots of `Guards::opened`.
+const OPENED_SLOTS: usize = 1 << 13;
 
 impl Guards {
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+        !rest.is_zero()
+            && self
+                .opened
+                .get(block % OPENED_SLOTS)
+                .is_some_and(|&(b, at)| b == block && at.is_some_and(|at| at.elapsed() < rest))
     }
 
-    /// A write fault opened `block`.
+    /// A write fault opened `block` (in the handler: no allocation).
     fn opened(&mut self, block: usize) {
-        const MANY: usize = 1 << 13;
-        if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
-            if self.opened.len() >= MANY {
-                self.opened.clear();
+        if let Some(slot) = self.opened.get_mut(block % OPENED_SLOTS) {
+            *slot = (block, Some(std::time::Instant::now()));
+        }
+    }
+
+    /// Blocks `[lo, hi)` rest no longer (the runtime remapped them).
+    fn forget_opened(&mut self, lo: usize, hi: usize) {
+        if hi.saturating_sub(lo) < OPENED_SLOTS {
+            for block in lo..hi {
+                if let Some(slot) = self.opened.get_mut(block % OPENED_SLOTS)
+                    && slot.0 == block
+                {
+                    *slot = (usize::MAX, None);
+                }
+            }
+        } else {
+            for slot in &mut self.opened {
+                if (lo..hi).contains(&slot.0) {
+                    *slot = (usize::MAX, None);
+                }
             }
         }
-        self.opened.insert(block, std::time::Instant::now());
     }
 }
 
@@ -1072,7 +1078,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     remapped: CleanBlocks(BTreeMap::new()),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
-    opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    opened: Vec::new(),
 });
 
 /// Whether host copies are not refreshed again over ranges that nothing
@@ -2857,14 +2863,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.aliased.remove(&block);
     }
     if !g.opened.is_empty() {
-        let (lo, hi) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-        if hi - lo < g.opened.len() {
-            for block in lo..hi {
-                g.opened.remove(&block);
-            }
-        } else {
-            g.opened.retain(|&block, _| block < lo || block >= hi);
-        }
+        g.forget_opened(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     }
     remapped_viewed(&mut g, at, len, view_known());
 }
@@ -2933,7 +2932,8 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards(crate::lockmeter::Site::Handler);
         if open(&mut g, at, at + 1) {
-            if guards_kept() {
+            // (No note with no rest: nothing reads it.)
+            if guards_kept() && !rest().is_zero() {
                 g.opened(block);
             }
             drop(g);
@@ -2957,6 +2957,16 @@ fn install() {
     rest();
     guard_coalesce();
     guard_intervals();
+    // The rests' slots, made here so that the handler allocates none (it
+    // runs inside any thread's fault, the process heap's lock among what
+    // that thread may hold).
+    static SLOTS: std::sync::Once = std::sync::Once::new();
+    SLOTS.call_once(|| {
+        // (Tests: whichever thread installs, a later one may rest.)
+        if cfg!(test) || guards_kept() {
+            guards(crate::lockmeter::Site::Other).opened = vec![(usize::MAX, None); OPENED_SLOTS];
+        }
+    });
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
