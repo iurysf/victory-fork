@@ -3445,6 +3445,12 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
+        // On threads of their own (`crate::underwide`), for a copy in the
+        // card's memory: the same pages merged, in the same order.
+        let wide = crate::underwide::threads();
+        if wide >= 2 && self.card.is_some() {
+            return self.merge_under_writes_wide(busy, room, wide);
+        }
         let base = start / PAGE;
         // The page buffer, kept on the thread between merges (a fresh
         // 64 KiB each time faulted its pages in, 376 times a frame).
@@ -3495,7 +3501,8 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    let compared = if wide >= 1 { crate::underwide::changed_runs(title, held) } else { changed_runs(title, held) };
+                    let runs = joined_over(compared, merge_gap());
                     let patchable = self.card_sides().is_some_and(|(_, _, size)| crate::host::card_patchable(size));
                     if !room.take(&runs, patchable) {
                         return true;
@@ -3541,6 +3548,107 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] of a copy in the card's memory on `n`
+    /// threads (`crate::underwide`; `busy` in order and joined): what the
+    /// title wrote is asked for on this thread, range by range, as there;
+    /// then, under the CPU side's lock held throughout, the stale pages are
+    /// read and compared on the pool's threads, each page's changed runs and
+    /// their title bytes kept; then, on this thread and in page order, the
+    /// room is taken, the bytes put in and the runs noted for the card, the
+    /// pages noted taken. Where the room runs out the pages before stay done
+    /// and the others are left, as there.
+    fn merge_under_writes_wide(&self, busy: Vec<(usize, usize)>, room: &mut Room, n: usize) -> bool {
+        let started = std::time::Instant::now();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        // (title range, page, whether the range holds all of the page that is
+        // in the copy, the asking that found it written)
+        let mut pages: Vec<(usize, usize, usize, bool, u64)> = Vec::new();
+        for (a, e) in busy {
+            let mut written = WRITTEN.take();
+            let Some(now) = crate::watch::writes_into(a, e, true, &mut written) else {
+                WRITTEN.set(written);
+                return true;
+            };
+            let stale: Vec<usize> = {
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                stale_pages_in(base, &copied, a, e, &written)
+            };
+            WRITTEN.set(written);
+            for page in stale {
+                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                if lo < hi {
+                    let whole = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                    pages.push((lo, hi, page, whole, now));
+                }
+            }
+        }
+        if pages.is_empty() {
+            return false;
+        }
+        let patchable = self.card_sides().is_some_and(|(_, _, size)| crate::host::card_patchable(size));
+        // The lock of the CPU side, as each page takes it there: from before
+        // title memory is read until the title's bytes are in.
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // Per page: `None` if it was not there; else its runs and the title's
+        // bytes of them, one after the other.
+        type Found = Option<(Vec<(usize, usize)>, Vec<u8>)>;
+        let found: Vec<Mutex<Found>> = pages.iter().map(|_| Mutex::new(None)).collect();
+        let data = self.data as usize;
+        crate::underwide::each(n, pages.len(), &|i: usize| {
+            let (lo, hi, ..) = pages[i];
+            let len = hi - lo;
+            let mut title = Scratch::take();
+            title.resize(PAGE, 0);
+            let title = &mut title[..len];
+            if !crate::host::read_into(lo as *const u8, title) {
+                return;
+            }
+            // SAFETY: inside the mapping of the copy's CPU side, only read
+            // here; it is written below on the calling thread, after every
+            // compare is done.
+            let held = unsafe { std::slice::from_raw_parts((data as *const u8).add(lo - start), len) };
+            let runs = joined_over(crate::underwide::changed_runs(title, held), merge_gap());
+            let mut bytes = Vec::with_capacity(runs.iter().map(|r| r.1).sum());
+            for &(r, m) in &runs {
+                bytes.extend_from_slice(&title[r..r + m]);
+            }
+            *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((runs, bytes));
+        });
+        let mut over = false;
+        for (i, &(lo, hi, page, whole, now)) in pages.iter().enumerate() {
+            let Some((runs, bytes)) = found[i].lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                // Not there: looked at again next time.
+                continue;
+            };
+            MERGED[0].fetch_add(1, Ordering::Relaxed);
+            if !room.take(&runs, patchable) {
+                over = true;
+                break;
+            }
+            let at = lo - start;
+            // SAFETY: as in `merge_under_writes`; the compares are done.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), hi - lo) };
+            let mut taken = 0;
+            for &(r, m) in &runs {
+                held[r..r + m].copy_from_slice(&bytes[taken..taken + m]);
+                taken += m;
+            }
+            self.card_changed_runs(at, &runs);
+            MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            MERGED[2].fetch_add(taken as u64, Ordering::Relaxed);
+            if whole {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(at) = copied.get_mut(page - base) {
+                    *at = now;
+                }
+            }
+        }
+        drop(before);
+        crate::framelog::add(crate::framelog::T::UnderWideUs, started.elapsed().as_micros() as u64);
+        over
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -3826,6 +3934,13 @@ impl Shadow {
             .filter(|&&(a, b)| b - a < shorter)
             .map(|&(a, b)| (a.min(len), b.min(len)))
             .filter(|r| r.0 < r.1);
+        // In pieces on threads of their own (`crate::underwide`): the same
+        // patches.
+        if crate::underwide::threads() >= 2 && ranges.len() >= crate::underwide::RUNS_A_PIECE {
+            let cut: Vec<(usize, usize)> = cut.collect();
+            crate::underwide::dword_patches(&cut, data, out);
+            return;
+        }
         dword_patches_of(cut, data, out);
     }
 

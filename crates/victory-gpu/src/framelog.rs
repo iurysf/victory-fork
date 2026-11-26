@@ -133,6 +133,9 @@ pub enum T {
     InPlaceUs,
     InPlaceFaults,
     SharedBuildUs,
+    /// The submitting thread in `VICTORY_UNDER_WIDE`'s paths (merges and
+    /// patches on threads of their own).
+    UnderWideUs,
     Count,
 }
 
@@ -614,7 +617,7 @@ fn preparing_line(f: &Frame) -> String {
          flush {:.1}, snapshots {:.1}, the card's plan {:.1}, not in a step {:.1} | the switches' own paths, all threads: \
          waits for the guards' lock {:.2} ms, their store turned {:.2} ms (GUARD_INTERVALS); {:.0} protections over runs \
          refused, {:.2} ms in them (GUARD_COALESCE); in-place copies {:.2} ms, {:.1} faults (COPY_READ_ONLY); copies made \
-         outside the lock {:.2} ms (SHADOW_SHARED)",
+         outside the lock {:.2} ms (SHADOW_SHARED); merges and patches on threads of their own {:.2} ms (UNDER_WIDE={})",
         ms(T::PrepareUs),
         ms(T::PrepAskUs),
         ms(T::PrepStepsUs),
@@ -633,6 +636,8 @@ fn preparing_line(f: &Frame) -> String {
         ms(T::InPlaceUs),
         f.t[T::InPlaceFaults as usize],
         ms(T::SharedBuildUs),
+        ms(T::UnderWideUs),
+        crate::underwide::threads(),
     )
 }
 
