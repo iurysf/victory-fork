@@ -517,6 +517,20 @@ fn aside() -> Option<&'static Aside> {
     if started { aside.as_ref() } else { None }
 }
 
+/// Submissions since the last frame line whose heap pass stayed on the
+/// submitting thread with [`heap_sync_aside`] on: a copy of theirs writes
+/// into a placed heap ([`begin_sync_heaps`]).
+#[cfg(windows)]
+static ASIDE_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `[at, at + len)` touches a placed shader-visible heap's records
+/// ([`SHADER_HEAPS`]).
+#[cfg(windows)]
+pub(crate) fn touches_heaps(at: usize, len: usize) -> bool {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, stop, _)| at < stop && start < end)
+}
+
 /// A submission's [`sync_heaps`]: done here, or under way on its own thread
 /// ([`heap_sync_aside`]) until [`SyncAside::finish`] (or the value's drop).
 #[cfg(windows)]
@@ -526,10 +540,22 @@ pub(crate) struct SyncAside(Option<(&'static Aside, u64)>);
 /// makes the slots that waited, [`make_waiting`], as before), or started on
 /// its own thread with [`heap_sync_aside`].
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncAside {
+///
+/// `copies_into_heaps`: whether a copy of the submission's (`Step::Copy`,
+/// at its preparing) writes into a placed shader-visible heap
+/// ([`touches_heaps`]). The pass on this thread reads every heap page before
+/// such a copy writes it; beside the preparing it could read the page
+/// before, during or after. Such a submission keeps the pass here, and is
+/// counted ([`ASIDE_KEPT`]). Asked only with the switch on.
+pub(crate) fn begin_sync_heaps(copies_into_heaps: impl FnOnce() -> bool) -> SyncAside {
     if heap_sync_aside()
         && let Some(a) = aside()
     {
+        if copies_into_heaps() {
+            ASIDE_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sync_heaps();
+            return SyncAside(None);
+        }
         let mut s = a.state.lock().unwrap_or_else(|e| e.into_inner());
         s.0 += 1;
         let ticket = s.0;
@@ -594,6 +620,15 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let kept = ASIDE_KEPT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if heap_sync_aside() || kept != 0 {
+        tracing::info!(
+            "heaps' pass beside the preparing (VICTORY_HEAP_SYNC_ASIDE {}): {:.1} submissions a frame kept it on the \
+             submitting thread (a copy of theirs writes into a placed heap)",
+            if heap_sync_aside() { "on" } else { "off" },
+            kept as f64 / frames.max(1.0)
+        );
+    }
     if pages == 0 {
         return;
     }
@@ -1927,7 +1962,7 @@ mod tests {
                 // SAFETY: a slot of the test's heap.
                 unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), memory.cast::<u8>().add(slot as usize * 16), 16) };
                 assert!(!host.made(slot));
-                let pass = begin_sync_heaps();
+                let pass = begin_sync_heaps(|| false);
                 assert!(pass.aside(), "the pass runs on its own thread");
                 if round % 2 == 0 {
                     pass.finish();
