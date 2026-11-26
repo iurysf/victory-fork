@@ -567,7 +567,9 @@ mod tests {
             }
             one_runs.push(runs);
         }
-        for n in [3, 4, 6] {
+        // 1: under `WIDE_PAGES` pages the merge keeps its wide shape (found
+        // per page, put in after) on this thread alone.
+        for n in [1, 3, 4, 6] {
             let found: Vec<Mutex<Option<(Vec<(usize, usize)>, Vec<u8>)>>> = pages.iter().map(|_| Mutex::new(None)).collect();
             each(n, pages.len(), &|i| {
                 let (title, held) = &pages[i];
@@ -605,6 +607,104 @@ mod tests {
                     hits[i].fetch_add(1, Relaxed);
                 });
                 assert!(hits.iter().all(|h| h.load(Relaxed) == 1), "{n} threads, {count} indices");
+            }
+        }
+    }
+
+    /// Small jobs many times over, the pool's size changing among them: each
+    /// index once, and a job's closure (borrowing this call's frame) never run
+    /// after its call returns (a late worker would hit a later round's
+    /// counters twice or a freed one's).
+    #[test]
+    fn small_jobs_again_and_again_with_the_size_changing_run_each_index_once() {
+        let mut seed = 99u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let late = AtomicUsize::new(0);
+        for round in 0..3000usize {
+            let n = [2usize, 3, 4, 6, 8][if round % 97 == 0 { next() as usize % 5 } else { 2 }];
+            let count = 2 + next() as usize % 6;
+            let open = AtomicBool::new(true);
+            let hits: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
+            each(n, count, &|i| {
+                if !open.load(Relaxed) {
+                    late.fetch_add(1, Relaxed);
+                }
+                hits[i].fetch_add(1, Relaxed);
+            });
+            open.store(false, Relaxed);
+            assert!(hits.iter().all(|h| h.load(Relaxed) == 1), "round {round}: {n} threads, {count} indices");
+        }
+        assert_eq!(late.load(Relaxed), 0, "a job run after its call returned");
+    }
+
+    /// The patches written straight into the room past the Vec's length: the
+    /// one-thread patches after what the Vec held, its room already larger
+    /// than needed or not, with empty runs, runs at the data's end, runs
+    /// sharing dwords at every piece edge, and the room beyond untouched.
+    #[test]
+    fn patches_written_into_the_room_are_the_one_thread_patches_after_what_was_there() {
+        let mut seed = 4321u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let len = 3 * RUNS_A_PIECE * 8 + 3;
+        let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        let mut cases: Vec<(&str, Vec<(usize, usize)>)> = Vec::new();
+        // Runs of 1..7 bytes, gaps of 0..5: many start or end inside a dword
+        // the last one used; empties among them; the last at the data's end.
+        let mut ranges = Vec::new();
+        let mut at = 1usize;
+        while at + 8 < len {
+            let n = next() as usize % 7 + 1;
+            ranges.push((at, at + n));
+            if next() % 11 == 0 {
+                ranges.push((at + n, at + n));
+            }
+            at += n + 1 + next() as usize % 5;
+        }
+        ranges.push((len - 2, len));
+        cases.push(("random runs", ranges));
+        // One byte per dword, every dword: a piece edge never ends a run.
+        cases.push(("a byte a dword", (0..3 * RUNS_A_PIECE + 5).map(|k| (4 * k + 3, 4 * k + 4)).collect()));
+        // Two runs per dword: every piece edge falls inside a dword.
+        cases.push(("two runs a dword", (0..3 * RUNS_A_PIECE + 7).map(|k| (2 * k, 2 * k + 1)).collect()));
+        // As above, one run ahead: 4,096 runs of any stride end on a dword's
+        // edge, so without it no piece edge would fall inside a dword.
+        cases.push(("two runs a dword, shifted", std::iter::once((0, 1)).chain((0..3 * RUNS_A_PIECE + 7).map(|k| (2 * k + 5, 2 * k + 6))).collect()));
+        // Long runs crossing many dwords.
+        cases.push(("long runs", (0..RUNS_A_PIECE * 2 + 1).map(|k| (k * 11 + 1, k * 11 + 10)).collect()));
+        for (name, ranges) in &cases {
+            assert!(ranges.len() >= RUNS_A_PIECE, "{name}: the wide path taken");
+            let mut one = vec![[5, 6, 7], [8, 9, 10]];
+            crate::shadow::dword_patches_of(ranges.iter().copied(), &data, &mut one);
+            for n in [2usize, 3, 4, 6, 8] {
+                let _n = test_with(n);
+                for spare in [0usize, 1, 100_000] {
+                    let mut wide: Vec<[u32; 3]> = Vec::with_capacity(2 + spare);
+                    wide.extend_from_slice(&[[5, 6, 7], [8, 9, 10]]);
+                    // The room past the length marked, to see it written
+                    // where it should be and nowhere after.
+                    let cap = wide.capacity();
+                    let marks = cap - wide.len();
+                    for slot in &mut wide.spare_capacity_mut()[..marks] {
+                        slot.write([0xDEAD_BEEF; 3]);
+                    }
+                    dword_patches(ranges, &data, &mut wide);
+                    assert_eq!(wide, one, "{name}: {n} threads, {spare} spare");
+                    let room = wide.capacity() - wide.len();
+                    let past = wide.len();
+                    if wide.capacity() == cap && marks + 2 > past {
+                        // The room was not grown: what is past the patches is
+                        // still marked.
+                        let tail = &wide.spare_capacity_mut()[..(marks + 2 - past).min(room)];
+                        // SAFETY: written with marks above.
+                        assert!(tail.iter().all(|s| unsafe { s.assume_init() } == [0xDEAD_BEEF; 3]), "{name}: written past the patches");
+                    }
+                }
             }
         }
     }
