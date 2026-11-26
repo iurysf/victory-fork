@@ -45,6 +45,22 @@ fn land_echo() -> bool {
     crate::ab::flag(crate::ab::Key::LandEcho, run)
 }
 
+/// Whether landings are noted at all ([`Shadow::note_landing`]):
+/// `VICTORY_LAND_ECHO=1`, or the A/B names `LAND_ECHO` (then in both arms,
+/// so that the arm that reads the notes finds those of the arm before).
+/// Neither: no landing costs anything. Read once.
+fn land_echo_kept() -> bool {
+    #[cfg(test)]
+    if LAND_ECHO_IN_TEST.get().is_some() {
+        return true;
+    }
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var_os("VICTORY_LAND_ECHO").is_some_and(|v| v == "1")
+            || std::env::var("VICTORY_AB").is_ok_and(|ab| ab.to_ascii_uppercase().contains("LAND_ECHO"))
+    })
+}
+
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -3908,6 +3924,10 @@ impl Shadow {
 
     /// What shaders wrote in `[from, to)` (copy offsets) was put into title memory.
     fn note_landing(&self, from: usize, to: usize) {
+        // Nobody reads the notes in a session that never names the switch.
+        if !land_echo_kept() {
+            return;
+        }
         let to = to.min(self.len as usize);
         if from >= to {
             return;
@@ -5386,6 +5406,8 @@ mod card_merge_tests {
             }
         }
         let _reset = Reset;
+        // Landings noted (the switch named), read by `take_landed` below.
+        LAND_ECHO_IN_TEST.set(Some(false));
         let room = vec![7u8; 3 * PAGE];
         let title = (room.as_ptr() as usize).next_multiple_of(PAGE);
         let len = 2 * PAGE;

@@ -1318,6 +1318,31 @@ fn guards(site: crate::lockmeter::Site) -> GuardsHeld {
     g
 }
 
+/// Whether the write faults' new ways may be in use in this session
+/// (`VICTORY_OPEN_ONE_VIEW`, `VICTORY_GUARD_REST`): either switch on in the
+/// environment, or named by the A/B (`OPEN_ONE_VIEW`, `GUARD_REST`), then in
+/// both arms. A block opened alone or left resting in one arm is still so
+/// in the next, so the guards keep the new ways' checks (every other view
+/// covered before a block is noted clean, the other views cleared before
+/// one is opened) for the whole session, whichever arm runs. A session that
+/// never names either goes the old way exactly ([`open_classic`],
+/// [`protect_classic`], [`views_mapped_classic`]). Read once.
+fn guards_kept() -> bool {
+    #[cfg(test)]
+    if OPEN_ONE_IN_TEST.get().is_some() || REST_IN_TEST.get().is_some() {
+        return true;
+    }
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1")
+            || std::env::var("VICTORY_GUARD_REST").is_ok_and(|v| v.trim().parse::<u64>().is_ok_and(|n| n != 0))
+            || std::env::var("VICTORY_AB").is_ok_and(|ab| {
+                let ab = ab.to_ascii_uppercase();
+                ab.contains("OPEN_ONE_VIEW") || ab.contains("GUARD_REST")
+            })
+    })
+}
+
 /// Whether the bits of the light refresh are kept ([`PUBLISHED`]):
 /// `VICTORY_LIGHT_REFRESH=1`, or the A/B names `LIGHT_REFRESH` (then in both
 /// arms, so that the arm that asks them finds them true whatever was
@@ -1381,7 +1406,9 @@ pub(crate) fn askings_line(frames: f64) -> String {
     let [bits, guards, filled] = light_asks();
     let [asked, noted] = absent_looks();
     format!(
-        "askings of view memory, a frame: {:.0} answered by the bits of their blocks, {:.0} through the guards (LIGHT_REFRESH {}),          {filled} holes found filled with nobody telling; blocks noted uncommitted: {:.0} questions to Windows, {:.0} answered          from their note (ABSENT_ONCE {}, VICTORY_ABSENT_MS {})",
+        "askings of view memory, a frame: {:.0} answered by the bits of their blocks, {:.0} through the guards (LIGHT_REFRESH {}), \
+         {filled} holes found filled with nobody telling; blocks noted uncommitted: {:.0} questions to Windows, {:.0} answered \
+         from their note (ABSENT_ONCE {}, VICTORY_ABSENT_MS {})",
         bits as f64 / f,
         guards as f64 / f,
         if light() { "on" } else if light_kept() { "off, bits kept" } else { "off" },
@@ -1944,7 +1971,10 @@ fn guard_locked(mut g: GuardsHeld, start: usize, end: usize, now: u64, keep: u64
                 if g.aliased.contains(&block) {
                     crate::copystat::add(crate::copystat::C::AliasPages, (BLOCK / PAGE) as u64);
                 }
-                if g.protected.contains(&block) {
+                if g.protected.contains(&block) && !guards_kept() {
+                    // Written through the runtime, still read-only.
+                    g.clean.insert(block, block + 1);
+                } else if g.protected.contains(&block) {
                     // Read-only by way of another view of its page, written
                     // through the runtime, or left unclean because an alias was
                     // opened/resting (`VICTORY_OPEN_ONE_VIEW`/`VICTORY_GUARD_REST`):
@@ -2024,8 +2054,77 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize, rest: std::time::Duration) {
+    if !guards_kept() {
+        protect_classic(g, from, to);
+        return;
+    }
     protect_here(g, from, to);
     cover(g, from, to, rest);
+}
+
+/// [`protect`] in a session that never names the write faults' new ways
+/// ([`guards_kept`]): as before them (fx-main da215a9), the other views'
+/// blocks made read-only with no look at whether each is covered.
+fn protect_classic(g: &mut Guards, from: usize, to: usize) {
+    protect_here(g, from, to);
+    if !view_guard() {
+        return;
+    }
+    let coalesced = guard_coalesce();
+    let metered = crate::lockmeter::on().then(std::time::Instant::now);
+    let mut aliases: Vec<usize> = Vec::new();
+    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+        let first = (base / BLOCK).max(from);
+        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
+        for block in first..last {
+            let shown = crate::inplace::pages_of(block * BLOCK);
+            // One view (nothing else to guard), or the page the title shows
+            // wherever it has nothing (thousands of views): each view of
+            // that one is guarded by itself.
+            if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for alias in shown {
+                let alias = alias / BLOCK;
+                g.aliased.insert(alias);
+                if alias != block {
+                    if coalesced {
+                        if !g.protected.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    } else {
+                        protect_alias(g, alias, std::time::Duration::ZERO);
+                    }
+                }
+            }
+        }
+    }
+    // The other views' blocks that follow one another are made read-only
+    // in one call ([`guard_coalesce`]); a run the kernel refuses whole (it
+    // spans regions it takes one at a time) block by block, as before.
+    aliases.sort_unstable();
+    aliases.dedup();
+    for (first, last) in block_runs(&aliases) {
+        if first + 1 == last || !refused_timed(|| protect_run(first, last)) {
+            for block in first..last {
+                protect_alias(g, block, std::time::Duration::ZERO);
+            }
+            continue;
+        }
+        // (The bits the new ways read, kept as they keep them.)
+        for block in first..last {
+            PROTECTED.set(block);
+        }
+        g.protected.extend(first..last);
+        if view_known() {
+            g.viewed.extend(first..last);
+        }
+    }
+    if let Some(started) = metered {
+        crate::lockmeter::alias_ns(started.elapsed().as_nanos() as u64);
+    }
 }
 
 /// Ensures every other view of the physical pages in `[from, to)` is also
@@ -2338,6 +2437,9 @@ fn uncommitted_end(block: usize) -> usize {
 /// watchers are invalidated, whether they are opened as well
 /// ([`open_one_view`]) or left read-only.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    if !guards_kept() {
+        return open_classic(g, start, end);
+    }
     if start >= end {
         return false;
     }
@@ -2377,6 +2479,37 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+    }
+    any
+}
+
+/// [`open`] in a session that never names the write faults' new ways
+/// ([`guards_kept`]): as before them (fx-main da215a9).
+fn open_classic(g: &mut Guards, start: usize, end: usize) -> bool {
+    // The light refresh: no view of these pages is known by its bit once
+    // one of them can be written (who asks the bits takes no lock of ours;
+    // after avatarmanz/VIctory-7900XTX 689df313).
+    if light_kept() && start < end && !g.aliased.is_empty() {
+        for &block in g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                PUBLISHED.clear(alias / BLOCK);
+            }
+        }
+    }
+    let any = open_here(g, start, end);
+    if start >= end || g.aliased.is_empty() {
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+        for alias in crate::inplace::pages_of(block * BLOCK) {
+            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+                #[cfg(feature = "diagnostics")]
+                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            g.aliased.remove(&(alias / BLOCK));
         }
     }
     any
@@ -2558,6 +2691,10 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
+    if !guards_kept() {
+        views_mapped_classic(&ranges);
+        return;
+    }
     // Check `PROTECTED` without filtering `ranges`: all views of the pages
     // must be cleared under the lock together (avatarmanz 2be0515).
     if !ranges
@@ -2579,6 +2716,28 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         }
     }
     for &(at, n) in &ranges {
+        if open_here(&mut g, at, at.saturating_add(n)) {
+            #[cfg(feature = "diagnostics")]
+            ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// [`views_mapped`] of the views `ranges` in a session that never names the
+/// write faults' new ways ([`guards_kept`]): as before them (fx-main
+/// da215a9).
+fn views_mapped_classic(ranges: &[(usize, usize)]) {
+    let mut g = guards(crate::lockmeter::Site::ViewsMapped);
+    // The light refresh: all of them told as written before the first can
+    // be written (as in [`open`]).
+    if light_kept() {
+        for &(at, n) in ranges {
+            for block in g.protected.blocks_in(at / BLOCK..at.saturating_add(n).div_ceil(BLOCK)) {
+                PUBLISHED.clear(block);
+            }
+        }
+    }
+    for &(at, n) in ranges {
         if open_here(&mut g, at, at.saturating_add(n)) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2746,7 +2905,7 @@ fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
-        let fast = open_one_view() || !rest().is_zero();
+        let fast = guards_kept() && (open_one_view() || !rest().is_zero());
         // Another thread may have opened the block since this one faulted
         // (then nothing waits for the lock with `fast`), and a copy may have
         // guarded it again since that (then it is ours again, not read-only
@@ -2759,7 +2918,9 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards(crate::lockmeter::Site::Handler);
         if open(&mut g, at, at + 1) {
-            g.opened(block);
+            if guards_kept() {
+                g.opened(block);
+            }
             drop(g);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -2776,6 +2937,7 @@ fn install() {
     // Switches are read here, not first in the handler ([`open`] and
     // `fast` ask them): reading the environment allocates.
     light_kept();
+    guards_kept();
     open_one_view();
     rest();
     guard_coalesce();
@@ -4029,7 +4191,29 @@ mod tests {
     /// 3 views, regression for avatarmanz 2be0515): no write is ever lost.
     #[test]
     fn no_write_to_resting_views_is_lost_between_askers() {
-        fn run<const VIEWS: usize>() {
+        askers_lose_no_write::<1>(true);
+        askers_lose_no_write::<3>(true);
+    }
+
+    /// As [`no_write_to_resting_views_is_lost_between_askers`], in a session
+    /// that never names the write faults' new ways (`guards_kept` false: the
+    /// guards' old paths, `open_classic`, `protect_classic`,
+    /// `views_mapped_classic`), asked through the guards as the yard's runs
+    /// ask (no light refresh): no write is ever lost.
+    #[test]
+    fn no_write_through_another_view_is_lost_between_askers_the_old_way() {
+        askers_lose_no_write::<1>(false);
+        askers_lose_no_write::<3>(false);
+    }
+
+    /// Eight threads write their own words through any of `VIEWS` views of
+    /// one section and ask through any view, with the runtime's word of new
+    /// views and our own told writes among them: every asking after a write
+    /// reports it. `new_ways`: with `VICTORY_OPEN_ONE_VIEW` and
+    /// `VICTORY_GUARD_REST` (50 us) on, asked by the bits where they can
+    /// answer; else neither named, asked through the guards.
+    fn askers_lose_no_write<const VIEWS: usize>(new_ways: bool) {
+        {
             const PAGES: usize = 8;
             const THREADS: usize = 8;
             let bytes = PAGES * BLOCK;
@@ -4042,7 +4226,9 @@ mod tests {
                 for t in 0..THREADS {
                     let all_ref = &all;
                     s.spawn(move || {
-                        let _sw = TestSwitches::set(Some(true), Some(std::time::Duration::from_micros(50)));
+                        let _sw = new_ways.then(|| TestSwitches::set(Some(true), Some(std::time::Duration::from_micros(50))));
+                        assert_eq!(guards_kept(), new_ways, "the session's ways as asked");
+                        let light: u8 = if new_ways { 2 } else { 0 };
                         let mut last = [[0u64; PAGES]; VIEWS];
                         let mut seed = (t as u64 + 1).wrapping_mul(6364136223846793005);
                         let mut next = |n: usize| {
@@ -4058,7 +4244,7 @@ mod tests {
                             let at = all_ref[asked];
                             let word = through + page * BLOCK + 8 * (t + 1);
                             let mut written = Vec::new();
-                            let before = writes_as(at + from * PAGE, at + to * PAGE, true, 2, &mut written)
+                            let before = writes_as(at + from * PAGE, at + to * PAGE, true, light, &mut written)
                                 .expect("a view");
                             if round % 19 == 0 && VIEWS > 1 {
                                 views_mapped(section, (page * BLOCK) as u64, BLOCK);
@@ -4069,7 +4255,7 @@ mod tests {
                             unsafe { (word as *mut u64).write_volatile((round + 1) as u64) };
                             let (now, written) = {
                                 let mut w = Vec::new();
-                                let n = writes_as(at + from * PAGE, at + to * PAGE, true, 2, &mut w).expect("a view");
+                                let n = writes_as(at + from * PAGE, at + to * PAGE, true, light, &mut w).expect("a view");
                                 (n, w)
                             };
                             let number = written.iter().find(|w| w.0 == at / PAGE + page).map_or(0, |w| w.1);
@@ -4087,8 +4273,6 @@ mod tests {
             });
             drop_views(section, &all, bytes);
         }
-        run::<1>();
-        run::<3>();
     }
 }
 
