@@ -28,6 +28,115 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
+## Frame-rate work on an RTX 4070: 2026-11-26
+
+Same machine and scene as the section below (Windows 11, AMD Ryzen 7 5800X3D,
+NVIDIA RTX 4070 12 GB, 32 GB RAM; the yard after the prologue, about 4,500 to
+5,000 draws a frame, Series X profile, the argument clamp left on). Since
+2026-11-25 a switch is no longer judged by two runs: it is turned on and off
+in blocks inside one run (`VICTORY_AB=<SWITCH>,<readings>,<blocks>`, quartets
+A B B A), because two equal runs differ by about 10%. "4 of 4" below means
+all four quartets agreed in sign.
+
+| Configuration | Frame | Notes |
+|---|---:|---|
+| 1440p inside, 4K out, the recipe of 2026-11-25 evening | 157.1 ms (6.4 fps) | with `VICTORY_BACK_OWN_VIEW=1` |
+| 1440p inside, 4K out, the recipe below | 127.3 ms (7.9 fps) | the "off" arm of an in-run comparison, no switch under test changing it |
+| 1080p inside and out, the recipe below + `VICTORY_UNDER_ON_CARD=2048` | 115.2 ms (8.7 fps) | standard run; another run gave 118.0 ms, and one with a further switch on 117.4 ms |
+
+The 1080p mode is softer (a plain stretch replaces the title's own temporal
+upscaler) and is not the default. In several runs, at both resolutions, the
+yard seen through the window is washed out by low sun; we have not decided
+whether that is the title or ours.
+
+### The recipe (environment variables)
+
+```
+VICTORY_BACK_OWN_VIEW=1
+VICTORY_ABSENT_ONCE=1
+VICTORY_ABSENT_MS=told
+VICTORY_INDIRECT_HOIST=1
+VICTORY_INDIRECT_BATCH=1
+VICTORY_JOURNAL_UNLOCKED=1
+VICTORY_INPLACE=0
+```
+
+1080p inside and out, on top of that (`VICTORY_UPSCALER` takes the address of
+the title's upscaler picker for the title's version; see
+`apps/victory/src/title_patch.rs`):
+
+```
+VICTORY_UPSCALER=<rva>
+VICTORY_FFX_SCALE=0.5
+VICTORY_FFX_CAP_OUTPUT=1
+VICTORY_UNDER_ON_CARD=2048
+```
+
+### What each switch does, and what it measured in the game
+
+- `VICTORY_BACK_OWN_VIEW=1`: what the card wrote and we put back into title
+  memory is noted current through a view of our own, not copied in again.
+  Frame -12.6 ms (4 of 4).
+- `VICTORY_ABSENT_ONCE=1` with `VICTORY_ABSENT_MS=told`: a block Windows said
+  was not committed is not asked about again until the runtime tells of a
+  commit or a mapping there (for good only in a placeholder reservation,
+  100 ms elsewhere). Questions to Windows 9,420 to 1 a frame; preparing
+  -12.8 to -14.3 ms (4 of 4); frame -4.1 to -5.5 ms.
+- `VICTORY_INDIRECT_HOIST=1` (upstream #2472): the clamps of the first part
+  of each list run in one pass ahead of it. Frame -5.1 ms (4 of 4).
+- `VICTORY_INDIRECT_BATCH=1` (after avatarmanz/VIctory-7900XTX): indirect
+  argument clamps in batches, about 2,500 passes a frame down to about 1,000.
+  Frame -7.1 ms (4 of 4), the card busy 100.7 to 86.7 ms a frame; with the
+  hoist, frame -8.8 ms (4 of 4). The passes write title memory, so fewer of
+  them also cut what the processor side has to compare.
+- `VICTORY_JOURNAL_UNLOCKED=1` (after JozefDeTremmerie/CCS03 `f94625a`): the
+  write-watch journal's lock is let go while the kernel and the guards are
+  asked. Waiting for that lock 62.2 to 3.7 ms a frame, summed over threads;
+  frame -4.2 ms (4 of 4).
+- `VICTORY_UNDER_ON_CARD=N`: a page with N or more small changes under what
+  the card wrote goes up whole and the card applies the changes, instead of
+  one patch a change from the processor. At 1440p frame -2.2 ms (4 of 4),
+  preparing -6.2 ms: kept as a candidate, not in the 1440p recipe. At 1080p,
+  where the FidelityFX path makes two of the title's compute passes write
+  about a hundred times more runs into one 50 MB buffer, frame 147.8 to
+  114.6 ms in one run (-33.0, 4 of 4).
+- `VICTORY_FFX_SCALE` and `VICTORY_FFX_CAP_OUTPUT=1`: render at half
+  resolution an axis and cap the upscaler's output at 1920x1080. Without the
+  cap the title's FidelityFX refuses a 4K output; that is now refused with a
+  message instead of a division by zero. On its own the 1080p mode is
+  slower (163.0 ms): the card has less to do, the processor side more.
+
+### What a trace said
+
+A Windows trace (ETW) of the yard on 2026-11-26: from the fourth submission
+of a frame on, each one waits 19 to 42 ms in the card's queue, and the card
+is busy about 104 of 153 ms. That is why cutting 13 ms of preparation moved
+the frame by 4: most of the preparation runs while the card is still busy
+with the submission before. Cuts on the card count one for one; so do cuts
+of our own passes that write title memory.
+
+### Tried and left out
+
+- `VICTORY_LAND_ECHO`, `VICTORY_UNDER_WIDE` (threads or one thread),
+  `VICTORY_STEP_INDEX`, `VICTORY_PRESENT_QUEUED`, `VICTORY_OPEN_ONE_VIEW`,
+  `VICTORY_GUARD_REST`, `VICTORY_CARD_SYNC_BATCH` (fork #1227): no gain
+  outside the noise in the game; all stay off.
+- `VICTORY_INDIRECT_BATCH_TEXTURES` (the rule of fork #995): frame -3.4 ms
+  alone, nothing on top of `VICTORY_UNDER_ON_CARD`; off.
+- The heap trio (`VICTORY_HEAP_LESS`, `VICTORY_HEAP_LOCKFREE`,
+  `VICTORY_SHADOW_SHARED`) and a pack of six guard and copy switches: the
+  heap pass got shorter, the preparation longer, the frame did not move.
+- `VICTORY_HEAP_SYNC_ASIDE`: taken out again; a pass beside the preparation
+  can read a descriptor page while a copy of the same submission writes it.
+- Skipping the ray-tracing resolve passes: 4.7 ms less on the card, nothing
+  on the frame, and the picture changes.
+- Written, off and not measured in the game: `VICTORY_HEAP_SYNC_WIDE`,
+  `VICTORY_REFRESH_AHEAD`, `VICTORY_WIDE_FILLS`, `VICTORY_LIGHT_REFRESH`.
+
+Ported pieces carry their authors in the commits: avatarmanz/VIctory-7900XTX,
+fxceless/victory-fork pull requests #1185 (BradRoland), #1202
+(nicolasveilleux) and #1227 (KyleS98), JozefDeTremmerie/CCS03.
+
 ## The `fx-main` branch: frame-rate work on an RTX 4070 (2026-11-25)
 
 This branch is the fork's `main`
