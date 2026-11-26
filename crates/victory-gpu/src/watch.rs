@@ -76,6 +76,12 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// With [`journal_unlocked`]: page ranges a [`writes`] is asking the
+    /// kernel (or the guards) about with the journal let go ([`Asking`]):
+    /// their pages are reset there and not in the journal yet, so nothing
+    /// else asks or answers about pages of theirs until they are
+    /// ([`unbusy`]). Empty without the switch.
+    busy: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -85,7 +91,95 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    busy: Vec::new(),
 });
+
+/// The journal as [`crate::lockmeter::lock_journal`] takes it.
+type JournalHeld = crate::lockmeter::JournalHeld<Journal>;
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' setting of [`journal_unlocked`] on this thread.
+    static JOURNAL_UNLOCKED_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a [`writes`] asks the kernel, or the guards, with the journal's
+/// lock let go (`VICTORY_JOURNAL_UNLOCKED=1`; off by default).
+///
+/// The asking held the journal for its `GetWriteWatch` call and, where that
+/// failed, for the guards' walk. The copies the last flush brings up to
+/// date on the `wide` helpers (`VICTORY_WIDE_REFRESH=1`) each ask about
+/// their own range and stood in line for it, one asking at a time: the
+/// trace of 26/11 (map §14) found the submission's thread 18.5 ms a frame
+/// waiting for the journal's lock, held by those helpers. With the switch
+/// the range is noted busy ([`Journal::busy`]) and the lock let go while
+/// it is asked about; whatever overlaps it waits ([`unbusy`]), ranges that
+/// do not are asked at the same time, and the pages found get their
+/// asking's number when the lock is taken again: a number can only come
+/// later than without the switch, which copies a page again and never
+/// misses one. No other lock is taken in its place.
+///
+/// May turn within a run (`crate::ab`): every reader waits for the busy
+/// ranges whichever way the switch is, and there are none while it is off.
+/// From JozefDeTremmerie/CCS03 f94625a, which mends what kept fork #1102
+/// out (the guards' walk still under the journal; an answer read from the
+/// journal while an asking's pages were reset and not noted).
+fn journal_unlocked() -> bool {
+    #[cfg(test)]
+    if let Some(on) = JOURNAL_UNLOCKED_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let run = *ON.get_or_init(|| std::env::var_os("VICTORY_JOURNAL_UNLOCKED").is_some_and(|v| v == "1"));
+    crate::ab::flag(crate::ab::Key::JournalUnlocked, run)
+}
+
+/// Told when a range leaves [`Journal::busy`].
+static UNBUSY: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The journal once no range a [`writes`] is asking about crosses one of
+/// the page ranges `pages` (`[first, last)` each): only those wait, never
+/// for a range of other pages. At once when nothing is busy, as always
+/// without [`journal_unlocked`].
+fn unbusy(j: JournalHeld, pages: &[(usize, usize)]) -> JournalHeld {
+    if j.busy.is_empty() {
+        return j;
+    }
+    j.wait_while(&UNBUSY, |j| {
+        j.busy.iter().any(|&(a, b)| pages.iter().any(|&(first, last)| a < last && first < b))
+    })
+}
+
+/// A range in [`Journal::busy`]; leaves it when dropped (a panic in the
+/// asking must not leave other threads waiting for it).
+struct Asking(usize, usize);
+
+impl Asking {
+    /// Takes the range out of `j.busy` and tells the waiters.
+    fn done(self, j: &mut Journal) {
+        if let Some(at) = j.busy.iter().position(|&r| r == (self.0, self.1)) {
+            j.busy.swap_remove(at);
+        }
+        UNBUSY.notify_all();
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = j.busy.iter().position(|&r| r == (self.0, self.1)) {
+            j.busy.swap_remove(at);
+        }
+        UNBUSY.notify_all();
+    }
+}
+
+thread_local! {
+    /// Room for the kernel's answer to a [`writes`] made with the journal
+    /// let go ([`journal_unlocked`]).
+    static UNLOCKED_FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -111,11 +205,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = crate::lockmeter::lock_journal(&JOURNAL);
-    let j = &mut *j;
+    let held = crate::lockmeter::lock_journal(&JOURNAL);
     // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if j.kept {
+    // hold is left to `writes`. Said before any wait.
+    if held.kept {
         return;
     }
     // View memory the guards hold is left to `writes`, which answers it
@@ -129,9 +222,35 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     pieces.retain(|&(first, _)| !known_view(first * PAGE));
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+    // A range a [`writes`] asks about with the journal let go
+    // ([`journal_unlocked`]) whose pages these askings would reset is
+    // waited for, and only such a range: the spans of the runs are what the
+    // kernel is asked about (by halves too, inside them). With nothing busy
+    // (always without the switch) nothing is made for it, and the lock is
+    // held throughout, as before; else it is let go only while such a range
+    // is waited for, and the standing asking is looked at again after.
+    let mut held = if held.busy.is_empty() {
+        held
+    } else {
+        let mut spans = Vec::new();
+        ahead_runs(&pieces, |_, span| spans.push(span));
+        let held = unbusy(held, &spans);
+        if held.kept {
+            return;
+        }
+        held
+    };
+    let j = &mut *held;
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    ahead_runs(&pieces, |run, _| ask_run(j, &pieces[run]));
+}
+
+/// [`ask_ahead`]'s runs of `pieces` (page ranges in order), each given to
+/// `each` in order: pieces closer than [`AHEAD_GAP`] together, no run over
+/// [`AHEAD_MAX`]; the run's pieces and the span asked about.
+fn ahead_runs(pieces: &[(usize, usize)], mut each: impl FnMut(std::ops::Range<usize>, (usize, usize))) {
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -144,7 +263,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        each(i..k, (first, last));
         i = k;
     }
 }
@@ -226,7 +345,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    // Only a range being asked about with the journal let go that crosses
+    // one of the submission's is waited for ([`unbusy`]); with nothing busy
+    // (always without the switch) nothing is made for it.
     let mut j = crate::lockmeter::lock_journal(&JOURNAL);
+    if !j.busy.is_empty() {
+        let pages: Vec<(usize, usize)> =
+            ranges.iter().filter(|r| r.0 < r.1).map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE))).collect();
+        j = unbusy(j, &pages);
+    }
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -390,7 +517,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = crate::lockmeter::lock_journal(&JOURNAL);
+    let j = unbusy(crate::lockmeter::lock_journal(&JOURNAL), &[(first, last)]);
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -426,8 +553,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8, written: &mut V
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = crate::lockmeter::lock_journal(&JOURNAL);
-    let j = &mut *j;
+    let mut held = unbusy(crate::lockmeter::lock_journal(&JOURNAL), &[(first, last)]);
+    let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         written.clear();
@@ -445,6 +572,10 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8, written: &mut V
         written.clear();
         written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
         return Some(j.asked);
+    }
+    // The kernel, or the guards, asked with the journal let go.
+    if journal_unlocked() {
+        return writes_unlocked(held, (first, last), guarded, light, written);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -529,6 +660,436 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8, written: &mut V
     written.clear();
     written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
     Some(now)
+}
+
+/// [`writes_as`] past the journal's own answers, with [`journal_unlocked`]:
+/// the range is noted busy, the journal let go while the kernel or the
+/// guards are asked ([`ask_unlocked`], the same asking as there), then
+/// taken again to note what was found, under an asking numbered then.
+fn writes_unlocked(
+    mut held: JournalHeld,
+    (first, last): (usize, usize),
+    guarded: bool,
+    light: u8,
+    written: &mut Vec<(usize, u64)>,
+) -> Option<u64> {
+    held.busy.push((first, last));
+    let asking = Asking(first, last);
+    drop(held);
+    let found = UNLOCKED_FOUND.with_borrow_mut(|found| ask_unlocked(found, (first, last), guarded));
+    let mut held = crate::lockmeter::lock_journal(&JOURNAL);
+    let j = &mut *held;
+    asking.done(j);
+    let (pages, failed) = found?;
+    j.asked += 1;
+    let now = j.asked;
+    for &page in &pages {
+        j.written.insert(page, now);
+    }
+    // A range that crosses one asked ahead ([`ask_ahead`], [`ask_once`])
+    // without lying inside it is asked here, and the pages it found in that
+    // range now have a later number than the asking that stands: the
+    // standing answer moves with it, as [`wrote`] moves it, or a copy
+    // answered from the journal would take such a page at the standing
+    // number and find it written later at every refresh (the class of
+    // fxceless/victory-fork#410). A later number takes a page again, never
+    // misses one.
+    if pages.iter().any(|&page| j.ahead.iter().any(|&(a, b)| a <= page && page < b)) {
+        j.ahead_asked = now;
+    }
+    // The light refresh, as [`writes_as`] notes it: the waiters for this
+    // range are still kept out by the journal's lock, held from here on.
+    if failed && light != 0 {
+        LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        publish(j, &pages, first * PAGE, last * PAGE, told());
+    }
+    written.clear();
+    written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    Some(now)
+}
+
+/// [`writes_unlocked`]'s asking, with the journal let go: the kernel's write
+/// watch about pages `[first, last)` (reset as it answers), or the guards
+/// where that fails and `guarded`, as in [`writes_as`]. The pages found
+/// written and whether the kernel's asking failed; `None` where neither can
+/// tell.
+fn ask_unlocked(found: &mut Vec<usize>, (first, last): (usize, usize), guarded: bool) -> Option<(Vec<usize>, bool)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    if found.len() < count {
+        found.resize(count, 0);
+    }
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let known_view = (guarded || watch_view_early()) && known_view(first * PAGE);
+    if known_view && !guarded {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        return None;
+    }
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = known_view
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        if known_view {
+            crate::copystat::C::WatchKnownView
+        } else {
+            crate::copystat::C::WatchFailed
+        },
+        failed as u64,
+    );
+    let guarded = if failed {
+        count = 0;
+        if !guarded {
+            return None;
+        }
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let written = guard(first * PAGE, last * PAGE);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        written?
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        crate::framelog::add(crate::framelog::T::WatchUs, started.elapsed().as_micros() as u64);
+        slow(started.elapsed().as_micros() as u64);
+    }
+    if !failed {
+        kernel_answered(first, last, &found[..count]);
+    }
+    Some((found[..count].iter().map(|&at| at / PAGE).chain(guarded).collect(), failed))
+}
+
+#[cfg(test)]
+mod journal_unlocked_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release, Ordering::SeqCst};
+
+    /// Private, committed, write-watched memory of `pages` pages of 64 KiB,
+    /// as the title's is.
+    struct Memory(usize, usize);
+
+    impl Memory {
+        fn new(pages: usize) -> Memory {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+            let len = pages * PAGE;
+            // SAFETY: a plain allocation of our own.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+            assert!(!at.is_null() && (at as usize).is_multiple_of(PAGE));
+            Memory(at as usize, len)
+        }
+    }
+
+    impl Drop for Memory {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            forget(self.0, self.0 + self.1);
+            // SAFETY: our own reservation, which nothing reads any more.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// The journal's notes of `[start, end)` dropped (the next test that
+    /// gets the same addresses finds none).
+    fn forget(start: usize, end: usize) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j.written.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
+    }
+
+    /// A title write of the 8 bytes at `at`, as an atomic store: the test
+    /// reads that memory only through the kernel while others write it.
+    fn put(at: usize, value: u64) {
+        // SAFETY: 8-aligned title memory of the test's, written only so.
+        unsafe { (*(at as *const AtomicU64)).store(value, Relaxed) };
+    }
+
+    /// A host copy of `[start, start + len)` as `Shadow::update` keeps one:
+    /// each page with the asking it was last taken at (0: never), taken
+    /// again where the journal has it written later, read through the
+    /// kernel (`crate::host::read_into`), as the layer reads title memory.
+    struct HostCopy {
+        start: usize,
+        guarded: bool,
+        bytes: Vec<u8>,
+        taken: Vec<u64>,
+    }
+
+    impl HostCopy {
+        fn new(start: usize, len: usize, guarded: bool) -> HostCopy {
+            HostCopy { start, guarded, bytes: vec![0; len], taken: vec![0; len / PAGE] }
+        }
+
+        /// Brings `[from, to)` (page-aligned offsets) up to date; the pages
+        /// copied.
+        fn refresh(&mut self, from: usize, to: usize) -> usize {
+            let Some((now, written)) = writes(self.start + from, self.start + to, self.guarded) else {
+                panic!("watched or guarded memory");
+            };
+            let base = self.start / PAGE;
+            let mut copied = 0;
+            for page in (self.start + from) / PAGE..(self.start + to) / PAGE {
+                let w = written.iter().find(|&&(p, _)| p == page).map_or(0, |&(_, w)| w);
+                let at = &mut self.taken[page - base];
+                if *at == 0 || w > *at {
+                    *at = now;
+                    let off = (page - base) * PAGE;
+                    assert!(crate::host::read_into((self.start + off) as *const u8, &mut self.bytes[off..off + PAGE]));
+                    copied += 1;
+                }
+            }
+            copied
+        }
+
+        /// The 8 bytes of slot `i` (offset `8 * i`).
+        fn slot(&self, i: usize) -> u64 {
+            u64::from_le_bytes(self.bytes[8 * i..8 * i + 8].try_into().unwrap())
+        }
+    }
+
+    /// The case of fxceless/victory-fork#410 the review names: a submission's
+    /// one asking stands over A; the title writes in A∩B; B, which crosses A
+    /// without lying inside it, is asked about; then a copy of A answered
+    /// from the journal is brought up to date twice. With the switch the
+    /// page is taken once and then not again (the standing answer moved with
+    /// B's asking). Off it is taken at every refresh, as before the switch:
+    /// that path is left as it was.
+    #[test]
+    fn a_crossing_asking_moves_the_standing_answer() {
+        let _turn = crate::warp_turn();
+        for on in [false, true] {
+            JOURNAL_UNLOCKED_IN_TEST.set(Some(on));
+            let memory = Memory::new(4);
+            let m = memory.0;
+            ask_once(&[(m, m + 2 * PAGE)]);
+            let mut copy = HostCopy::new(m, 2 * PAGE, false);
+            assert_eq!(copy.refresh(0, 2 * PAGE), 2, "the first refresh takes all");
+            put(m + PAGE + 64, 0x5a5a);
+            assert!(writes(m + PAGE, m + 3 * PAGE, false).is_some());
+            let taken = [copy.refresh(0, 2 * PAGE), copy.refresh(0, 2 * PAGE)];
+            ask_once_end();
+            assert_eq!(copy.slot((PAGE + 64) / 8), 0x5a5a, "the title's write is in the copy (on: {on})");
+            if on {
+                assert_eq!(taken, [1, 0], "taken once, then current");
+            } else {
+                assert_eq!(taken, [1, 1], "as before the switch");
+            }
+            drop(memory);
+        }
+        JOURNAL_UNLOCKED_IN_TEST.set(None);
+    }
+
+    /// The concurrent oracle. A writer stores rising numbers at random
+    /// 8-byte slots of the memory, and after each store says, per slot, the
+    /// last number it stored there (`last`, with release). A submission
+    /// thread loops: notes `last` (acquire), makes that its floor, asks
+    /// once (`ask_once`) for two of the memory's pages, brings its copy of
+    /// them up to date, checks, and ends the asking. Three helpers bring
+    /// copies of ranges that cross the submission's and each other's up to
+    /// date, each checking against its own note of `last` taken before the
+    /// refresh, lowered to the submission's floor where an asking may stand
+    /// (an answer from a standing asking is as of that asking). A copy that
+    /// holds, at some slot, a number below the floor has lost a write that
+    /// ended before its refresh began. Once all have stopped, every copy
+    /// brought up to date once more is the memory, byte for byte. Run on
+    /// private write-watched memory and on view memory (two views of one
+    /// section: written through one, copied through the other, the guards'
+    /// way), the switch off and on.
+    #[test]
+    fn copies_never_hold_a_write_older_than_their_refresh() {
+        let _turn = crate::warp_turn();
+        for views in [false, true] {
+            for on in [false, true] {
+                let (refreshes, stores) = oracle(views, on);
+                assert!(refreshes > 40 && stores > 1000, "views {views} on {on}: {refreshes} refreshes, {stores} stores");
+            }
+        }
+    }
+
+    fn oracle(views: bool, on: bool) -> (u64, u64) {
+        const PAGES: usize = 4;
+        let len = PAGES * PAGE;
+        let slots = len / 8;
+        let (memory, view) = if views {
+            let (section, one, two) = super::tests::two_views_for_others(len);
+            (None, Some((section, one, two)))
+        } else {
+            (Some(Memory::new(PAGES)), None)
+        };
+        let (read, write) = match (&memory, view) {
+            (Some(m), _) => (m.0, m.0),
+            (None, Some((_, one, two))) => (one, two),
+            _ => unreachable!(),
+        };
+        let last: Vec<AtomicU64> = (0..slots).map(|_| AtomicU64::new(0)).collect();
+        let floor: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(vec![0; slots]);
+        let stop = AtomicBool::new(false);
+        let (refreshes, lost, stores) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+        let note = |from: usize, to: usize| -> Vec<u64> { (from / 8..to / 8).map(|i| last[i].load(Acquire)).collect() };
+        let check = |copy: &HostCopy, from: usize, floor: &[u64]| {
+            for (k, &f) in floor.iter().enumerate() {
+                if copy.slot(from / 8 + k) < f {
+                    lost.fetch_add(1, Relaxed);
+                }
+            }
+        };
+        let copies: Vec<HostCopy> = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(on) ^ u64::from(views) << 1;
+                let mut seq = 0u64;
+                while !stop.load(SeqCst) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let i = x as usize % slots;
+                    seq += 1;
+                    put(write + 8 * i, seq);
+                    last[i].store(seq, Release);
+                }
+                stores.store(seq, SeqCst);
+            });
+            let submission = s.spawn(|| {
+                JOURNAL_UNLOCKED_IN_TEST.set(Some(on));
+                let mut copy = HostCopy::new(read, len, views);
+                let own = [(0, PAGE), (2 * PAGE, 3 * PAGE)];
+                while !stop.load(SeqCst) {
+                    let noted = note(0, len);
+                    floor.lock().unwrap().clone_from(&noted);
+                    ask_once(&own.map(|(a, b)| (read + a, read + b)));
+                    for (a, b) in own {
+                        copy.refresh(a, b);
+                        check(&copy, a, &noted[a / 8..b / 8]);
+                    }
+                    ask_once_end();
+                    refreshes.fetch_add(1, Relaxed);
+                }
+                copy
+            });
+            let helpers: Vec<_> = (0..3)
+                .map(|k| {
+                    let (note, check, floor, stop, refreshes) = (&note, &check, &floor, &stop, &refreshes);
+                    s.spawn(move || {
+                        JOURNAL_UNLOCKED_IN_TEST.set(Some(on));
+                        let mut copy = HostCopy::new(read, len, views);
+                        let ranges = [(0, len), (0, 2 * PAGE), (PAGE, 3 * PAGE), (2 * PAGE, len), (PAGE, 2 * PAGE)];
+                        let mut turn = k;
+                        while !stop.load(SeqCst) {
+                            let (a, b) = ranges[turn % ranges.len()];
+                            let mut noted = note(a, b);
+                            let standing = floor.lock().unwrap();
+                            for (n, f) in noted.iter_mut().zip(&standing[a / 8..b / 8]) {
+                                *n = (*n).min(*f);
+                            }
+                            drop(standing);
+                            copy.refresh(a, b);
+                            check(&copy, a, &noted);
+                            turn += 1;
+                            refreshes.fetch_add(1, Relaxed);
+                        }
+                        copy
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            stop.store(true, SeqCst);
+            let mut copies = vec![submission.join().unwrap()];
+            copies.extend(helpers.into_iter().map(|h| h.join().unwrap()));
+            copies
+        });
+        // Every thread has ended: each copy brought up to date once more is
+        // the memory as it is.
+        JOURNAL_UNLOCKED_IN_TEST.set(Some(on));
+        let mut title = vec![0u8; len];
+        assert!(crate::host::read_into(read as *const u8, &mut title));
+        for (n, mut copy) in copies.into_iter().enumerate() {
+            copy.refresh(0, len);
+            let differing = copy.bytes.iter().zip(&title).filter(|(a, b)| a != b).count();
+            assert_eq!(differing, 0, "copy {n} is not the memory (views {views}, on {on})");
+        }
+        JOURNAL_UNLOCKED_IN_TEST.set(None);
+        assert_eq!(lost.load(SeqCst), 0, "slots below their floor (views {views}, on {on})");
+        if let Some((section, one, two)) = view {
+            super::tests::drop_views(section, &[one, two], len);
+        }
+        drop(memory);
+        (refreshes.load(SeqCst), stores.load(SeqCst))
+    }
+
+    /// A range being asked about with the journal let go holds off an asker
+    /// whose pages cross it until its pages are in the journal, and not an
+    /// asker of other pages; an asking ahead of other pages does not wait
+    /// for it either. A dropped asking leaves its range.
+    #[test]
+    fn a_busy_range_holds_off_crossing_askers_only() {
+        let _turn = crate::warp_turn();
+        let memory = Memory::new(6);
+        let (m, first) = (memory.0, memory.0 / PAGE);
+        // As `writes_unlocked` notes it while it asks.
+        let asking = {
+            let mut j = JOURNAL.lock().unwrap();
+            j.busy.push((first, first + 2));
+            Asking(first, first + 2)
+        };
+        let (crossing, other, ahead) = (AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false));
+        // The asking belongs to the scope's closure: an assertion that fails
+        // in it drops the asking as it unwinds, before the scope waits for
+        // its threads, and the crossing asker goes on (no test hangs).
+        std::thread::scope(|s| {
+            // (Moved in: captured by value, the rest by reference.)
+            let asking = asking;
+            s.spawn(|| {
+                assert!(writes(m + PAGE, m + 2 * PAGE, false).is_some());
+                crossing.store(true, SeqCst);
+            });
+            s.spawn(|| {
+                assert!(writes(m + 3 * PAGE, m + 4 * PAGE, false).is_some());
+                other.store(true, SeqCst);
+            });
+            s.spawn(|| {
+                ask_ahead(&[(m + 4 * PAGE, m + 5 * PAGE), (m + 5 * PAGE, m + 6 * PAGE)]);
+                ask_ahead_done();
+                ahead.store(true, SeqCst);
+            });
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !(other.load(SeqCst) && ahead.load(SeqCst)) && std::time::Instant::now() < until {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(other.load(SeqCst), "an asker of other pages went on");
+            assert!(ahead.load(SeqCst), "an asking ahead of other pages went on");
+            assert!(!crossing.load(SeqCst), "a crossing asker waited");
+            asking.done(&mut JOURNAL.lock().unwrap());
+        });
+        assert!(crossing.load(SeqCst), "and went on once the range was done");
+        let dropped = {
+            let mut j = JOURNAL.lock().unwrap();
+            j.busy.push((first + 2, first + 3));
+            Asking(first + 2, first + 3)
+        };
+        drop(dropped);
+        assert!(!JOURNAL.lock().unwrap().busy.contains(&(first + 2, first + 3)));
+    }
 }
 
 impl Tracked {
@@ -1806,7 +2367,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if taken.contains(&0) {
         return false;
     }
-    let j = crate::lockmeter::lock_journal(&JOURNAL);
+    let j = unbusy(crate::lockmeter::lock_journal(&JOURNAL), &[(first, last)]);
     // The bits first, then the journal, both under its lock ([`published`]).
     let by_bits = !j.ahead.iter().any(|&(a, b)| a <= first && last <= b);
     if by_bits && !published(&j, first * PAGE, last * PAGE) {

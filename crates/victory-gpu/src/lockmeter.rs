@@ -433,6 +433,44 @@ impl<T: 'static> std::ops::DerefMut for JournalHeld<T> {
     }
 }
 
+impl<T: 'static> JournalHeld<T> {
+    /// Waits on `condvar` while `busy` says so (the journal's ranges being
+    /// asked about with it let go, `crate::watch`'s `unbusy`), the lock let
+    /// go meanwhile; the wait counted for the thread's role with the meter
+    /// on.
+    pub(crate) fn wait_while(self, condvar: &std::sync::Condvar, mut busy: impl FnMut(&T) -> bool) -> Self {
+        if !busy(&self.guard) {
+            return self;
+        }
+        let me = std::mem::ManuallyDrop::new(self);
+        let (role, since) = (me.role, me.since);
+        // The hold so far, counted as `Drop` counts one.
+        if let Some(since) = since {
+            let ns = since.elapsed().as_nanos() as u64;
+            J_HOLD_NS[usize::from(role)].fetch_add(ns * u64::from(every()), Relaxed);
+            J_HOLD_MAX_NS[usize::from(role)].fetch_max(ns, Relaxed);
+        }
+        // SAFETY: `me` is never dropped, so the guard is moved out once.
+        let mut guard = unsafe { std::ptr::read(&me.guard) };
+        let waiting = (every() > 0).then(std::time::Instant::now);
+        while busy(&guard) {
+            guard = condvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        if let Some(waiting) = waiting {
+            J_BUSY_US[usize::from(role)].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
+            J_BUSY_N[usize::from(role)].fetch_add(1, Relaxed);
+        }
+        // The rest of the hold is counted from here: the lock was let go
+        // meanwhile.
+        JournalHeld { guard, role, since: since.map(|_| std::time::Instant::now()) }
+    }
+}
+
+/// With the meter, by role: waits for the journal's ranges being asked
+/// about with it let go (`VICTORY_JOURNAL_UNLOCKED`), µs and count.
+static J_BUSY_US: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+static J_BUSY_N: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+
 impl<T: 'static> Drop for JournalHeld<T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
@@ -486,9 +524,14 @@ pub(crate) fn journal_line(frames: f64) -> Option<String> {
     }
     let f = frames.max(1.0);
     let take = |a: &AtomicU64| a.swap(0, Relaxed) as f64;
-    let (mut waits, mut holds) = (Vec::new(), Vec::new());
-    let (mut waited, mut held) = (0.0, 0.0);
+    let (mut waits, mut holds, mut busy) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut waited, mut held, mut busy_us) = (0.0, 0.0, 0.0);
     for r in 0..ROLES {
+        let (b_us, b_count) = (take(&J_BUSY_US[r]), take(&J_BUSY_N[r]));
+        busy_us += b_us;
+        if b_count > 0.0 {
+            busy.push(format!("{} {:.2} ms in {:.0}", ROLE_NAMES[r], b_us / 1e3 / f, b_count / f));
+        }
         let (us, count) = (take(&J_WAIT_US[r]), take(&J_WAIT_N[r]));
         let (ns, takings, max) = (take(&J_HOLD_NS[r]), take(&J_HOLD_N[r]), J_HOLD_MAX_NS[r].swap(0, Relaxed) as f64);
         waited += us;
@@ -513,7 +556,15 @@ pub(crate) fn journal_line(frames: f64) -> Option<String> {
         if waits.is_empty() { "none".to_owned() } else { waits.join(", ") },
         held / 1e6 / f,
         if holds.is_empty() { "none".to_owned() } else { holds.join(", ") },
-    ))
+    ) + &if busy.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; waits for ranges asked about with the lock let go (VICTORY_JOURNAL_UNLOCKED) {:.2} ms: {}",
+            busy_us / 1e3 / f,
+            busy.join(", ")
+        )
+    })
 }
 
 /// The cost of one timed hold's clock reads, ns, measured once.

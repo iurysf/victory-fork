@@ -82,6 +82,7 @@ pub(crate) enum Key {
     RefreshAhead,
     WideFills,
     HeapSyncWide,
+    JournalUnlocked,
     SkipUnchanged,
     IndirectHoist,
     IndirectBatch,
@@ -90,7 +91,7 @@ pub(crate) enum Key {
 }
 
 /// Each switch's name and, for one that may not take part, why.
-pub(crate) const KEYS: [(Key, &str, Option<&str>); 32] = [
+pub(crate) const KEYS: [(Key, &str, Option<&str>); 33] = [
     (Key::BackOwnView, "BACK_OWN_VIEW", None),
     (Key::TextureHashEvery, "TEXTURE_HASH_EVERY", None),
     (Key::CardQueue, "CARD_QUEUE", None),
@@ -118,6 +119,7 @@ pub(crate) const KEYS: [(Key, &str, Option<&str>); 32] = [
     (Key::RefreshAhead, "REFRESH_AHEAD", None),
     (Key::WideFills, "WIDE_FILLS", None),
     (Key::HeapSyncWide, "HEAP_SYNC_WIDE", None),
+    (Key::JournalUnlocked, "JOURNAL_UNLOCKED", None),
     (
         Key::SkipUnchanged,
         "SKIP_UNCHANGED",
