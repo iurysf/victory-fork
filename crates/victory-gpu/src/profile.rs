@@ -1216,7 +1216,7 @@ unsafe fn frame_fits(
                 return false;
             }
             let chained = version >> 3 & 4 != 0;
-            if part == 0 {
+            if pointer == 0 {
                 pointer = frame & 15;
             }
             let codes = info.add(4);
@@ -1368,12 +1368,22 @@ unsafe fn epilogue_fits(
         at += if rex { 2 } else { 1 };
         pops += 1;
     }
+    // `ntdll!RtlVirtualUnwind2` skips a 0xf2 prefix (BND/REPNE) before the
+    // leaving instruction and does not stop scanning at the function's end.
+    if byte(at) == 0xf2 {
+        at += 1;
+    }
     // A return or a jump: only then are the instructions before it run.
-    let leaves = matches!(byte(at), 0xc3 | 0xc2 | 0xeb | 0xe9)
+    let leaves = at >= code
+        || matches!(byte(at), 0xc3 | 0xc2 | 0xeb | 0xe9)
         || byte(at) == 0xf3 && byte(at + 1) == 0xc3
-        || byte(at) == 0xff && byte(at + 1) == 0x25
+        || byte(at) == 0xff && byte(at + 1) & 0x38 == 0x20
         || byte(at) & 0xf0 == 0x40 && byte(at + 1) == 0xff && byte(at + 2) & 0x38 == 0x20;
-    !leaves || (!pops_rsp && pops < 64 && rsp >= start && rsp + 8 * (pops + 1) <= end)
+    !leaves
+        || (!pops_rsp
+            && pops < 64
+            && rsp >= start
+            && end.checked_sub(rsp).is_some_and(|room| room >= 8 * (pops + 1)))
 }
 
 /// The class of a time in nanoseconds: four to a power of two (the
