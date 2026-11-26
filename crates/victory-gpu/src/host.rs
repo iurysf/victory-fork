@@ -6302,14 +6302,7 @@ impl Host {
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted (on a thread of
         // its own until just before they go, `VICTORY_HEAP_SYNC_ASIDE`).
-        let heaps_synced = crate::descriptor::begin_sync_heaps(|| {
-            runs.iter().any(|list| {
-                list.deferred()
-                    .copies
-                    .iter()
-                    .any(|step| matches!(step, &Step::Copy(dst, _, len) if crate::descriptor::touches_heaps(dst, len)))
-            })
-        });
+        let heaps_synced = crate::descriptor::begin_sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
