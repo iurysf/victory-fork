@@ -5904,6 +5904,8 @@ impl Host {
         if !late() {
             return;
         }
+        // Copy-back, for the guards' lock's waits (`crate::lockmeter`).
+        let _copy_back = crate::lockmeter::within(crate::lockmeter::Ctx::CopyBack);
         if relay() {
             // Nothing is settled here: the thread that lands flights does
             // it, in order, and this waits until nothing is in the air and
@@ -6110,6 +6112,7 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         let asking = std::time::Instant::now();
+        let step = crate::lockmeter::within(crate::lockmeter::Ctx::Ask);
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6144,7 +6147,9 @@ impl Host {
             settled += settling.elapsed();
         }
         prep(crate::framelog::T::PrepAskUs, asking.elapsed().saturating_sub(settled));
+        drop(step);
         let steps = std::time::Instant::now();
+        let step = crate::lockmeter::within(crate::lockmeter::Ctx::Steps);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6153,10 +6158,13 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        drop(step);
         prep(crate::framelog::T::PrepStepsUs, steps.elapsed());
         let flushing = std::time::Instant::now();
+        let step = crate::lockmeter::within(crate::lockmeter::Ctx::Flush);
         batch.flush();
         crate::watch::ask_once_end();
+        drop(step);
         prep(crate::framelog::T::PrepFlushUs, flushing.elapsed());
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -6165,6 +6173,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             let taking = std::time::Instant::now();
+            let _step = crate::lockmeter::within(crate::lockmeter::Ctx::Snapshots);
             crate::shadow::take_snapshots();
             prep(crate::framelog::T::PrepSnapshotsUs, taking.elapsed());
             #[cfg(feature = "diagnostics")]
@@ -6175,6 +6184,7 @@ impl Host {
         // write follows them in the same submission.
         let flown = late && relay();
         let planning = std::time::Instant::now();
+        let step = crate::lockmeter::within(crate::lockmeter::Ctx::Card);
         let mut card_settled = std::time::Duration::ZERO;
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
@@ -6183,6 +6193,7 @@ impl Host {
             settled += card_settled;
         }
         let card = self.card_before(runs, flown, *submitted);
+        drop(step);
         prep(crate::framelog::T::PrepCardUs, planning.elapsed().saturating_sub(card_settled));
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));

@@ -543,7 +543,7 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards();
+    let g = guards(crate::lockmeter::Site::KnownView);
     let first = start / BLOCK;
     if g.protected.contains(&first) || g.absent.contains(&first) {
         return true;
@@ -771,7 +771,7 @@ pub(crate) enum Over {
 /// was set ([`BACK_UNGUARDED`]).
 pub(crate) fn differing_kind(block: usize) -> Over {
     {
-        let g = guards();
+        let g = guards(crate::lockmeter::Site::DifferingKind);
         if g.clean.uncovered(block, block + 1).is_empty() {
             return Over::Clean;
         }
@@ -1055,7 +1055,7 @@ pub(crate) fn watch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Uncha
     if first >= last {
         return None;
     }
-    let mut g = guards();
+    let mut g = guards(crate::lockmeter::Site::WatchUnchanged);
     if g.protected.count_in(first..last) != last - first {
         return None;
     }
@@ -1133,7 +1133,7 @@ fn register_refreshing(g: &mut Guards, first: usize, last: usize) {
 /// A copy watching `[start, start + len)` goes.
 pub(crate) fn unwatch_unchanged(start: usize, len: usize, w: &std::sync::Arc<Unchanged>) {
     let (first, last) = (start / BLOCK, start.saturating_add(len).div_ceil(BLOCK));
-    let mut g = guards();
+    let mut g = guards(crate::lockmeter::Site::UnwatchUnchanged);
     let buckets: Vec<usize> =
         g.watchers.range(first >> BUCKET_SHIFT..(last + (1 << BUCKET_SHIFT) - 1) >> BUCKET_SHIFT).map(|(&b, _)| b).collect();
     for bucket in buckets {
@@ -1153,24 +1153,18 @@ fn unchanged_gone(at: usize, len: usize) {
     if len == 0 || !WATCHING.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let g = guards();
+    let g = guards(crate::lockmeter::Site::UnchangedGone);
     take_out_range(&g, at, at.saturating_add(len));
 }
 
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
+/// The guards, locked for `site`; the waits and holds measured
+/// (`crate::lockmeter`).
+type GuardsHeld = crate::lockmeter::Held<Guards>;
+
+fn guards(site: crate::lockmeter::Site) -> GuardsHeld {
     use crate::framelog::{T, add};
-    let mut g = match GUARDS.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            // Another thread holds them: the wait goes to the frame log.
-            let waiting = std::time::Instant::now();
-            let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-            add(T::GuardsLockUs, waiting.elapsed().as_micros() as u64);
-            g
-        }
-    };
+    let mut g = crate::lockmeter::lock(&GUARDS, site);
     let runs = guard_intervals();
     if g.protected.runs_mode != runs {
         let turning = std::time::Instant::now();
@@ -1203,7 +1197,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // for the guards'.)
         install();
         let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-        let mut g = guards();
+        let mut g = guards(crate::lockmeter::Site::GuardClean);
         if first < last && g.clean.uncovered(first, last).is_empty() {
             register_refreshing(&mut g, first, last);
             return Some(Vec::new());
@@ -1214,12 +1208,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if !is_view(start, end) {
                 return None;
             }
-            g = guards();
+            g = guards(crate::lockmeter::Site::GuardLocked);
         }
+        g.now_for(crate::lockmeter::Site::GuardLocked);
         return guard_locked(g, start, end);
     }
     let known = !ask && {
-        let g = guards();
+        let g = guards(crate::lockmeter::Site::GuardKnown);
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
@@ -1227,11 +1222,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
-    guard_locked(guards(), start, end)
+    guard_locked(guards(crate::lockmeter::Site::GuardLocked), start, end)
 }
 
 /// [`guard`] with the guards locked, the range known to be a view.
-fn guard_locked(mut g: std::sync::MutexGuard<'static, Guards>, start: usize, end: usize) -> Option<Vec<usize>> {
+fn guard_locked(mut g: GuardsHeld, start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Large heaps are usually clean (#979): one lookup when all of the
@@ -1339,6 +1334,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         return;
     }
     let coalesced = guard_coalesce();
+    let metered = crate::lockmeter::on().then(std::time::Instant::now);
     let mut aliases: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
@@ -1384,6 +1380,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         if view_known() {
             g.viewed.extend(first..last);
         }
+    }
+    if let Some(started) = metered {
+        crate::lockmeter::alias_ns(started.elapsed().as_nanos() as u64);
     }
 }
 
@@ -1648,7 +1647,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    open(&mut guards(crate::lockmeter::Site::Writing), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1721,7 +1720,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         }
     }
     {
-        let mut g = guards();
+        let mut g = guards(crate::lockmeter::Site::TitleWritten);
         let guarded = g.protected.count_in(at / BLOCK..end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
@@ -1747,7 +1746,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = guards();
+    let mut g = guards(crate::lockmeter::Site::ViewsMapped);
     for &(at, n) in &ranges {
         if open_here(&mut g, at, at.saturating_add(n)) {
             #[cfg(feature = "diagnostics")]
@@ -1827,7 +1826,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let mut g = guards(crate::lockmeter::Site::Remapped);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -1903,7 +1902,7 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        let mut g = guards(crate::lockmeter::Site::Handler);
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -2063,7 +2062,7 @@ mod tests {
             let first = p / BLOCK;
             COALESCE_TEST.store(mode, std::sync::atomic::Ordering::SeqCst);
             let held = {
-                let mut g = guards();
+                let mut g = guards(crate::lockmeter::Site::Other);
                 protect_here(&mut g, first, first + 8);
                 for (a, b) in [(1, 3), (4, 5), (6, 8)] {
                     let _ = open_here(&mut g, (first + a) * BLOCK, (first + b) * BLOCK);
@@ -2650,7 +2649,7 @@ mod unchanged_tests {
     const FAR: usize = (1 << 46) / BLOCK;
 
     fn guard_fake(first: usize, n: usize) {
-        let mut g = guards();
+        let mut g = guards(crate::lockmeter::Site::Other);
         for b in first..first + n {
             g.protected.insert(b);
         }
@@ -2658,7 +2657,7 @@ mod unchanged_tests {
 
     fn unguard_fake(first: usize, n: usize, w: &Arc<Unchanged>) {
         unwatch_unchanged(first * BLOCK, n * BLOCK, w);
-        let mut g = guards();
+        let mut g = guards(crate::lockmeter::Site::Other);
         for b in first..first + n {
             g.protected.remove(&b);
         }
@@ -2677,7 +2676,7 @@ mod unchanged_tests {
         assert!(w.covers(start, len), "refreshed and not written: skipped");
         assert!(w.covers(start + BLOCK + 8, 100));
         // The title writes block 2 (the guard opens).
-        open_here(&mut guards(), (first + 2) * BLOCK, (first + 2) * BLOCK + 1);
+        open_here(&mut guards(crate::lockmeter::Site::Other), (first + 2) * BLOCK, (first + 2) * BLOCK + 1);
         assert!(!w.covers(start, len), "a written block is refreshed again");
         assert!(!w.covers((first + 2) * BLOCK, 16));
         assert!(w.covers(start, 2 * BLOCK), "the blocks before it stay current");
@@ -2693,7 +2692,7 @@ mod unchanged_tests {
         let w = Arc::new(Unchanged::default());
         let (start, len) = (first * BLOCK, 2 * BLOCK);
         let seen = watch_unchanged(start, len, &w).expect("all blocks guarded");
-        open_here(&mut guards(), start, start + 1);
+        open_here(&mut guards(crate::lockmeter::Site::Other), start, start + 1);
         w.note(start, start + len, seen);
         assert!(!w.covers(start, len));
         assert!(!w.covers(start + BLOCK, 8));
@@ -2776,13 +2775,13 @@ mod unchanged_tests {
         let seen = watch_unchanged(start, len, &w).unwrap();
         w.note(start, start + len, seen);
         {
-            let g = guards();
+            let g = guards(crate::lockmeter::Site::Other);
             let buckets: usize = g.watchers.range(first >> BUCKET_SHIFT..(first + blocks) >> BUCKET_SHIFT).count();
             assert_eq!(buckets, 2, "one entry per bucket, not per block");
         }
-        open_here(&mut guards(), start + 3 * BLOCK, start + 3 * BLOCK + 1);
+        open_here(&mut guards(crate::lockmeter::Site::Other), start + 3 * BLOCK, start + 3 * BLOCK + 1);
         assert!(!w.covers(start + 3 * BLOCK, 8));
-        open_here(&mut guards(), start + 5 * BLOCK, start + 5 * BLOCK + 1);
+        open_here(&mut guards(crate::lockmeter::Site::Other), start + 5 * BLOCK, start + 5 * BLOCK + 1);
         assert!(!w.covers(start + 5 * BLOCK, 8), "still registered after the first opening");
         assert!(w.covers(start + 4 * BLOCK, BLOCK));
         assert!(w.covers(start + 6 * BLOCK, len - 6 * BLOCK));
@@ -2802,7 +2801,7 @@ mod unchanged_tests {
         let seen = watch_unchanged(start, len, &w).unwrap();
         w.note(start, start + len, seen);
         {
-            let mut g = guards();
+            let mut g = guards(crate::lockmeter::Site::Other);
             g.protected.remove(&first);
             g.protected.remove(&(first + 1));
             g.clean.remove(first);
@@ -2814,7 +2813,7 @@ mod unchanged_tests {
         }
         assert!(!w.covers(start, len), "nothing of it is held current");
         {
-            let mut g = guards();
+            let mut g = guards(crate::lockmeter::Site::Other);
             remapped_viewed(&mut g, start, len, false);
             assert!(!g.viewed.contains(&first) && !g.viewed.contains(&(first + 1)), "forgotten without the switch");
         }
@@ -2848,7 +2847,7 @@ mod unchanged_tests {
         assert!(w.covers(start, len));
         // As `title_memory_remapped` does for every watched block of its range.
         {
-            let mut g = guards();
+            let mut g = guards(crate::lockmeter::Site::Other);
             invalidate(&mut g, first + 1);
         }
         assert!(w.covers(start, BLOCK));
