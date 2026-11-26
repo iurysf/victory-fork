@@ -1953,6 +1953,11 @@ fn guard_locked(mut g: GuardsHeld, start: usize, end: usize, now: u64, keep: u64
                     // this asking's query for the following blocks in the same region.
                     if block >= uncommitted_until {
                         ABSENT_LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Ahead of the question: a commit told after it is
+                        // looked for ([`title_memory_committed`]).
+                        if keep != 0 {
+                            NOTED_ABSENT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         uncommitted_until = uncommitted_end(block);
                     }
                     open = block >= uncommitted_until;
@@ -2564,6 +2569,14 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Whether a note that a block is uncommitted may exist ([`absent_once`]):
+/// set under the guards' lock before Windows is asked about such a block
+/// with notes kept, cleared under it by [`title_memory_committed`] when it
+/// finds none. A commit the runtime tells of either finds it set, or came
+/// before the question, whose answer then saw it. Without notes no commit
+/// takes the guards' lock.
+static NOTED_ABSENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The runtime committed title memory `[at, at + len)` for the title
 /// (`XMemVirtualAlloc` with a commit): what [`absent_once`] noted about its
 /// blocks is forgotten, so the next asking puts the question to Windows
@@ -2571,11 +2584,13 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again. From fxceless/victory-fork 6d20eed.
 pub fn title_memory_committed(at: usize, len: usize) {
-    if len == 0 || !WATCHING.load(std::sync::atomic::Ordering::Relaxed) {
+    if len == 0 || !NOTED_ABSENT.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     let mut g = guards(crate::lockmeter::Site::TitleWritten);
     if g.verified.is_empty() {
+        // (Under the guards' lock, which every note is made under.)
+        NOTED_ABSENT.store(false, std::sync::atomic::Ordering::SeqCst);
         return;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -3471,7 +3486,8 @@ mod tests {
             MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        WATCHING.store(true, std::sync::atomic::Ordering::Relaxed);
+        // (Nothing else set by hand: the commit's word must reach the notes
+        // as in a run without VICTORY_SKIP_UNCHANGED.)
         // SAFETY: a fresh placeholder of five blocks and a pagefile section
         // of five, as the runtime maps physical pages.
         let (p, section) = unsafe {
