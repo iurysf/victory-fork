@@ -243,6 +243,144 @@ pub(crate) fn alias_ns(ns: u64) {
     ALIAS_NS.fetch_add(ns, Relaxed);
 }
 
+/// The write-watch journal's lock (`crate::watch`'s `JOURNAL`), with
+/// `VICTORY_GUARDS_METER=N` only (unset: taken as before, nothing
+/// measured): waits by the waiting thread's role, as the guards' are (the
+/// submitting thread by step of preparing, copy-back, wide helpers, other
+/// threads of ours, the title's threads); holds by the holding thread's
+/// role, every Nth taking of a thread timed, times N.
+///
+/// Asked for by the Orquestrador (26/11): the submitting thread is still
+/// some 30 ms a frame inside work no lock meter owns, and the fork
+/// JozefDeTremmerie/CCS03 f94625a lets this lock go during the kernel's
+/// write-watch question. Measured before anything is ported.
+static J_WAIT_US: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+static J_WAIT_N: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+static J_HOLD_NS: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+static J_HOLD_N: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+static J_HOLD_MAX_NS: [AtomicU64; ROLES] = [const { AtomicU64::new(0) }; ROLES];
+
+/// The role of this thread, from its step of preparing or its name (the
+/// guards' roles without the call site: the journal is not taken in the
+/// write fault's handler).
+fn thread_role() -> usize {
+    match CTX.with(Cell::get) {
+        c @ 1..=5 => return usize::from(c) - 1,
+        6 => return 6,
+        _ => {}
+    }
+    match std::thread::current().name() {
+        Some("victory-submit") => 5,
+        Some("victory-relay" | "victory-late-wait") => 6,
+        Some(n) if n.starts_with("victory-wide") => 9,
+        Some(n) if n.starts_with("victory") => 10,
+        _ => 11,
+    }
+}
+
+/// The journal's lock taken through [`lock_journal`].
+pub(crate) struct JournalHeld<T: 'static> {
+    guard: std::sync::MutexGuard<'static, T>,
+    role: u8,
+    since: Option<std::time::Instant>,
+}
+
+impl<T: 'static> std::ops::Deref for JournalHeld<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for JournalHeld<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T: 'static> Drop for JournalHeld<T> {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            let ns = since.elapsed().as_nanos() as u64;
+            let r = usize::from(self.role);
+            J_HOLD_NS[r].fetch_add(ns * u64::from(every()), Relaxed);
+            J_HOLD_MAX_NS[r].fetch_max(ns, Relaxed);
+        }
+    }
+}
+
+/// Takes the journal's `mutex` as `lock()` would (a poisoned lock is taken
+/// as it is), measured with `VICTORY_GUARDS_METER` ([`journal_line`]).
+pub(crate) fn lock_journal<T>(mutex: &'static std::sync::Mutex<T>) -> JournalHeld<T> {
+    let n = every();
+    if n == 0 {
+        let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        return JournalHeld { guard, role: 0, since: None };
+    }
+    let role = thread_role();
+    let guard = match mutex.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let waiting = std::time::Instant::now();
+            let g = mutex.lock().unwrap_or_else(|e| e.into_inner());
+            J_WAIT_US[role].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
+            J_WAIT_N[role].fetch_add(1, Relaxed);
+            g
+        }
+    };
+    J_HOLD_N[role].fetch_add(1, Relaxed);
+    let timed = TAKINGS.with(|t| {
+        let k = t.get().wrapping_add(1);
+        t.set(k);
+        k % n == 0
+    });
+    let since = timed.then(|| {
+        TIMED.fetch_add(1, Relaxed);
+        std::time::Instant::now()
+    });
+    JournalHeld { guard, role: role as u8, since }
+}
+
+/// For the frame log's reading of `frames` frames: the journal's line, the
+/// counts taken since the last one; `None` without the meter.
+pub(crate) fn journal_line(frames: f64) -> Option<String> {
+    let n = every();
+    if n == 0 {
+        return None;
+    }
+    let f = frames.max(1.0);
+    let take = |a: &AtomicU64| a.swap(0, Relaxed) as f64;
+    let (mut waits, mut holds) = (Vec::new(), Vec::new());
+    let (mut waited, mut held) = (0.0, 0.0);
+    for r in 0..ROLES {
+        let (us, count) = (take(&J_WAIT_US[r]), take(&J_WAIT_N[r]));
+        let (ns, takings, max) = (take(&J_HOLD_NS[r]), take(&J_HOLD_N[r]), J_HOLD_MAX_NS[r].swap(0, Relaxed) as f64);
+        waited += us;
+        held += ns;
+        if count > 0.0 {
+            waits.push(format!("{} {:.2} ms in {:.0}", ROLE_NAMES[r], us / 1e3 / f, count / f));
+        }
+        if takings > 0.0 {
+            holds.push(format!(
+                "{} {:.0} takings {:.2} ms (longest {:.2} ms)",
+                ROLE_NAMES[r],
+                takings / f,
+                ns / 1e6 / f,
+                max / 1e6
+            ));
+        }
+    }
+    Some(format!(
+        "the write-watch journal's lock, a frame: waits {:.2} ms; by who waited: {}; holds {:.2} ms (VICTORY_GUARDS_METER={n}: \
+         one taking in {n} timed, times {n}); by who held it: {}",
+        waited / 1e3 / f,
+        if waits.is_empty() { "none".to_owned() } else { waits.join(", ") },
+        held / 1e6 / f,
+        if holds.is_empty() { "none".to_owned() } else { holds.join(", ") },
+    ))
+}
+
 /// The cost of one timed hold's clock reads, ns, measured once.
 fn timing_cost_ns() -> f64 {
     static COST: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -358,5 +496,35 @@ mod tests {
         assert!(WAIT_HOLDER_PREPARING.load(Relaxed) > preparing, "the holder was preparing (the lists' steps)");
         // The context is the thread's own: none here.
         assert_eq!(CTX.with(Cell::get), 0);
+    }
+
+    /// The journal's lock: taken and given back as a plain lock, whatever
+    /// the meter says; a wait goes to the waiter's role.
+    #[test]
+    fn the_journals_lock_is_a_plain_lock_with_its_waits_by_role() {
+        static M: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut g = lock_journal(&M);
+            *g += 1;
+            taken_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        taken_rx.recv().unwrap();
+        let relay = J_WAIT_N[6].load(Relaxed);
+        let waiter = std::thread::Builder::new()
+            .name("victory-relay".into())
+            .spawn(|| {
+                let mut g = lock_journal(&M);
+                assert_eq!(*g, 1, "after the holder");
+                *g += 1;
+            })
+            .unwrap();
+        holder.join().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(*M.lock().unwrap(), 2);
+        if every() > 0 {
+            assert!(J_WAIT_N[6].load(Relaxed) > relay, "the relay's wait is copy-back's");
+        }
     }
 }
