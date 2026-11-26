@@ -840,6 +840,11 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
+    /// With notes kept for good ([`told`]): the noted blocks that lie in
+    /// no placeholder reservation ([`placeholder`]), ordinary reservations
+    /// or free memory, which anybody can commit or take with no word to us.
+    /// Their notes live [`UNSURE_MS`] ([`note_life`]).
+    unsure: BTreeSet<usize>,
     /// Blocks opened by a write fault, and when ([`rest`]): a block's slot
     /// is its number modulo [`OPENED_SLOTS`], a later block in the slot
     /// taking it (that one then rests no longer). Made once, before the
@@ -1078,6 +1083,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     remapped: CleanBlocks(BTreeMap::new()),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
+    unsure: BTreeSet::new(),
     opened: Vec::new(),
 });
 
@@ -1410,16 +1416,18 @@ fn light_asks() -> [u64; 3] {
 pub(crate) fn askings_line(frames: f64) -> String {
     let f = frames.max(1.0);
     let [bits, guards, filled] = light_asks();
-    let [asked, noted] = absent_looks();
+    let [asked, noted, unsure] = absent_looks();
     format!(
         "askings of view memory, a frame: {:.0} answered by the bits of their blocks, {:.0} through the guards (LIGHT_REFRESH {}), \
          {filled} holes found filled with nobody telling; blocks noted uncommitted: {:.0} questions to Windows, {:.0} answered \
-         from their note (ABSENT_ONCE {}, VICTORY_ABSENT_MS {})",
+         from their note, {:.0} new notes in no placeholder (they live 100 ms with told) (ABSENT_ONCE {}, \
+         VICTORY_ABSENT_MS {})",
         bits as f64 / f,
         guards as f64 / f,
         if light() { "on" } else if light_kept() { "off, bits kept" } else { "off" },
         asked as f64 / f,
         noted as f64 / f,
+        unsure as f64 / f,
         if absent_once() { "on" } else { "off" },
         match absent_keep_ms() {
             u64::MAX => "told".to_owned(),
@@ -1678,6 +1686,7 @@ fn placeholder(block: usize) -> bool {
 /// The note that `block` is uncommitted is gone, or is true no longer: the
 /// block is not known by its bit any more ([`publish`]).
 fn forget_hole(g: &mut Guards, block: usize) {
+    g.unsure.remove(&block);
     if g.holes.remove(&block) {
         PUBLISHED.clear(block);
     }
@@ -1694,9 +1703,13 @@ const UNSURE_MS: u64 = 100;
 /// that [`publish`] looked at and found in an ordinary reservation or in
 /// free memory, which anybody can commit or take with no word to us, is
 /// asked of Windows again when its note is [`UNSURE_MS`] old. (Without the
-/// light refresh no hole is looked at, and `keep` stands.)
+/// light refresh no hole is looked at.) The same with or without the
+/// light refresh: a note kept for good of a block in no placeholder
+/// reservation (`Guards::unsure`) lives [`UNSURE_MS`].
 fn note_life(g: &Guards, block: usize, keep: u64) -> u64 {
-    if keep == u64::MAX && g.holes.contains(&block) && !PUBLISHED.all(block, block + 1) {
+    if keep == u64::MAX
+        && (g.unsure.contains(&block) || g.holes.contains(&block) && !PUBLISHED.all(block, block + 1))
+    {
         UNSURE_MS
     } else {
         keep
@@ -1853,11 +1866,11 @@ fn absent_keep_ms() -> u64 {
 /// Since they were last taken ([`absent_looks`]): questions to Windows
 /// about blocks noted absent, and such blocks answered from their note
 /// ([`absent_once`]). Counted with the switch off too.
-static ABSENT_LOOKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static ABSENT_LOOKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// [`ABSENT_LOOKS`], taken ([`askings_line`]).
-fn absent_looks() -> [u64; 2] {
-    [0, 1].map(|i| ABSENT_LOOKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+fn absent_looks() -> [u64; 3] {
+    [0, 1, 2].map(|i| ABSENT_LOOKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Milliseconds since the guards' first asking: the clock of
@@ -1973,6 +1986,13 @@ fn guard_locked(mut g: GuardsHeld, start: usize, end: usize, now: u64, keep: u64
                         forget_hole(&mut g, block);
                     } else if keep != 0 {
                         g.verified.insert(block, now);
+                        // Kept for good only where the runtime's word is
+                        // sure to come; asked once a block (a placeholder is
+                        // made or let go only by the runtime, which tells).
+                        if keep == u64::MAX && !g.unsure.contains(&block) && !placeholder(block) {
+                            g.unsure.insert(block);
+                            ABSENT_LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
