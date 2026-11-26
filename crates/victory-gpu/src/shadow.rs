@@ -3949,7 +3949,8 @@ impl Shadow {
     }
 
     /// Copies `[from, to)` (title addresses) where needed, skipping 4 KiB pages
-    /// whose bytes only came from our own landing (`VICTORY_LAND_ECHO`).
+    /// whose bytes only came from our own landing (`VICTORY_LAND_ECHO`); the
+    /// bytes copied.
     fn take_landed(&self, from: usize, to: usize) -> usize {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -3973,17 +3974,21 @@ impl Shadow {
                 if noted && next - at == KERNEL_PAGE {
                     bits[page / 64] &= !(1 << (page % 64));
                 }
+                // (A run of noted pages is read into one buffer: 64 KiB at
+                // most. One not noted is copied whole, as without the switch.)
                 match runs.last_mut() {
-                    Some(last) if last.2 == noted && next - last.0 <= PAGE => last.1 = next,
+                    Some(last) if last.2 == noted && (!noted || next - last.0 <= PAGE) => last.1 = next,
                     _ => runs.push((at, next, noted)),
                 }
                 at = next;
             }
         }
+        // The bytes copied into the copy: what a refresh counts.
         TITLE.with_borrow_mut(|title| {
+            let mut copied = 0;
             for (from, to, noted) in runs {
                 if !noted {
-                    self.copy(from, to);
+                    copied += self.copy(from, to);
                     continue;
                 }
                 title.resize(to - from, 0);
@@ -4004,12 +4009,13 @@ impl Shadow {
                         held.copy_from_slice(slice);
                         self.changed(at - start, next - start);
                         self.card_changed(at - start, next - start);
+                        copied += next - at;
                     }
                     at = next;
                 }
             }
-        });
-        to - from
+            copied
+        })
     }
 
     /// Copies the pages of `[from, to)` written after their last copy

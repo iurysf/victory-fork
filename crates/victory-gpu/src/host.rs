@@ -8375,7 +8375,7 @@ impl Batch {
         crate::shadow::wide_run(jobs);
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
         let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
-        PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+        let _ = PREPARING[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |was| Some(was.saturating_sub(over)));
         crate::framelog::sub(crate::framelog::T::CopyUs, over);
     }
 
@@ -8423,7 +8423,7 @@ impl Batch {
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
-            PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+            let _ = PREPARING[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |was| Some(was.saturating_sub(over)));
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
             for (shadow, ranges) in self.refreshes.drain(..) {

@@ -163,9 +163,10 @@ pub fn add(t: T, n: u64) {
 }
 
 /// Takes from a total (a time that was summed over threads is corrected
-/// to the time it took).
+/// to the time it took). Not below 0: the frame line may have taken the
+/// total meanwhile, and a wrapped one read as 584,000 years.
 pub fn sub(t: T, n: u64) {
-    TOTAL[t as usize].fetch_sub(n, Relaxed);
+    let _ = TOTAL[t as usize].fetch_update(Relaxed, Relaxed, |was| Some(was.saturating_sub(n)));
 }
 
 /// What a thread did inside our calls since its last present: for the
